@@ -1,0 +1,194 @@
+===========================================================
+  EVE PI TEMPLATE GENERATOR — HOW TO USE
+===========================================================
+
+-----------------------------------------------------------
+GETTING STARTED
+-----------------------------------------------------------
+
+Double-click "Eve PI.exe" to launch the app.
+  OR
+Run from source:  python PI.py
+
+The main window has five configuration steps on the left,
+a Bill of Materials panel below them, and action buttons
+at the bottom.
+
+-----------------------------------------------------------
+STEP 1 — GENERATING A TEMPLATE
+-----------------------------------------------------------
+
+Follow the steps in order from top to bottom:
+
+  1. PRODUCT
+     Click a product name from the list, or type in the
+     search box to filter. Products are grouped by tier
+     (P1 through P4). The list updates automatically based
+     on what your selected chain can produce.
+
+  2. CHAIN
+     Select the production chain you want to use.
+     Examples:
+       "P0 → P1 (Extraction)"  — raw resource to P1
+       "P1 → P2 (Factory)"     — P1 inputs to P2 output
+       "P2 → P4 (Factory)"     — P2 inputs to P4 output
+     The available chains update based on your product.
+
+  3. PLANET TYPE
+     Pick the planet type where you will build this setup.
+     For extraction chains, this must match a planet that
+     actually produces the raw resource.
+
+  4. PLANET RADIUS
+     Choose the size bucket for your specific planet:
+       Auto  — uses the real diameter fetched from ESI
+       XS / S / M / L / XL — manual size override
+     Tip: "Auto" requires you to have scanned or visited
+     the system so the radius cache is populated.
+
+  5. CC LEVEL
+     Select your Command Center Upgrades skill level (0–5).
+     Higher levels unlock more CPU/Power and more factories.
+     The available levels are shown as clickable badges.
+
+  After setting all five options, click GENERATE.
+
+-----------------------------------------------------------
+STEP 2 — READING THE OUTPUT
+-----------------------------------------------------------
+
+A popup window appears with:
+
+  - JSON text (the raw template data)
+  - A visual planet map showing structure layout
+  - "Copy JSON" button — copies the template to clipboard
+
+To import into EVE Online:
+  1. Click "Copy JSON" in the popup
+  2. Open EVE Online and enter Planetary Interaction view
+  3. Use the in-game "Import Template" feature and paste
+
+The map shows:
+  ECU  = Extractor Control Unit (with heads around it)
+  [G]  = Basic Industry Facility (gear icon)
+  [R]  = Advanced Industry Facility (rocket icon)
+  [H]  = High-Tech Industry Facility (H icon)
+  [S]  = Storage Facility
+  [LP] = Launch Pad
+
+You can drag to pan the map and scroll to zoom.
+Drag the popup edges to resize it.
+
+-----------------------------------------------------------
+BILL OF MATERIALS
+-----------------------------------------------------------
+
+Below the configuration steps, the BOM panel shows the
+full raw-resource (P0) requirements to produce one batch
+of your selected product, along with estimated ISK cost
+(if price data has been loaded).
+
+The breakdown is colour-coded by tier:
+  P0 — raw resources (grey)
+  P1 — basic commodities (green)
+  P2 — refined commodities (blue)
+  P3 — specialized commodities (purple)
+  P4 — advanced commodities (gold)
+
+-----------------------------------------------------------
+REGION SCANNER
+-----------------------------------------------------------
+
+The scanner finds the best PI planets near you.
+
+  1. Click "Region Scanner" (bottom of the main window).
+  2. Enter a system name in the search box (autocomplete
+     will suggest matches as you type).
+  3. Choose scan mode:
+       Jump Range  — scan all systems within N jumps
+       Region      — scan all systems in the same region
+  4. Click SCAN.
+
+Results appear as expandable system cards, sorted by
+estimated PI profit (ISK/hr). Each card shows:
+  - System name and security status
+  - Jump distance from your origin system
+  - Planet cards for each planet in that system
+
+Planet cards show:
+  - Planet type and name
+  - Priority P1 products (gold/silver/bronze badges)
+  - Estimated output and ISK value (when prices loaded)
+
+Click a system header to expand/collapse its planet list.
+Click a planet card to expand its full resource detail.
+
+Note: The first scan of a region may take 30–60 seconds
+while the app fetches data from ESI. Results are cached
+locally so subsequent scans of the same area are instant.
+
+-----------------------------------------------------------
+SETTINGS
+-----------------------------------------------------------
+
+Click the gear icon in the title bar to open Settings.
+
+  Theme       — change the UI colour scheme
+  Opacity     — adjust window transparency (0.5–1.0)
+
+Window positions are saved automatically when you close
+or move the windows.
+
+-----------------------------------------------------------
+SYSTEM TRAY
+-----------------------------------------------------------
+
+Click the minimize button (–) to hide the main window to
+the system tray. A small icon will appear in the taskbar
+notification area.
+
+  Single-click tray icon  — show/hide the window
+  Right-click tray icon   — menu with Show / Exit options
+  Double-click title bar  — collapse/expand the window
+
+-----------------------------------------------------------
+TIPS
+-----------------------------------------------------------
+
+- For P4 products, use the "P1 → P4" chain on a single
+  planet if you have CC level 4 or 5, or split into
+  separate extraction and factory planets at lower levels.
+
+- The "P2 → P4" chain assumes you are importing P2
+  materials from off-planet and only doing final assembly.
+
+- Planet radii matter: a planet classified as "XL" can
+  fit more extractor heads spread further apart, improving
+  resource yield.
+
+- Run the scanner before setting up a new PI operation —
+  it highlights which planets in your area have the
+  highest-value resources.
+
+-----------------------------------------------------------
+TROUBLESHOOTING
+-----------------------------------------------------------
+
+"No systems found"
+  — Check your internet connection; the scanner fetches
+    live data from ESI.
+
+Template popup is blank / map is empty
+  — Try a different planet type or CC level. Some combos
+    (e.g., Gas planet + High-Tech Facility) are not valid
+    and will return no layout.
+
+Prices show as 0 or "N/A"
+  — Price data loads in the background on startup. Wait
+    a few seconds and re-open the scanner.
+
+App crashes on launch (from source)
+  — Make sure Pillow is installed: pip install Pillow
+  — pystray is optional but required for tray support.
+
+===========================================================
