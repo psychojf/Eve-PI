@@ -1067,7 +1067,7 @@ def _gen_single_facility_template(product_name, chain_name, planet_type, cc_leve
         cfg = {
             "P1 → P2 (Factory)": {"facility": "Advanced Industry Facility", "recipe_dict": RECIPES_P1_P2},
             "P2 → P3 (Factory)": {"facility": "Advanced Industry Facility", "recipe_dict": RECIPES_P2_P3},
-            "P1 → P3 (Factory)": {"facility": "Advanced Industry Facility", "recipe_dict": RECIPES_P2_P3},
+            "P1 → P3 (Factory)": {"facility": "Advanced Industry Facility", "recipe_dict": RECIPES_P1_P2},
         }.get(chain_name)
 
         if not cfg:
@@ -1197,8 +1197,238 @@ def _gen_p2_to_p3_template(product_name, planet_type, cc_level, diameter):
     return _gen_single_facility_template(product_name, "P2 → P3 (Factory)", planet_type, cc_level, diameter)
 
 def _gen_p1_to_p3_template(product_name, planet_type, cc_level, diameter):
-    """Raccourci vers _gen_single_facility_template pour la chaîne P1→P3."""
-    return _gen_single_facility_template(product_name, "P1 → P3 (Factory)", planet_type, cc_level, diameter)
+    """
+    True P1→P2→P3 two-stage factory chain.
+    Stage 1 AIFs convert P1 inputs into P2 intermediates.
+    Stage 2 AIFs convert P2 intermediates into the final P3 product.
+    Uses 4 Launch Pads for Two-P2-input products, 3 for Three-P2-input.
+    """
+    try:
+        p3_recipe = RECIPES_P2_P3.get(product_name)
+        if not p3_recipe:
+            return None
+
+        p2_inputs = p3_recipe["input"]   # [(p2_name, qty), ...]
+        num_p2 = len(p2_inputs)
+
+        # Verify each P2 intermediate can be produced from P1
+        p1_recipes = {}
+        for p2_name, _ in p2_inputs:
+            r = RECIPES_P1_P2.get(p2_name)
+            if r is None:
+                return None
+            p1_recipes[p2_name] = r
+
+        aif_type = STRUCTURE_IDS["Advanced Industry Facility"][planet_type]
+        lp_type  = STRUCTURE_IDS["Launch Pad"][planet_type]
+        sp = _calc_spacing(diameter)
+
+        # Balanced factory ratio: how many P1→P2 AIFs per P3 AIF
+        p2_ratios = [
+            max(1, math.ceil(qty / p1_recipes[name]["output"]))
+            for name, qty in p2_inputs
+        ]
+
+        # Find max n_p3 that fits in budget
+        num_lps = 4 if num_p2 == 2 else 3
+        best_n_p3 = 0
+        for n in range(1, 20):
+            n_each = [n * r for r in p2_ratios]
+            if any(x > 2 * MAX_ARM_LEN for x in n_each) or n > 2 * MAX_ARM_LEN:
+                break
+            n_aif = n + sum(n_each)
+            est_links = (num_lps - 1) + n_aif + (1 if num_lps == 4 else 0)
+            if _try_budget(num_lps, n_aif, 0, est_links, cc_level)[0]:
+                best_n_p3 = n
+            else:
+                break
+
+        if best_n_p3 == 0:
+            num_lps -= 1
+            for n in range(1, 20):
+                n_each = [n * r for r in p2_ratios]
+                if any(x > 2 * MAX_ARM_LEN for x in n_each) or n > 2 * MAX_ARM_LEN:
+                    break
+                n_aif = n + sum(n_each)
+                est_links = (num_lps - 1) + n_aif
+                if _try_budget(num_lps, n_aif, 0, est_links, cc_level)[0]:
+                    best_n_p3 = n
+                else:
+                    break
+            if best_n_p3 == 0:
+                return None
+
+        n_p3 = best_n_p3
+        n_p2_each = [n_p3 * r for r in p2_ratios]
+
+        # ── LAYOUT ──────────────────────────────────────────────────────
+        # Two-P2  (4 LPs): P2a row @ +sp, P2b row @ -sp, P3 row @ 0
+        #                   hub LP @ 0, LP_A @ +sp, LP_B @ -sp, LP_D @ -2sp
+        # Three-P2 (3 LPs): P2a @ +sp, P2b @ -sp, P2c/P3 split @ 0
+        #                    hub LP @ 0, LP_A @ +sp, LP_B @ -sp
+        if num_p2 == 2:
+            p2_row_lats = [CENTER_LAT + sp, CENTER_LAT - sp]
+            p3_row_lat  = CENTER_LAT
+            lp_lats     = [CENTER_LAT, CENTER_LAT + sp, CENTER_LAT - sp, CENTER_LAT - 2 * sp]
+        else:
+            p2_row_lats = [CENTER_LAT + sp, CENTER_LAT - sp]  # P2a, P2b
+            p3_row_lat  = CENTER_LAT
+            lp_lats     = [CENTER_LAT, CENTER_LAT + sp, CENTER_LAT - sp]
+            # P2c (index 2) will share the center row using left/right arm split
+
+        pins = []
+
+        # Place P2 AIF groups
+        p2_arms = []
+        for i, (p2_name, _) in enumerate(p2_inputs):
+            count = n_p2_each[i]
+            if i < 2:
+                # Standard row
+                row_lat = p2_row_lats[i]
+                positions, arms_local = _place_factory_row(row_lat, 0.0, count, sp)
+                base = len(pins) + 1
+                for lat, lon in positions:
+                    pins.append(_make_pin(lat, lon, aif_type, schematic_id=NAME_TO_ID[p2_name]))
+                p2_arms.append([[base + a for a in arm] for arm in arms_local])
+            else:
+                # Third P2 group (Three-P2 only): left arm of center row
+                base = len(pins) + 1
+                local_indices = []
+                for j in range(min(count, MAX_ARM_LEN)):
+                    pins.append(_make_pin(CENTER_LAT, -(j + 1) * sp, aif_type,
+                                         schematic_id=NAME_TO_ID[p2_name]))
+                    local_indices.append(base + j - 1)
+                p2_arms.append([local_indices, []])  # left arm only
+
+        # Place P3 AIFs
+        if num_p2 == 2:
+            p3_positions, p3_arms_local = _place_factory_row(p3_row_lat, 0.0, n_p3, sp)
+            p3_base = len(pins) + 1
+            for lat, lon in p3_positions:
+                pins.append(_make_pin(lat, lon, aif_type, schematic_id=NAME_TO_ID[product_name]))
+            p3_arms = [[p3_base + a for a in arm] for arm in p3_arms_local]
+        else:
+            # Three-P2: P3 on right arm of center row
+            p3_base = len(pins) + 1
+            right_indices = []
+            for j in range(min(n_p3, MAX_ARM_LEN)):
+                pins.append(_make_pin(CENTER_LAT, (j + 1) * sp, aif_type,
+                                      schematic_id=NAME_TO_ID[product_name]))
+                right_indices.append(p3_base + j - 1)
+            p3_arms = [[], right_indices]
+
+        # Place LPs (Razkin standard: at end of pin list)
+        lp_pin_1b = []
+        for lat in lp_lats[:num_lps]:
+            pins.append(_make_pin(lat, 0.0, lp_type))
+            lp_pin_1b.append(len(pins))
+
+        lp_hub   = lp_pin_1b[0]   # center hub: P2 collection + P3 export
+        num_pins = len(pins)
+
+        # ── LINKS ────────────────────────────────────────────────────────
+        links = []
+
+        # LP backbone: hub connects to all other LPs
+        for i in range(1, num_lps):
+            links.append({"D": lp_hub, "Lv": 0, "S": lp_pin_1b[i]})
+        # Extra backbone for 4-LP: LP_B <-> LP_D (so LP_D can relay P1d to RF AIFs)
+        if num_lps == 4:
+            links.append({"D": lp_pin_1b[2], "Lv": 0, "S": lp_pin_1b[3]})
+
+        # LP serving each P2 group (for arm connections)
+        p2_row_lps = [
+            lp_pin_1b[1] if num_lps >= 2 else lp_hub,   # P2a -> LP_A
+            lp_pin_1b[2] if num_lps >= 3 else lp_hub,   # P2b -> LP_B
+            lp_hub,                                       # P2c (Three-P2) -> hub
+        ]
+
+        for i, arms in enumerate(p2_arms):
+            row_lp = p2_row_lps[i] if i < len(p2_row_lps) else lp_hub
+            for arm in arms:
+                if not arm:
+                    continue
+                links.append({"D": row_lp, "Lv": 0, "S": arm[0]})
+                for k in range(1, len(arm)):
+                    links.append({"D": arm[k - 1], "Lv": 0, "S": arm[k]})
+
+        # P3 AIFs connect to hub
+        for arm in p3_arms:
+            if not arm:
+                continue
+            links.append({"D": lp_hub, "Lv": 0, "S": arm[0]})
+            for k in range(1, len(arm)):
+                links.append({"D": arm[k - 1], "Lv": 0, "S": arm[k]})
+
+        # ── ROUTES ───────────────────────────────────────────────────────
+        routes = []
+
+        # 1) P1 inputs from LPs → P2 AIFs
+        for p2_idx, (p2_name, _) in enumerate(p2_inputs):
+            p1_ins = p1_recipes[p2_name]["input"]  # [(p1_name, qty), ...]
+
+            if num_lps == 4 and p2_idx == 0:
+                # P2a: LP_A imports P1[0] (Silicon), hub imports P1[1] (OxComp)
+                import_map = [
+                    (lp_pin_1b[1], p1_ins[0]),
+                    (lp_hub,       p1_ins[1]),
+                ]
+            elif num_lps == 4 and p2_idx == 1:
+                # P2b: LP_B imports P1[0] (Electrolytes), LP_D imports P1[1] (Plasmoids)
+                import_map = [
+                    (lp_pin_1b[2], p1_ins[0]),
+                    (lp_pin_1b[3], p1_ins[1]),
+                ]
+            else:
+                # 3-LP: each group LP imports both P1s
+                serving_idx = min(p2_idx + 1, num_lps - 1)
+                import_map  = [(lp_pin_1b[serving_idx], inp) for inp in p1_ins]
+
+            for src_lp, (p1_name, p1_qty) in import_map:
+                for arm in p2_arms[p2_idx]:
+                    for f_pin in arm:
+                        path = _bfs_path(links, src_lp, f_pin, num_pins)
+                        if path:
+                            routes.append({"P": path, "Q": p1_qty, "T": NAME_TO_ID[p1_name]})
+
+        # 2) P2 outputs from P2 AIFs → hub LP
+        for p2_idx, (p2_name, _) in enumerate(p2_inputs):
+            p2_qty = p1_recipes[p2_name]["output"]
+            for arm in p2_arms[p2_idx]:
+                for f_pin in arm:
+                    path = _bfs_path(links, f_pin, lp_hub, num_pins)
+                    if path:
+                        routes.append({"P": path, "Q": p2_qty, "T": NAME_TO_ID[p2_name]})
+
+        # 3) P2 inputs from hub LP → P3 AIFs
+        for p2_name, p2_qty in p2_inputs:
+            for arm in p3_arms:
+                for f_pin in arm:
+                    path = _bfs_path(links, lp_hub, f_pin, num_pins)
+                    if path:
+                        routes.append({"P": path, "Q": p2_qty, "T": NAME_TO_ID[p2_name]})
+
+        # 4) P3 output from P3 AIFs → hub LP (export)
+        for arm in p3_arms:
+            for f_pin in arm:
+                path = _bfs_path(links, f_pin, lp_hub, num_pins)
+                if path:
+                    routes.append({"P": path, "Q": p3_recipe["output"], "T": NAME_TO_ID[product_name]})
+
+        return {
+            "CmdCtrLv": cc_level,
+            "Cmt":       f"P1\u2192P3 {product_name}",
+            "Diam":      float(diameter),
+            "L":         links,
+            "P":         pins,
+            "Pln":       PLANET_TYPES[planet_type],
+            "R":         routes,
+        }
+
+    except Exception as e:
+        print(f"[DEBUG] _gen_p1_to_p3_template error for {product_name}: {e}")
+        traceback.print_exc()
+        return None
 
 # =====================================================================
 # MULTI-TIER P4 BUILDERS (Kept intact to preserve complex mechanics)
