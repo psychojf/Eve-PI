@@ -1031,14 +1031,17 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, use_
         links.append({"D": parent.get(pin, hub_1b), "Lv": 0, "S": pin})
     if use_sf:
         links.append({"D": lp_1b, "Lv": 0, "S": sf_1b})
-    links.append({"D": lp_1b, "Lv": 0, "S": ecu_1b})
+        links.append({"D": sf_1b, "Lv": 0, "S": ecu_1b})
+    else:
+        links.append({"D": lp_1b, "Lv": 0, "S": ecu_1b})
 
     num_pins = len(pins)
     routes = []
 
+    p0_src = sf_1b if use_sf else lp_1b
     for i in range(num_bif):
         bif_pin = first_bif_1b + i
-        path = _bfs_path(links, lp_1b, bif_pin, num_pins)
+        path = _bfs_path(links, p0_src, bif_pin, num_pins)
         if path:
             routes.append({"P": path, "Q": 3000, "T": p0_tid})
 
@@ -1049,7 +1052,8 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, use_
             routes.append({"P": path, "Q": 20, "T": p1_tid})
 
     ecu_qty = max(num_bif * 3000, 125000)
-    routes.append({"P": [ecu_1b, lp_1b], "Q": ecu_qty, "T": p0_tid})
+    ecu_dest = sf_1b if use_sf else lp_1b
+    routes.append({"P": [ecu_1b, ecu_dest], "Q": ecu_qty, "T": p0_tid})
 
     return {
         "CmdCtrLv": cc_level, "Cmt": f"{product_name} Extract",
