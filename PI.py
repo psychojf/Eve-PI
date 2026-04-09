@@ -15,6 +15,7 @@ import time
 import datetime
 import traceback
 import ctypes
+import ssl
 from collections import deque
 
 # ── System tray (pystray + PIL) ───────────────────────────────────────
@@ -24,6 +25,35 @@ try:
     _TRAY_OK = True
 except ImportError:
     _TRAY_OK = False
+
+# ── SSL context (Wine / Linux compatibility) ──────────────────────────
+# Wine has no system CA store, so default HTTPS verification fails.
+# We try a verified context first; on the first SSLError we permanently
+# switch to an unverified context so all subsequent requests stay fast.
+def _build_ssl_ctx():
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+_SSL_CTX_VERIFIED = _build_ssl_ctx()
+_SSL_CTX_UNVERIFIED = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+_SSL_CTX_UNVERIFIED.check_hostname = False
+_SSL_CTX_UNVERIFIED.verify_mode = ssl.CERT_NONE
+_ssl_use_verified = True   # flipped to False after first SSL failure
+
+
+def _esi_urlopen(req, timeout=15):
+    """urllib.urlopen wrapper with Wine-compatible SSL fallback."""
+    global _ssl_use_verified
+    if _ssl_use_verified:
+        try:
+            return urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX_VERIFIED)
+        except ssl.SSLError:
+            print("[DEBUG] SSL verification failed — switching to unverified context (Wine mode)")
+            _ssl_use_verified = False
+    return urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX_UNVERIFIED)
 
 # =============================================================================
 # DATA LAYER - All EVE PI reference data
@@ -341,13 +371,13 @@ def _ensure_system_names():
         try:
             url = f"{ESI_BASE}/universe/systems/?datasource=tranquility"
             req = urllib.request.Request(url, headers={"User-Agent": "EVE-PI-Scanner/1.0"})
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with _esi_urlopen(req, timeout=30) as r:
                 ids = json.loads(r.read())
             def _fetch_name(sid):
                 try:
                     url2 = f"{ESI_BASE}/universe/systems/{sid}/?datasource=tranquility"
                     req2 = urllib.request.Request(url2, headers={"User-Agent": "EVE-PI-Scanner/1.0"})
-                    with urllib.request.urlopen(req2, timeout=10) as r2:
+                    with _esi_urlopen(req2, timeout=10) as r2:
                         return json.loads(r2.read()).get("name", "")
                 except Exception:
                     return ""
@@ -385,7 +415,7 @@ def _ensure_planet_radii():
             print("[DEBUG] _ensure_planet_radii - downloading mapCelestialStatistics.csv...")
             url = "https://www.fuzzwork.co.uk/dump/latest/mapCelestialStatistics.csv"
             req = urllib.request.Request(url, headers={"User-Agent": "EVE-PI-Generator/1.0"})
-            with urllib.request.urlopen(req, timeout=120) as r:
+            with _esi_urlopen(req, timeout=120) as r:
                 raw = r.read().decode("utf-8")
             reader = _csv.DictReader(_io.StringIO(raw))
             radii = {}
@@ -488,7 +518,7 @@ def _esi_fetch(path):
     """Récupère du JSON depuis l'ESI EVE pour un chemin donné."""
     url = f"{ESI_BASE}{path}?datasource=tranquility"
     req = urllib.request.Request(url, headers={"User-Agent": "EVE-PI-Scanner/1.0"})
-    with urllib.request.urlopen(req, timeout=15) as r:
+    with _esi_urlopen(req, timeout=15) as r:
         return json.loads(r.read())
 
 def _esi_resolve_system(system_name):
@@ -496,7 +526,7 @@ def _esi_resolve_system(system_name):
     try:
         url = f"{ESI_BASE}/universe/ids/?datasource=tranquility"
         req = urllib.request.Request(url, data=json.dumps([system_name]).encode(), headers={"Content-Type": "application/json", "User-Agent": "EVE-PI-Scanner/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with _esi_urlopen(req, timeout=15) as r:
             res = json.loads(r.read())
         if 'systems' in res and len(res['systems']) > 0:
             return res['systems'][0]['id']
