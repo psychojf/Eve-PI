@@ -1464,17 +1464,24 @@ class PIGeneratorApp:
         y = 6
         lh = 18
 
+        # Right edge for values/dividers — track the real canvas width so the
+        # quantity + tier badge (e.g. "6×  [P2]") never clips off the edge.
+        c.update_idletasks()
+        right_x = c.winfo_width() - 10
+        if right_x < 200:          # not laid out yet (first build) → 420px-window fallback
+            right_x = 372
+
         def draw_row(label, value, color, indent=0):
             nonlocal y
             c.create_text(8 + indent, y, anchor=tk.W, text=label,
                           fill=color, font=("Segoe UI", 9))
             if value:
-                c.create_text(390, y, anchor=tk.E, text=value,
+                c.create_text(right_x, y, anchor=tk.E, text=value,
                               fill=color, font=("Consolas", 9))
             y += lh
 
         draw_row(f"  {chain_info['facility']}", f"⊞ {recipe['output']}/cycle", EVE["fg_dim"])
-        c.create_line(8, y, 390, y, fill=EVE["border"], width=1)
+        c.create_line(8, y, right_x, y, fill=EVE["border"], width=1)
         y += 4
 
         draw_row("INPUTS", "", EVE["accent"])
@@ -1486,7 +1493,7 @@ class PIGeneratorApp:
         bom = get_full_supply_chain(product, chain)
         if bom:
             y += 4
-            c.create_line(8, y, 390, y, fill=EVE["border"], width=1)
+            c.create_line(8, y, right_x, y, fill=EVE["border"], width=1)
             y += 4
             draw_row("BASE P1 MATERIALS", "", EVE["fg_dim"])
             for name, qty in sorted(bom.items()):
