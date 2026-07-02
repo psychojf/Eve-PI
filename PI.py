@@ -4,7 +4,6 @@ import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 import json
 import math
-import copy
 import os
 import sys
 import platform
@@ -16,12 +15,12 @@ import datetime
 import traceback
 import ctypes
 import ssl
-from collections import deque
 
 from src.debug_log import _debug
 from src.pi_data import (
     CHAINS,
     HTIF_PLANET_TYPES,
+    NAME_TO_ID,
     PLANET_PI_PRIORITY,
     PLANET_RESOURCES,
     PLANET_TYPES,
@@ -81,6 +80,17 @@ ESI_PLANET_TYPE_MAP = {
     2017: "Storm", 2063: "Plasma",
 }
 
+# Reverse lookup: structure type_id → structure name (used by the template map)
+STRUCT_TYPE_TO_NAME = {
+    tid: sname
+    for sname, planets in STRUCTURE_IDS.items()
+    for tid in planets.values()
+    if tid is not None
+}
+
+# Reverse lookup: commodity type_id → commodity name (used by LP tooltips)
+ID_TO_COMMODITY = {tid: name for name, tid in NAME_TO_ID.items()}
+
 # ── System name autocomplete cache ─────────────────────────────────────
 _SYSTEM_NAMES_CACHE: list = []   # populated lazily
 _SYSTEM_NAMES_LOCK = threading.Lock()
@@ -105,16 +115,18 @@ def _ensure_system_names():
             req = urllib.request.Request(url, headers={"User-Agent": "EVE-PI-Scanner/1.0"})
             with _esi_urlopen(req, timeout=30) as r:
                 ids = json.loads(r.read())
-            def _fetch_name(sid):
-                try:
-                    url2 = f"{ESI_BASE}/universe/systems/{sid}/?datasource=tranquility"
-                    req2 = urllib.request.Request(url2, headers={"User-Agent": "EVE-PI-Scanner/1.0"})
-                    with _esi_urlopen(req2, timeout=10) as r2:
-                        return json.loads(r2.read()).get("name", "")
-                except Exception:
-                    return ""
-            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
-                names = sorted([n for n in ex.map(_fetch_name, ids) if n])
+            # Bulk-resolve names via POST /universe/names/ (1000 ids per call)
+            # instead of one GET per system (~8400 requests → ~9).
+            names = []
+            for i in range(0, len(ids), 1000):
+                data = json.dumps(ids[i:i + 1000]).encode()
+                req2 = urllib.request.Request(
+                    f"{ESI_BASE}/universe/names/?datasource=tranquility", data=data,
+                    headers={"Content-Type": "application/json",
+                             "User-Agent": "EVE-PI-Scanner/1.0"})
+                with _esi_urlopen(req2, timeout=30) as r2:
+                    names.extend(item["name"] for item in json.loads(r2.read()))
+            names.sort()
             _SYSTEM_NAMES_CACHE = names
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
             with open(cache_path, "w", encoding="utf-8") as f:
@@ -205,13 +217,19 @@ def _esi_resolve_system(system_name):
         return None
 
 
-def _fetch_planets_for_systems(system_ids, progress_callback=None):
-    """Récupère en parallèle les données de planètes pour une liste de systèmes."""
+def _fetch_planets_for_systems(system_ids, progress_callback=None, preloaded=None):
+    """Récupère en parallèle les données de planètes pour une liste de systèmes.
+
+    preloaded: dict optionnel system_id → payload ESI déjà téléchargé (évite de
+    re-télécharger les systèmes que le BFS des sauts a déjà récupérés).
+    """
     results = {}
-    
+
     def scan_one_system(sid):
         try:
-            sys_data = _esi_fetch(f"/universe/systems/{sid}/")
+            sys_data = (preloaded or {}).get(sid)
+            if sys_data is None:
+                sys_data = _esi_fetch(f"/universe/systems/{sid}/")
             planets_raw = sys_data.get('planets', [])
             sec = sys_data.get('security_status', 0)
             name = sys_data.get('name', str(sid))
@@ -746,28 +764,18 @@ class PIGeneratorApp:
         style.configure("TButton",          font=("Segoe UI", 10, "bold"))
         style.configure("Accent.TButton",   font=("Segoe UI", 11, "bold"))
         
-        style.configure("TCombobox",        font=("Segoe UI", 10), fieldbackground=EVE["bg_input"],
-                         background=EVE["bg_card"], foreground=EVE["fg_bright"],
-                         selectbackground=EVE["accent_dim"], selectforeground="white",
-                         arrowcolor=EVE["accent"], bordercolor=EVE["border"])
-        style.map("TCombobox",
-                  fieldbackground=[("readonly", EVE["bg_input"]), ("disabled", EVE["bg_deep"])],
-                  foreground=[("readonly", EVE["fg_bright"]), ("disabled", EVE["fg_dim"])],
-                  selectbackground=[("readonly", EVE["accent_dim"])],
-                  selectforeground=[("readonly", "white")],
-                  bordercolor=[("focus", EVE["border_hi"])])
-        
-        style.configure("PI.TCombobox",     font=("Segoe UI", 10), fieldbackground=EVE["bg_input"],
-                         background=EVE["bg_card"], foreground=EVE["fg_bright"],
-                         selectbackground=EVE["accent_dim"], selectforeground="white",
-                         arrowcolor=EVE["accent"], bordercolor=EVE["border"])
-        style.map("PI.TCombobox",
-                  fieldbackground=[("readonly", EVE["bg_input"]), ("disabled", EVE["bg_deep"])],
-                  foreground=[("readonly", EVE["fg_bright"]), ("disabled", EVE["fg_dim"])],
-                  selectbackground=[("readonly", EVE["accent_dim"])],
-                  selectforeground=[("readonly", "white")],
-                  bordercolor=[("focus", EVE["border_hi"])])
-        
+        for cb_style in ("TCombobox", "PI.TCombobox"):
+            style.configure(cb_style,       font=("Segoe UI", 10), fieldbackground=EVE["bg_input"],
+                             background=EVE["bg_card"], foreground=EVE["fg_bright"],
+                             selectbackground=EVE["accent_dim"], selectforeground="white",
+                             arrowcolor=EVE["accent"], bordercolor=EVE["border"])
+            style.map(cb_style,
+                      fieldbackground=[("readonly", EVE["bg_input"]), ("disabled", EVE["bg_deep"])],
+                      foreground=[("readonly", EVE["fg_bright"]), ("disabled", EVE["fg_dim"])],
+                      selectbackground=[("readonly", EVE["accent_dim"])],
+                      selectforeground=[("readonly", "white")],
+                      bordercolor=[("focus", EVE["border_hi"])])
+
         style.configure("TRadiobutton",     background=EVE["bg_deep"], foreground=EVE["fg"], font=("Segoe UI", 10))
         style.map("TRadiobutton", background=[("active", EVE["bg_card"])])
         style.configure("TCheckbutton",    background=EVE["bg_deep"], foreground=EVE["fg"], font=("Segoe UI", 10))
@@ -1131,13 +1139,8 @@ class PIGeneratorApp:
             if trigger_source == "chain":
                 # Chain changed → re-derive planet list and refresh BOM
                 self._on_chain_changed()
-            elif trigger_source == "planet":
-                # Planet changed → just refresh BOM (chain list is already correct)
-                self._update_bom()
-            elif trigger_source == "product":
-                # Legacy path (called from proximity scout click)
-                self._update_chain_list()
-            elif trigger_source == "cc":
+            elif trigger_source in ("planet", "cc"):
+                # Planet/CC changed → just refresh BOM (chain list is already correct)
                 self._update_bom()
         except Exception as e:
             timestamp = datetime.datetime.now().isoformat()
@@ -1149,9 +1152,6 @@ class PIGeneratorApp:
         # Simple frame — no scrollbar. Window auto-sizes to content after build.
         scroll_frame = ttk.Frame(parent)
         scroll_frame.pack(fill=tk.BOTH, expand=True)
-
-        # Dummy ref so _update_bom doesn't crash on the after_idle call
-        self._main_canvas = None
 
         # ── STEP 1: PRODUCT ───────────────────────────────────────────
         # Build master product list: all products across all chains, sorted
@@ -1413,16 +1413,13 @@ class PIGeneratorApp:
         if needs_barren_temp:
             valid_planets = list(HTIF_PLANET_TYPES)
         elif is_extraction:
-            # Only planet types that have at least one P0 for this product
-            product = self.product_var.get()
-            valid_planets = []
-            for ptype, p0_list in PLANET_RESOURCES.items():
-                for p0 in p0_list:
-                    recipe = RECIPES_P0_P1.get(product)
-                    if recipe and recipe["input"][0][0] == p0:
-                        valid_planets.append(ptype)
-                        break
-            valid_planets = sorted(valid_planets) if valid_planets else list(PLANET_TYPES.keys())
+            # Only planet types whose resources include this product's P0
+            recipe = RECIPES_P0_P1.get(self.product_var.get())
+            p0 = recipe["input"][0][0] if recipe else None
+            valid_planets = sorted(
+                ptype for ptype, p0_list in PLANET_RESOURCES.items() if p0 in p0_list)
+            if not valid_planets:
+                valid_planets = list(PLANET_TYPES.keys())
         else:
             valid_planets = list(PLANET_TYPES.keys())
 
@@ -1495,11 +1492,21 @@ class PIGeneratorApp:
             y += 4
             c.create_line(8, y, right_x, y, fill=EVE["border"], width=1)
             y += 4
-            draw_row("BASE P1 MATERIALS", "", EVE["fg_dim"])
-            for name, qty in sorted(bom.items()):
-                tier = get_tier(name)
-                clr  = TIER_CLR.get(tier, EVE["fg"])
-                draw_row(f"  {name}", f"{qty}×", clr, indent=4)
+            if chain == "P0 → P1 (Extraction)":
+                # P0 comes from the extractor — nothing to haul in
+                draw_row("EXTRACTED ON-PLANET — no imports needed", "", EVE["green"])
+                for name, qty in sorted(bom.items()):
+                    tier = get_tier(name)
+                    clr  = TIER_CLR.get(tier, EVE["fg"])
+                    draw_row(f"  {name}", f"{qty}×  [{tier}]", clr, indent=4)
+            else:
+                # These are the materials the player must manually send to
+                # the Launch Pad(s) — the planet cannot produce them.
+                draw_row("⬆ SEND TO LAUNCH PAD (per cycle)", "", EVE["orange"])
+                for name, qty in sorted(bom.items()):
+                    tier = get_tier(name)
+                    clr  = TIER_CLR.get(tier, EVE["fg"])
+                    draw_row(f"  {name}", f"{qty}×  [{tier}]", clr, indent=4)
 
         c.config(height=max(80, y + 8))
         # Resize main window to fit content after BOM height changes
@@ -1517,7 +1524,7 @@ class PIGeneratorApp:
                                    "Please select a product, chain, and planet type.")
             return
 
-        if chain in ("P3 → P4 (Factory)", "P2 → P4 (Factory)", "P1 → P4 (Factory)") \
+        if chain in ("P2 → P4 (Factory)", "P1 → P4 (Factory)") \
                 and planet not in HTIF_PLANET_TYPES:
             messagebox.showwarning("Invalid Planet",
                                    "P4 production requires a Barren or Temperate planet.")
@@ -1616,50 +1623,55 @@ class PIGeneratorApp:
         map_canvas.pack(fill=tk.BOTH, expand=True)
 
         view_state = {"zoom": 1.0, "pan_x": 0, "pan_y": 0, "drag_start_x": 0, "drag_start_y": 0,
-                      "last_draw_time": 0, "pending_draw": None}
+                      "redraw_job": None}
 
-        def throttled_draw():
-            now = time.time()
-            if now - view_state["last_draw_time"] > 0.033:
-                view_state["last_draw_time"] = now
+        # Panning moves the already-drawn items ("map" tag) — no redraw, no
+        # flicker. Zooming scales them in place for instant feedback, then a
+        # single debounced redraw restores crisp line widths and icon sizes.
+        def _schedule_crisp_redraw(delay=120):
+            if view_state["redraw_job"]:
+                popup.after_cancel(view_state["redraw_job"])
+
+            def _do():
+                view_state["redraw_job"] = None
                 self._draw_map(map_canvas, template, view_state)
-                view_state["pending_draw"] = None
-            else:
-                if view_state["pending_draw"] is None:
-                    view_state["pending_draw"] = popup.after(33, throttled_draw)
+
+            view_state["redraw_job"] = popup.after(delay, _do)
 
         def on_scroll(event):
-            if event.delta > 0:
-                view_state["zoom"] = min(3.0, view_state["zoom"] * 1.15)
-            else:
-                view_state["zoom"] = max(0.3, view_state["zoom"] / 1.15)
-            throttled_draw()
+            factor = 1.15 if event.delta > 0 else 1 / 1.15
+            new_zoom = max(0.3, min(3.0, view_state["zoom"] * factor))
+            factor = new_zoom / view_state["zoom"]
+            if factor == 1.0:
+                return
+            view_state["zoom"] = new_zoom
+            # Scaling about the canvas center also scales the pan offset.
+            view_state["pan_x"] *= factor
+            view_state["pan_y"] *= factor
+            cw = map_canvas.winfo_width() or 700
+            ch = map_canvas.winfo_height() or 500
+            map_canvas.scale("map", cw / 2, ch / 2, factor, factor)
+            _schedule_crisp_redraw()
 
         def on_drag_start(event):
+            map_canvas.delete("tooltip")
             view_state["drag_start_x"] = event.x
             view_state["drag_start_y"] = event.y
 
         def on_drag(event):
             dx = event.x - view_state["drag_start_x"]
             dy = event.y - view_state["drag_start_y"]
-            view_state["pan_x"] += dx
-            view_state["pan_y"] += dy
             view_state["drag_start_x"] = event.x
             view_state["drag_start_y"] = event.y
-            throttled_draw()
-
-        def on_drag_end(event):
-            if view_state["pending_draw"]:
-                popup.after_cancel(view_state["pending_draw"])
-                view_state["pending_draw"] = None
-            self._draw_map(map_canvas, template, view_state)
+            view_state["pan_x"] += dx
+            view_state["pan_y"] += dy
+            map_canvas.move("map", dx, dy)
 
         map_canvas.bind("<MouseWheel>", on_scroll)
         map_canvas.bind("<Button-4>", lambda e: on_scroll(type('obj', (object,), {'delta': 120})))
         map_canvas.bind("<Button-5>", lambda e: on_scroll(type('obj', (object,), {'delta': -120})))
         map_canvas.bind("<Button-1>", on_drag_start)
         map_canvas.bind("<B1-Motion>", on_drag)
-        map_canvas.bind("<ButtonRelease-1>", on_drag_end)
 
         popup.update_idletasks()
         self._draw_map(map_canvas, template, view_state)
@@ -1779,7 +1791,6 @@ class PIGeneratorApp:
     def _draw_map(self, canvas, template, view_state=None):
         """Dessine la carte visuelle du template (pins, liens, légende) avec zoom et panoramique."""
         canvas.delete("all")
-        canvas.update_idletasks()
         cw = canvas.winfo_width() or 700
         ch = canvas.winfo_height() or 500
         
@@ -1794,167 +1805,55 @@ class PIGeneratorApp:
         if not pins:
             return
 
-        def get_struct_name(type_id):
-            for sname, planets in STRUCTURE_IDS.items():
-                if type_id in planets.values():
-                    return sname
-            return None
-
-        lps = []
-        sfs = []
-        ecus = []
-        htfs = []
-        aifs = []
-        bifs = []
-
-        for i, pin in enumerate(pins):
-            sname = get_struct_name(pin.get("T"))
-            rec = (i, pin, sname)
-            if sname == "Launch Pad":
-                lps.append(rec)
-            elif sname == "Storage Facility":
-                sfs.append(rec)
-            elif sname == "Extractor Control Unit":
-                ecus.append(rec)
-            elif sname == "High-Tech Industry Facility":
-                htfs.append(rec)
-            elif sname == "Advanced Industry Facility":
-                aifs.append(rec)
-            elif sname == "Basic Industry Facility":
-                bifs.append(rec)
-
-        factories = aifs + bifs + htfs
-        has_ecu = len(ecus) > 0
-        is_extraction = has_ecu and len(bifs) > 0
-
-        num_lps = max(1, len(lps))
-        num_factories = len(factories)
-        
-        factories_per_row = min(8, max(4, num_factories // max(1, num_lps)))
-        num_rows = max(1, (num_factories + factories_per_row - 1) // factories_per_row)
-        
+        # ── True-scale planet layout ──────────────────────────────────────
+        # Project each pin's real planet coordinates (La/Lo, radians) to the canvas so
+        # the preview matches the in-game spacing. Two things make it faithful:
+        #   1. Longitude is compressed by sin(La) — a step of longitude covers less
+        #      surface the further you are from the equator (sphere geometry).
+        #   2. Building icons are sized from the real inter-building spacing (not a
+        #      fixed cap), so the building-to-gap ratio is the same as in-game.
+        # The cluster is then uniformly scaled to fit the window (pure zoom, which the
+        # user can still adjust) — relative proportions are preserved exactly.
         margin = 60
-        available_w = cw - 2 * margin
-        available_h = ch - 2 * margin
-        
-        max_cols = factories_per_row + 1
-        max_rows = max(num_rows + 2, num_lps + 2)
-        
-        node_spacing_x = min(90, available_w / (max_cols + 1))
-        node_spacing_y = min(90, available_h / (max_rows + 1))
-        node_radius = min(28, node_spacing_x * 0.35, node_spacing_y * 0.35)
-        
+        available_w = max(1.0, cw - 2 * margin)
+        available_h = max(1.0, ch - 2 * margin)
+
+        lats = [float(p.get("La", 0.0)) for p in pins]
+        lons = [float(p.get("Lo", 0.0)) for p in pins]
+        lat_min, lat_max = min(lats), max(lats)
+        lon_min, lon_max = min(lons), max(lons)
+        lat_span = (lat_max - lat_min) or 1e-9
+
+        # Longitude → surface distance shrinks by sin(colatitude); ~constant over a
+        # small cluster, so one factor at the mean latitude keeps the aspect ratio true.
+        lon_compress = max(0.05, math.sin((lat_min + lat_max) / 2.0))
+        lon_span = ((lon_max - lon_min) * lon_compress) or 1e-9
+
+        # Uniform scale keeps the real aspect ratio (no horizontal/vertical stretch).
+        scale = min(available_w / lon_span, available_h / lat_span)
+        off_x = (cw - lon_span * scale) / 2.0
+        off_y = (ch - lat_span * scale) / 2.0
+
         positions = {}
-        cx, cy = cw / 2, ch / 2
+        for i, pin in enumerate(pins):
+            # Lo → x (east-west); La → y, inverted so higher latitude sits higher up.
+            px = off_x + (float(pin.get("Lo", 0.0)) - lon_min) * lon_compress * scale
+            py = off_y + (lat_max - float(pin.get("La", 0.0))) * scale
+            positions[i] = (px, py)
 
-        if is_extraction:
-            if ecus:
-                positions[ecus[0][0]] = (cx, margin + node_spacing_y)
-            
-            sf_y = margin + node_spacing_y * 2 if sfs else None
-            if sfs:
-                positions[sfs[0][0]] = (cx, sf_y)
-            
-            lp_y = margin + node_spacing_y * (3 if sfs else 2.5)
-            if lps:
-                positions[lps[0][0]] = (cx, lp_y)
-            
-            num_bif = len(bifs)
-            if num_bif > 0:
-                bifs_per_row = min(8, num_bif)
-                bif_rows = (num_bif + bifs_per_row - 1) // bifs_per_row
-                
-                bif_idx = 0
-                for row in range(bif_rows):
-                    row_y = lp_y + node_spacing_y * (row + 1)
-                    bifs_this_row = min(bifs_per_row, num_bif - bif_idx)
-                    row_width = (bifs_this_row - 1) * node_spacing_x
-                    start_x = cx - row_width / 2
-                    
-                    for col in range(bifs_this_row):
-                        if bif_idx < num_bif:
-                            x = start_x + col * node_spacing_x
-                            positions[bifs[bif_idx][0]] = (x, row_y)
-                            bif_idx += 1
-
-        else:
-            num_lps = len(lps)
-            num_aifs = len(aifs)
-            num_htfs = len(htfs)
-            
-            total_rows = num_lps + (1 if num_htfs > 0 else 0) + 1
-            row_height = min(node_spacing_y, available_h / (total_rows + 1))
-            
-            start_y = cy - (num_lps - 1) * row_height / 2
-            
-            if htfs:
-                htf_y = start_y - row_height * 1.5
-                htf_width = (len(htfs) - 1) * node_spacing_x
-                htf_start_x = cx - htf_width / 2
-                for idx, (pin_idx, pin, sname) in enumerate(htfs):
-                    x = htf_start_x + idx * node_spacing_x
-                    positions[pin_idx] = (x, htf_y)
-            
-            lp_positions = []
-            for idx, (pin_idx, pin, sname) in enumerate(lps):
-                y = start_y + idx * row_height
-                positions[pin_idx] = (cx, y)
-                lp_positions.append((cx, y))
-            
-            if num_aifs > 0 and num_lps > 0:
-                aifs_per_lp = (num_aifs + num_lps - 1) // num_lps
-                aif_idx = 0
-                
-                for lp_idx, (lp_x, lp_y) in enumerate(lp_positions):
-                    remaining = num_aifs - aif_idx
-                    count_this_lp = min(aifs_per_lp, remaining)
-                    
-                    left_count = (count_this_lp + 1) // 2
-                    right_count = count_this_lp - left_count
-                    
-                    for i in range(left_count):
-                        if aif_idx < num_aifs:
-                            x = lp_x - node_spacing_x * (i + 1)
-                            positions[aifs[aif_idx][0]] = (x, lp_y)
-                            aif_idx += 1
-                    
-                    for i in range(right_count):
-                        if aif_idx < num_aifs:
-                            x = lp_x + node_spacing_x * (i + 1)
-                            positions[aifs[aif_idx][0]] = (x, lp_y)
-                            aif_idx += 1
-            
-            if sfs and lp_positions:
-                last_lp_x, last_lp_y = lp_positions[-1]
-                sf_y = last_lp_y + row_height
-                for idx, (pin_idx, pin, sname) in enumerate(sfs):
-                    positions[pin_idx] = (cx, sf_y)
-            
-            if bifs:
-                bif_y = start_y + num_lps * row_height
-                bif_width = (len(bifs) - 1) * node_spacing_x
-                bif_start_x = cx - bif_width / 2
-                for idx, (pin_idx, pin, sname) in enumerate(bifs):
-                    x = bif_start_x + idx * node_spacing_x
-                    positions[pin_idx] = (x, bif_y)
-
-        unpositioned = [i for i in range(len(pins)) if i not in positions]
-        if unpositioned:
-            extra_y = ch - margin - node_spacing_y
-            extra_width = (len(unpositioned) - 1) * node_spacing_x
-            extra_start_x = cx - extra_width / 2
-            for idx, pin_idx in enumerate(unpositioned):
-                positions[pin_idx] = (extra_start_x + idx * node_spacing_x, extra_y)
-
-        STRUCT_STYLE = {
-            "Launch Pad":                 {"fill": "#1a1a1a", "stroke": "#ffffff", "icon": "⬡", "icon_color": "#ffffff"},
-            "Storage Facility":           {"fill": "#1a1a1a", "stroke": "#ffffff", "icon": "◎", "icon_color": "#ffffff"},
-            "Basic Industry Facility":    {"fill": "#1a1a1a", "stroke": "#ffffff", "icon": "⚙", "icon_color": "#ffffff"},
-            "Advanced Industry Facility": {"fill": "#1a1a1a", "stroke": "#ffffff", "icon": "⚙", "icon_color": "#ffffff"},
-            "High-Tech Industry Facility":{"fill": "#1a1a1a", "stroke": "#ffffff", "icon": "⬆", "icon_color": "#ffffff"},
-            "Extractor Control Unit":     {"fill": "#1a1a1a", "stroke": "#ffffff", "icon": "⊕", "icon_color": "#ffffff"},
-        }
-        default_style = {"fill": "#1a1a1a", "stroke": "#888888", "icon": "?", "icon_color": "#888888"}
+        # Building size = fraction of the closest real spacing, so tightly-packed
+        # (optimised) layouts render snug — just like the in-game planet view.
+        pts = list(positions.values())
+        min_dist = None
+        for a in range(len(pts)):
+            ax, ay = pts[a]
+            for b in range(a + 1, len(pts)):
+                d = math.hypot(ax - pts[b][0], ay - pts[b][1])
+                if d > 0 and (min_dist is None or d < min_dist):
+                    min_dist = d
+        if min_dist is None:
+            min_dist = min(available_w, available_h)
+        node_radius = max(5.0, min(min_dist * 0.46, min(available_w, available_h) / 5.0))
 
         def transform(x, y):
             cx_canvas = cw / 2
@@ -1979,12 +1878,12 @@ class PIGeneratorApp:
                 tx2, ty2 = transform(x2, y2)
                 canvas.create_line(tx1, ty1, tx2, ty2, fill=link_color, width=link_width)
 
-        def draw_gear_icon(cx, cy, size, color="#ffffff"):
+        def draw_gear_icon(cx, cy, size, color="#ffffff", tags=()):
             teeth = 8
             outer_r = size * 0.85
             inner_r = size * 0.55
             tooth_depth = size * 0.2
-            
+
             points = []
             for i in range(teeth * 2):
                 angle = math.pi * i / teeth - math.pi / 2
@@ -1995,16 +1894,17 @@ class PIGeneratorApp:
                 px = cx + r * math.cos(angle)
                 py = cy + r * math.sin(angle)
                 points.extend([px, py])
-            
-            canvas.create_polygon(points, fill=color, outline=color, width=1)
+
+            canvas.create_polygon(points, fill=color, outline=color, width=1, tags=tags)
             canvas.create_oval(cx - inner_r * 0.5, cy - inner_r * 0.5,
                              cx + inner_r * 0.5, cy + inner_r * 0.5,
-                             fill="#1a1a1a", outline=color, width=max(1, int(size * 0.08)))
+                             fill="#1a1a1a", outline=color, width=max(1, int(size * 0.08)),
+                             tags=tags)
 
-        def draw_rocket_icon(cx, cy, size, color="#ffffff"):
+        def draw_rocket_icon(cx, cy, size, color="#ffffff", tags=()):
             w = size * 0.35
             h = size * 0.85
-            
+
             points = [
                 cx, cy - h * 0.5,
                 cx + w * 0.4, cy - h * 0.25,
@@ -2017,33 +1917,34 @@ class PIGeneratorApp:
                 cx - w * 0.4, cy + h * 0.3,
                 cx - w * 0.4, cy - h * 0.25,
             ]
-            canvas.create_polygon(points, fill=color, outline=color, width=1)
-            
+            canvas.create_polygon(points, fill=color, outline=color, width=1, tags=tags)
+
             wr = size * 0.12
             canvas.create_oval(cx - wr, cy - h * 0.1 - wr,
                              cx + wr, cy - h * 0.1 + wr,
-                             fill="#1a1a1a", outline=color, width=1)
+                             fill="#1a1a1a", outline=color, width=1, tags=tags)
 
-        def draw_crosshair_icon(cx, cy, size, color="#ffffff"):
+        def draw_crosshair_icon(cx, cy, size, color="#ffffff", tags=()):
             r1 = size * 0.8
             canvas.create_oval(cx - r1, cy - r1, cx + r1, cy + r1,
-                             fill="", outline=color, width=max(1, int(size * 0.1)))
+                             fill="", outline=color, width=max(1, int(size * 0.1)), tags=tags)
             r2 = size * 0.45
             canvas.create_oval(cx - r2, cy - r2, cx + r2, cy + r2,
-                             fill="", outline=color, width=max(1, int(size * 0.1)))
+                             fill="", outline=color, width=max(1, int(size * 0.1)), tags=tags)
             lw = max(1, int(size * 0.1))
-            canvas.create_line(cx, cy - r1, cx, cy + r1, fill=color, width=lw)
-            canvas.create_line(cx - r1, cy, cx + r1, cy, fill=color, width=lw)
+            canvas.create_line(cx, cy - r1, cx, cy + r1, fill=color, width=lw, tags=tags)
+            canvas.create_line(cx - r1, cy, cx + r1, cy, fill=color, width=lw, tags=tags)
 
-        def draw_storage_icon(cx, cy, size, color="#ffffff"):
+        def draw_storage_icon(cx, cy, size, color="#ffffff", tags=()):
             for i, factor in enumerate([0.8, 0.55, 0.3]):
                 r = size * factor
                 fill = "" if i < 2 else color
                 canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
-                                 fill=fill, outline=color, width=max(1, int(size * 0.08)))
+                                 fill=fill, outline=color, width=max(1, int(size * 0.08)),
+                                 tags=tags)
 
-        def draw_htf_icon(cx, cy, size, color="#ffffff"):
-            draw_gear_icon(cx, cy, size * 0.9, color)
+        def draw_htf_icon(cx, cy, size, color="#ffffff", tags=()):
+            draw_gear_icon(cx, cy, size * 0.9, color, tags=tags)
             aw = size * 0.25
             ah = size * 0.4
             points = [
@@ -2055,39 +1956,100 @@ class PIGeneratorApp:
                 cx - aw * 0.4, cy,
                 cx - aw, cy,
             ]
-            canvas.create_polygon(points, fill="#1a1a1a", outline=color, width=1)
+            canvas.create_polygon(points, fill="#1a1a1a", outline=color, width=1, tags=tags)
+
+        # ── Manual imports per Launch Pad ─────────────────────────────────
+        # A route leaving an LP with a commodity that no structure on the
+        # planet produces means the player must haul that commodity in.
+        lp_idx0 = {i for i, p in enumerate(pins)
+                   if STRUCT_TYPE_TO_NAME.get(p.get("T")) == "Launch Pad"}
+        produced_tids = {p.get("S") for p in pins if p.get("S")}
+        lp_imports = {}   # 0-based LP pin idx -> {commodity tid -> {dest pin -> qty}}
+        for rt in template.get("R", []):
+            rpath = rt.get("P") or []
+            if len(rpath) < 2:
+                continue
+            src0, dst0 = rpath[0] - 1, rpath[-1] - 1
+            tid = rt.get("T")
+            if src0 in lp_idx0 and dst0 not in lp_idx0 and tid not in produced_tids:
+                lp_imports.setdefault(src0, {}).setdefault(tid, {})[dst0] = rt.get("Q", 0)
+
+        def _show_lp_tooltip(event, pin_idx):
+            canvas.delete("tooltip")
+            imports = lp_imports.get(pin_idx, {})
+            if imports:
+                lines = ["⬆  Send to this Launch Pad:"]
+                for tid, dests in sorted(imports.items(),
+                                         key=lambda kv: ID_TO_COMMODITY.get(kv[0], "")):
+                    name = ID_TO_COMMODITY.get(tid, f"type {tid}")
+                    total = sum(dests.values())
+                    lines.append(f"   {name}  —  {total:,} /cycle")
+            else:
+                lines = ["⬆  Send to this Launch Pad:", "   nothing — collection / export only"]
+            # state=DISABLED keeps the tooltip out of mouse hit-testing so it
+            # can't steal the <Leave> event from the pin under the cursor.
+            tip = canvas.create_text(event.x + 16, event.y, anchor=tk.W,
+                                     text="\n".join(lines), justify=tk.LEFT,
+                                     fill=EVE["fg_bright"], font=("Segoe UI", 9),
+                                     tags=("tooltip",), state=tk.DISABLED)
+            x1, y1, x2, y2 = canvas.bbox(tip)
+            # Keep the tooltip inside the canvas
+            w_now = canvas.winfo_width() or cw
+            h_now = canvas.winfo_height() or ch
+            dx = min(0, (w_now - 8) - x2)
+            dy = max(0, 8 - y1) + min(0, (h_now - 8) - y2)
+            if dx or dy:
+                canvas.move(tip, dx, dy)
+                x1, y1, x2, y2 = canvas.bbox(tip)
+            bg = canvas.create_rectangle(x1 - 8, y1 - 6, x2 + 8, y2 + 6,
+                                         fill=EVE["bg_panel"], outline=EVE["accent"],
+                                         width=1, tags=("tooltip",), state=tk.DISABLED)
+            canvas.tag_raise(tip, bg)
 
         for pin_idx, (x, y) in positions.items():
             pin = pins[pin_idx]
-            sname = get_struct_name(pin.get("T"))
-            style = STRUCT_STYLE.get(sname, default_style)
-            
+            sname = STRUCT_TYPE_TO_NAME.get(pin.get("T"))
+            # Known structures render white; unknown type ids render grey "?"
+            stroke = "#ffffff" if sname else "#888888"
+            pin_tag = f"pin{pin_idx}"
+
             tx, ty = transform(x, y)
             r = node_radius * zoom
-            
-            canvas.create_oval(tx - r - 5 * zoom, ty - r - 5 * zoom, 
+
+            canvas.create_oval(tx - r - 5 * zoom, ty - r - 5 * zoom,
                              tx + r + 5 * zoom, ty + r + 5 * zoom,
-                             outline=style["stroke"], width=1, dash=(3, 3))
-            
+                             outline=stroke, width=1, dash=(3, 3), tags=(pin_tag,))
+
             canvas.create_oval(tx - r, ty - r, tx + r, ty + r,
-                             fill="#1a1a1a", outline=style["stroke"], width=max(2, int(2.5 * zoom)))
-            
+                             fill="#1a1a1a", outline=stroke, width=max(2, int(2.5 * zoom)),
+                             tags=(pin_tag,))
+
             icon_size = r * 0.7
             if sname == "Launch Pad":
-                draw_rocket_icon(tx, ty, icon_size, style["stroke"])
+                draw_rocket_icon(tx, ty, icon_size, stroke, tags=(pin_tag,))
             elif sname == "Storage Facility":
-                draw_storage_icon(tx, ty, icon_size, style["stroke"])
+                draw_storage_icon(tx, ty, icon_size, stroke, tags=(pin_tag,))
             elif sname == "Extractor Control Unit":
-                draw_crosshair_icon(tx, ty, icon_size, style["stroke"])
+                draw_crosshair_icon(tx, ty, icon_size, stroke, tags=(pin_tag,))
             elif sname == "High-Tech Industry Facility":
-                draw_htf_icon(tx, ty, icon_size, style["stroke"])
+                draw_htf_icon(tx, ty, icon_size, stroke, tags=(pin_tag,))
             elif sname in ("Basic Industry Facility", "Advanced Industry Facility"):
-                draw_gear_icon(tx, ty, icon_size, style["stroke"])
+                draw_gear_icon(tx, ty, icon_size, stroke, tags=(pin_tag,))
             else:
-                icon = style["icon"]
                 font_size = max(8, int(r * 0.5))
-                canvas.create_text(tx, ty, text=icon, fill=style["icon_color"],
-                                 font=("Segoe UI Symbol", font_size, "bold"))
+                canvas.create_text(tx, ty, text="?", fill=stroke,
+                                 font=("Segoe UI Symbol", font_size, "bold"),
+                                 tags=(pin_tag,))
+
+            if pin_idx in lp_idx0:
+                canvas.tag_bind(pin_tag, "<Enter>",
+                                lambda e, i=pin_idx: _show_lp_tooltip(e, i))
+                canvas.tag_bind(pin_tag, "<Leave>",
+                                lambda e: canvas.delete("tooltip"))
+
+        # Everything drawn so far is the template itself — tag it so pan/zoom
+        # can move/scale it as one group. The legend below stays fixed.
+        canvas.addtag_all("map")
 
         legend_items = [
             ("Launch Pad", "rocket"),
@@ -2107,8 +2069,7 @@ class PIGeneratorApp:
         for j, (name, icon_type) in enumerate(legend_items):
             ly2 = ly + 20 + j * 20
             icx, icy = lx + 12, ly2
-            icon_s = 7
-            
+
             canvas.create_oval(icx - 8, icy - 8, icx + 8, icy + 8,
                              fill="#1a1a1a", outline="#ffffff", width=1)
             
@@ -2328,7 +2289,7 @@ class PIGeneratorApp:
             if sec >= 0.1:  return "#e0a030"
             return "#cc4444"
 
-        def _make_planet_card(parent, system_name, security, planet_data, jump_dist):
+        def _make_planet_card(parent, security, planet_data, jump_dist):
             """Crée un canvas-carte cliquable pour une planète avec priorités P0→P1 et rayon."""
             ptype   = planet_data.get("type", "Unknown")
             pname   = planet_data.get("name", "")
@@ -2340,10 +2301,6 @@ class PIGeneratorApp:
             # Priority-ordered P0→P1 pairs for this planet type
             # Each entry: (p1_name, p0_name, tier_rank)
             priority_rows = PLANET_PI_PRIORITY.get(ptype, [])
-
-            # Convenience lists for collapsed-view badge strip
-            p1s = [r[0] for r in priority_rows]
-            p0s = [r[1] for r in priority_rows]
 
             # Top-tier (rank 1) items shown as badges in collapsed view
             top_p1s = [(r[0], r[2]) for r in priority_rows if r[2] == 1]
@@ -2423,11 +2380,12 @@ class PIGeneratorApp:
                 if top_p1s:
                     rx = x
                     for p1_name, _ in top_p1s:
-                        badge_text = f"🥇 {p1_name}"
-                        card.create_text(rx, y, anchor=tk.NW,
-                                         text=badge_text,
-                                         fill=_TIER_CLR_PI[1], font=("Segoe UI", 11, "bold"))
-                        rx += len(badge_text) * 7 + 10
+                        item = card.create_text(rx, y, anchor=tk.NW,
+                                                text=f"🥇 {p1_name}",
+                                                fill=_TIER_CLR_PI[1], font=("Segoe UI", 11, "bold"))
+                        # Advance by the real rendered width — a per-character
+                        # estimate overlaps the next badge onto this text.
+                        rx = card.bbox(item)[2] + 12
                     y += 22
 
                 y += 4   # bottom padding for collapsed view
@@ -2492,7 +2450,7 @@ class PIGeneratorApp:
 
             return card
 
-        def _render_results(systems_data, origin_id):
+        def _render_results(systems_data):
             """Peuple la zone de résultats avec les sections système et cartes planète triées."""
             for w in cards_frame.winfo_children():
                 w.destroy()
@@ -2584,7 +2542,7 @@ class PIGeneratorApp:
                     w.bind("<Button-1>", _toggle)
 
                 for planet in sorted(planets, key=lambda p: p.get("type", "")):
-                    card = _make_planet_card(cards_container, sname, sec, planet, jdist)
+                    card = _make_planet_card(cards_container, sec, planet, jdist)
                     card.pack(fill=tk.X, padx=4, pady=2)
 
             for sid, sdata in sys_list:
@@ -2602,7 +2560,12 @@ class PIGeneratorApp:
             _hide_ac()
 
             sys_name = sys_var.get().strip()
-            jumps = jumps_var.get()
+            try:
+                jumps = max(0, min(10, int(jumps_var.get())))
+            except (tk.TclError, ValueError):
+                status_var.set("Invalid jump count.")
+                scan_btn._scanning = False
+                return
 
             if not sys_name:
                 status_var.set("Enter a system name first.")
@@ -2640,6 +2603,9 @@ class PIGeneratorApp:
                         dist_map = {start_id: 0}
                         frontier = {start_id}
                         all_ids = {start_id}
+                        # System payloads fetched during the BFS, reused by the
+                        # planet scan below so each system is downloaded once.
+                        sys_payloads = {}
 
                         for depth in range(1, jumps + 1):
                             if not frontier: break
@@ -2647,7 +2613,9 @@ class PIGeneratorApp:
 
                             def _get_gates(sid):
                                 try:
-                                    return _esi_fetch(f"/universe/systems/{sid}/").get("stargates", [])
+                                    data = _esi_fetch(f"/universe/systems/{sid}/")
+                                    sys_payloads[sid] = data
+                                    return data.get("stargates", [])
                                 except Exception:
                                     return []
 
@@ -2677,7 +2645,8 @@ class PIGeneratorApp:
                         popup.after(0, lambda: status_var.set(f"Scanning {n} systems…"))
                         systems_data = _fetch_planets_for_systems(
                             list(all_ids),
-                            lambda m: popup.after(0, lambda msg=m: status_var.set(msg)))
+                            lambda m: popup.after(0, lambda msg=m: status_var.set(msg)),
+                            preloaded=sys_payloads)
 
                         # Attach jump distances to each system's data dict
                         for sid_key in systems_data:
@@ -2686,14 +2655,14 @@ class PIGeneratorApp:
 
                         _save_scan_cache(cache_key, systems_data)
 
-                    popup.after(0, lambda: _render_results(systems_data, start_id))
+                    popup.after(0, lambda: _render_results(systems_data))
                     _update_window_config("scanner_last_system", sys_name)
                     _update_window_config("scanner_last_jumps", jumps)
 
                 except Exception as e:
                     _debug(f"Proximity Scout scan error: {e}")
-                    import traceback; traceback.print_exc()
-                    popup.after(0, lambda: status_var.set(f"Error: {e}"))
+                    traceback.print_exc()
+                    popup.after(0, lambda msg=str(e): status_var.set(f"Error: {msg}"))
                 finally:
                     popup.after(0, _reset_btn)
 
