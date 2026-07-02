@@ -1118,7 +1118,7 @@ class PIGeneratorApp:
         content.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
 
         ttk.Label(content, text="EVE Online — PI Template Generator", style="Header.TLabel").pack(anchor=tk.W, pady=(0,5))
-        ttk.Label(content, text="Version 1.4", style="Sub.TLabel").pack(anchor=tk.W)
+        ttk.Label(content, text="Version 1.6", style="Sub.TLabel").pack(anchor=tk.W)
         ttk.Label(content, text="\nBased on the Planetary Interaction Template\nGenerator spreadsheet by Razkin\n(Pandemic Horde).").pack(anchor=tk.W)
         ttk.Label(content, text="\nBundled Template Library:", style="Sub.TLabel").pack(anchor=tk.W)
         ttk.Label(content, text="Templates by DalShooth").pack(anchor=tk.W)
