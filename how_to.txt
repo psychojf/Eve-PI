@@ -14,7 +14,7 @@ Keep the "data" folder next to the .exe — the planet icons,
 template library and planet radius table are read from
 there, not from inside the executable.
 
-The main window has five configuration steps, a Bill of
+The main window has six configuration steps, a Bill of
 Materials panel below them, and three buttons at the bottom:
 GENERATE TEMPLATE, PROXIMITY SCOUT and TEMPLATE LIBRARY.
 
@@ -83,10 +83,68 @@ Work down the numbered panels:
      Radius. Defaults to 5000. This only scales the layout;
      it does not change the structure count.
 
+     On a P0 → P1 planet a checkbox also appears here:
+     "Include Storage Facility (P0 buffer)". It puts a
+     Storage Facility between the extractor and the
+     factories, so raw material that arrives faster than the
+     factories consume it has somewhere to sit instead of
+     being lost. Worth it if you run short extraction
+     programs that spike well above the average yield.
+
   5. COMMAND CENTER LEVEL
      Your Command Center Upgrades skill (0–5), as clickable
      badges. Higher levels mean more CPU and power, so the
-     generator fits more factories on the planet.
+     generator has more to work with.
+
+  6. LAYOUT
+     There is no single correct PI layout, so the decisions
+     that actually shape a colony are yours:
+
+     Collect every — how long the colony must run without
+       you. The generator adds launch pads, and if need be
+       drops factories, until the pads can hold that many
+       hours of materials. Ask for 48h and you get a smaller,
+       slower colony you can ignore for two days; ask for 6h
+       and you get maximum output you must service often.
+
+       This bites hardest on factory planets, where the
+       imports alone fill a pad quickly. A P3 → P4 planet at
+       level 5 goes from 16 facilities on 2 pads at 6h to 8
+       facilities on 4 pads at 24h. On extraction planets it
+       usually changes nothing: P1 is compact enough that a
+       single pad already holds several days of output — a
+       balanced level 5 extraction planet runs about 150
+       hours untended — so don't be surprised when the layout
+       stays put.
+
+     Extractor yield — units per head per hour, shown only
+       for extraction chains. This is the number the whole
+       chain is balanced against: one basic factory eats
+       6000 units an hour, so a 10-head extractor at 2000
+       feeds three of them. Raise it if your deposits are
+       rich, lower it if the extractors run dry.
+
+     Set counts myself — tick this to place exact numbers of
+       extractors, heads, factories and pads. 0 means "you
+       decide". Manual values are placed as asked, even bad
+       ones: the panel then tells you what is wrong instead
+       of silently refusing. Available for the extraction and
+       single-stage factory chains; the multi-stage layouts
+       (P1→P3, P1→P4, P2→P4) are fixed by geometry.
+
+     The strip at the bottom of the panel measures whatever
+     is currently configured, updating as you type:
+
+       CPU and power bars against your command center,
+         green until 90%, amber to 100%, red beyond it.
+       "runs Nh untended" — green if it meets the interval
+         you asked for, amber if it falls short.
+       "extract N/h · factories use N/h" on extraction
+         chains — red when the factories outrun the ground.
+       Any number of ⚠ warning lines in red.
+
+     Your interval and yield choices are remembered between
+     sessions; the manual counts are not.
 
   Then click GENERATE TEMPLATE.
 
@@ -224,6 +282,17 @@ TIPS
 - Radius matters. Check it in-game and type the real value
   before generating.
 
+- Extraction planets are power-limited, not CPU-limited. A
+  10-head extractor burns 8100 of the 19000 power a level 5
+  command center has, which is why a balanced extraction
+  colony leaves CPU unused. Spending that spare power on a
+  second extractor leaves almost nothing for factories.
+
+- If the layout panel says the extractors are short, either
+  build fewer factories or accept that they idle part of the
+  time. Factories that outrun their supply do not produce
+  more, they just cost CPU and power.
+
 -----------------------------------------------------------
 TROUBLESHOOTING
 -----------------------------------------------------------
@@ -231,6 +300,28 @@ TROUBLESHOOTING
 "Could not generate template"
   — The Command Center level is too low for that layout.
     Raise it, or choose a chain with fewer structures.
+
+"Extractors N/h short of what the factories eat"
+  — More factories than the ground can feed. Either lower the
+    factory count, add an extractor if power allows, or raise
+    the Extractor yield if your deposits really are that rich.
+    Starved factories cost CPU and power without producing.
+
+"Storage only lasts Nh, not the Nh asked for"
+  — The colony cannot buffer the interval you picked. Add a
+    launch pad, drop a factory, or accept a shorter interval.
+    In automatic mode the generator has already tried; the
+    warning means even its best attempt fell short.
+
+"CPU / Power over budget"
+  — Only reachable with manual counts. The template is still
+    produced so you can see the shape of it, but EVE will
+    refuse to build it as-is.
+
+The layout panel is greyed out
+  — Manual counts are only available for the extraction and
+    single-stage factory chains. P1 → P3, P1 → P4 and
+    P2 → P4 build a fixed geometry that cannot be resized.
 
 Radius shows "—" in the Proximity Scout
   — The planet radius table is missing. The app downloads it

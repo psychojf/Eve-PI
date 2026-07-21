@@ -249,6 +249,34 @@ CC_LEVELS = {
 LINK_CPU_COST = 15
 LINK_POWER_COST = 8
 
+# Schematic cycle length per facility, in hours. Rates are recipe quantity
+# divided by these: a Basic Industry Facility running a P1 schematic turns
+# 3000 P0 into 20 P1 every 30 minutes, so it eats 6000 P0/h and makes 40 P1/h.
+CYCLE_HOURS = {
+    "Basic Industry Facility":     0.5,
+    "Advanced Industry Facility":  1.0,
+    "High-Tech Industry Facility": 1.0,
+}
+
+# Buffer capacity in m³ — what a colony can hold between collection trips.
+STORAGE_CAPACITY_M3 = {
+    "Launch Pad":       10000,
+    "Storage Facility": 12000,
+    "Command Center":     500,
+}
+
+# Assumed extractor yield, in raw units per head per hour. Real output depends
+# on deposit richness, program length and head placement, and decays over the
+# program — this is the planning figure the layout is balanced against, and the
+# user can change it. 2000/head/h ≈ 20k/h for a full 10-head extractor, which
+# is a realistic sustained figure for a decent deposit.
+DEFAULT_YIELD_PER_HEAD = 2000
+MAX_EXTRACTOR_HEADS = 10
+
+# How long the colony should run unattended between collection trips.
+DEFAULT_COLLECTION_HOURS = 24
+COLLECTION_INTERVALS = (6, 12, 24, 48)
+
 # "extracts": the planet mines its own P0, so the chain is limited to planet
 #   types that actually hold those resources and needs no P0 hauled in.
 # "supports_sf": the generator can add an optional Storage Facility.

@@ -19,7 +19,11 @@ import ssl
 from src.debug_log import _debug
 from src.pi_data import (
     CHAINS,
+    COLLECTION_INTERVALS,
     COMMODITY_SIZE,
+    DEFAULT_COLLECTION_HOURS,
+    DEFAULT_YIELD_PER_HEAD,
+    MAX_EXTRACTOR_HEADS,
     HTIF_PLANET_TYPES,
     NAME_TO_ID,
     NAME_TO_TIER,
@@ -30,7 +34,9 @@ from src.pi_data import (
     STRUCTURE_IDS,
 )
 from src.services.template_service import (
+    CONFIGURABLE_CHAINS,
     TemplateService,
+    analyze_template,
     get_full_supply_chain,
     get_tier,
 )
@@ -739,6 +745,7 @@ class PIGeneratorApp:
         
         self.root.resizable(False, False)
         self.current_template = None
+        self.current_preview = None   # colony the ⑥ LAYOUT panel is measuring
         self._main_hidden = False
         self._tray_icon = None
         self._sw = None
@@ -1339,6 +1346,85 @@ class PIGeneratorApp:
             btn.bind("<Button-1>", _make_cc_click())
         self._cc_buttons = list(cc_frame.winfo_children())
 
+        # ── STEP 6: LAYOUT ────────────────────────────────────────────
+        # PI has no single right answer, so the things that actually drive the
+        # shape of a colony — how hard the extractors run, how often you are
+        # willing to fly out — are settings rather than hardcoded constants.
+        cfg_layout = _load_window_config()
+        self.grp_layout = tk.Frame(scroll_frame, bg=EVE["bg_card"],
+                                   highlightbackground=EVE["border"], highlightthickness=1)
+        self.grp_layout.pack(fill=tk.X, padx=8, pady=3)
+
+        tk.Label(self.grp_layout, text="⑥ LAYOUT", bg=EVE["bg_card"], fg=EVE["accent"],
+                 font=("Segoe UI", 8, "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
+
+        # Collection interval — the "I hate collecting" dial
+        int_row = tk.Frame(self.grp_layout, bg=EVE["bg_card"])
+        int_row.pack(fill=tk.X, padx=8, pady=(2, 0))
+        tk.Label(int_row, text="Collect every", bg=EVE["bg_card"], fg=EVE["fg_dim"],
+                 font=("Segoe UI", 9)).pack(side=tk.LEFT)
+        self.interval_var = tk.IntVar(
+            value=cfg_layout.get("layout_collection_hours", DEFAULT_COLLECTION_HOURS))
+        self._interval_buttons = {}
+        for hrs in COLLECTION_INTERVALS:
+            b = tk.Label(int_row, text=f"{hrs}h", width=4, bg=EVE["bg_input"],
+                         fg=EVE["fg_dim"], font=("Segoe UI", 9, "bold"), cursor="hand2")
+            b.pack(side=tk.LEFT, padx=2)
+            b.bind("<Button-1>", lambda e, h=hrs: self._set_interval(h))
+            self._interval_buttons[hrs] = b
+
+        # Extractor yield — the assumption the whole extraction chain rests on
+        self.yield_row = tk.Frame(self.grp_layout, bg=EVE["bg_card"])
+        tk.Label(self.yield_row, text="Extractor yield", bg=EVE["bg_card"],
+                 fg=EVE["fg_dim"], font=("Segoe UI", 9)).pack(side=tk.LEFT)
+        self.yield_var = tk.StringVar(
+            value=str(cfg_layout.get("layout_yield_per_head", DEFAULT_YIELD_PER_HEAD)))
+        yield_entry = tk.Entry(self.yield_row, textvariable=self.yield_var, width=6,
+                               bg=EVE["bg_input"], fg=EVE["fg_bright"], relief=tk.FLAT,
+                               insertbackground=EVE["accent"], font=("Consolas", 9),
+                               justify=tk.RIGHT)
+        yield_entry.pack(side=tk.LEFT, padx=4)
+        tk.Label(self.yield_row, text="units / head / hour", bg=EVE["bg_card"],
+                 fg=EVE["fg_dim"], font=("Segoe UI", 8)).pack(side=tk.LEFT)
+        yield_entry.bind("<KeyRelease>", lambda e: self._on_layout_change())
+
+        # Manual counts — "validate me, don't decide for me"
+        self.manual_var = tk.BooleanVar(value=False)
+        self.manual_chk = ttk.Checkbutton(self.grp_layout,
+                                          text="Set counts myself  (0 = auto)",
+                                          variable=self.manual_var,
+                                          command=self._toggle_manual_layout)
+        self.manual_chk.pack(anchor=tk.W, padx=8, pady=(4, 0))
+
+        self.manual_frame = tk.Frame(self.grp_layout, bg=EVE["bg_card"])
+        self.manual_vars = {}
+        manual_rows = (
+            (("extractors", "Extractors", 4), ("heads", "Heads", MAX_EXTRACTOR_HEADS)),
+            (("factories", "Factories", 16), ("launch_pads", "Pads", 4)),
+        )
+        for pair in manual_rows:
+            line = tk.Frame(self.manual_frame, bg=EVE["bg_card"])
+            line.pack(fill=tk.X, pady=1)
+            for key, label, hi in pair:
+                tk.Label(line, text=label, bg=EVE["bg_card"], fg=EVE["fg_dim"],
+                         font=("Segoe UI", 8), width=9, anchor=tk.W).pack(side=tk.LEFT)
+                var = tk.StringVar(value="0")
+                sp_box = ttk.Spinbox(line, from_=0, to=hi, textvariable=var, width=4,
+                                     font=("Segoe UI", 9), command=self._on_layout_change)
+                sp_box.pack(side=tk.LEFT, padx=(0, 10))
+                sp_box.bind("<KeyRelease>", lambda e: self._on_layout_change())
+                self.manual_vars[key] = var
+        self.layout_canvas = tk.Canvas(self.grp_layout, bg=EVE["bg_card"],
+                                       highlightthickness=0, height=56)
+        self.layout_canvas.pack(fill=tk.X, padx=4, pady=(4, 8))
+        # Redraw when the canvas actually gets its width — but only on a width
+        # change, since the redraw sets the height and would otherwise loop.
+        self._layout_drawn_width = 0
+        self.layout_canvas.bind(
+            "<Configure>",
+            lambda e: (self._refresh_layout_panel()
+                       if e.width != self._layout_drawn_width else None))
+
         # ── BILL OF MATERIALS ─────────────────────────────────────────
         self.grp_bom = tk.Frame(scroll_frame, bg=EVE["bg_card"],
                                 highlightbackground=EVE["border"], highlightthickness=1)
@@ -1397,8 +1483,10 @@ class PIGeneratorApp:
             req_h = self.root.winfo_reqheight()
             # Add a small bottom margin (approx 3 text lines = 48px)
             new_h = req_h + 48
-            # Enforce minimum so the window never gets tiny
+            # Enforce minimum so the window never gets tiny, and never grow
+            # past the screen — there is no scrollbar to recover the overflow.
             new_h = max(new_h, 520)
+            new_h = min(new_h, max(520, self.root.winfo_screenheight() - 80))
             x = self.root.winfo_x()
             y = self.root.winfo_y()
             self.root.geometry(f"420x{new_h}+{x}+{y}")
@@ -1460,6 +1548,131 @@ class PIGeneratorApp:
 
         except Exception as e:
             _debug(f"_update_chain_list - Error: {e}")
+
+    def _layout_options(self):
+        """Assemble les réglages du panneau ⑥ en options pour le générateur."""
+        try:
+            yield_per_head = max(1, int(float(self.yield_var.get())))
+        except (ValueError, TypeError):
+            yield_per_head = DEFAULT_YIELD_PER_HEAD
+        opts = {
+            "yield_per_head": yield_per_head,
+            "collection_hours": self.interval_var.get(),
+            "use_sf": bool(self.sf_var.get()),
+        }
+        if self.manual_var.get():
+            for key, var in self.manual_vars.items():
+                try:
+                    value = int(float(var.get()))
+                except (ValueError, TypeError):
+                    value = 0
+                # 0 means "no opinion" so a partly-filled panel still works.
+                opts[key] = value or None
+        return opts
+
+    def _set_interval(self, hours):
+        """Change l'intervalle de collecte et régénère l'aperçu."""
+        self.interval_var.set(hours)
+        self._on_layout_change()
+
+    def _toggle_manual_layout(self):
+        """Affiche ou masque les compteurs manuels."""
+        if self.manual_var.get():
+            self.manual_frame.pack(fill=tk.X, padx=8, pady=(2, 0),
+                                   before=self.layout_canvas)
+        else:
+            self.manual_frame.pack_forget()
+        self._on_layout_change()
+
+    def _on_layout_change(self):
+        """Persiste les réglages de layout et rafraîchit l'aperçu."""
+        _update_window_config("layout_collection_hours", self.interval_var.get())
+        try:
+            _update_window_config("layout_yield_per_head", int(float(self.yield_var.get())))
+        except (ValueError, TypeError):
+            pass
+        self._update_bom()
+
+    def _refresh_layout_panel(self):
+        """Redessine les boutons d'intervalle et le bandeau de validation."""
+        for hrs, btn in self._interval_buttons.items():
+            on = hrs == self.interval_var.get()
+            btn.config(bg=EVE["accent"] if on else EVE["bg_input"],
+                       fg=EVE["bg_deep"] if on else EVE["fg_dim"])
+
+        chain = self.chain_var.get()
+        info = CHAINS.get(chain, {})
+        if info.get("extracts"):
+            # before= keeps it under the interval row; a plain pack() would
+            # re-append it below the validation strip.
+            self.yield_row.pack(fill=tk.X, padx=8, pady=(4, 0), before=self.manual_chk)
+        else:
+            self.yield_row.pack_forget()
+
+        # Layouts built from fixed geometry cannot honour manual counts.
+        configurable = chain in CONFIGURABLE_CHAINS
+        self.manual_chk.state(["!disabled"] if configurable else ["disabled"])
+        if not configurable and self.manual_var.get():
+            self.manual_frame.pack_forget()
+
+        c = self.layout_canvas
+        c.delete("all")
+        tpl = self.current_preview
+        if tpl is None:
+            c.create_text(8, 10, anchor=tk.NW, text="Select a product and chain",
+                          fill=EVE["fg_dim"], font=("Segoe UI", 9))
+            c.config(height=26)
+            return
+
+        a = analyze_template(tpl, self._layout_options())
+        # On the first draw the canvas has no real width yet; 392 matches the
+        # 420px window, and the <Configure> binding redraws once it is laid out.
+        right_x = c.winfo_width() - 8
+        if right_x < 200:
+            right_x = 392
+        self._layout_drawn_width = c.winfo_width()
+        y = 6
+
+        def bar(label, used, cap, x0, x1):
+            pct = used / cap if cap else 0
+            colour = EVE["green"] if pct <= 0.9 else (EVE["yellow"] if pct <= 1.0 else EVE["red"])
+            c.create_text(x0, y, anchor=tk.NW, text=label, fill=EVE["fg_dim"],
+                          font=("Segoe UI", 8))
+            c.create_text(x1, y, anchor=tk.NE, text=f"{used:,} / {cap:,}",
+                          fill=colour, font=("Consolas", 8))
+            track_y = y + 14
+            c.create_rectangle(x0, track_y, x1, track_y + 3, outline="", fill=EVE["bg_input"])
+            c.create_rectangle(x0, track_y, x0 + (x1 - x0) * min(pct, 1.0), track_y + 3,
+                               outline="", fill=colour)
+
+        mid = 8 + (right_x - 8) // 2
+        bar("CPU", a["cpu_used"], a["cpu_max"], 8, mid - 10)
+        bar("PWR", a["power_used"], a["power_max"], mid + 10, right_x)
+        y += 26
+
+        # One fact per line — at 420px wide anything else collides.
+        runs = a["buffer_hours"]
+        runs_txt = ("no output to store" if runs == float("inf")
+                    else f"runs {runs:.0f}h untended")
+        ok = runs >= self.interval_var.get()
+        c.create_text(8, y, anchor=tk.NW, text=runs_txt,
+                      fill=EVE["green"] if ok else EVE["orange"],
+                      font=("Segoe UI", 9, "bold"))
+        y += 16
+
+        if a["p0_supply_h"]:
+            fed = a["p0_supply_h"] >= a["p0_demand_h"]
+            c.create_text(8, y, anchor=tk.NW,
+                          text=f"extract {a['p0_supply_h']:,.0f}/h   ·   factories use "
+                               f"{a['p0_demand_h']:,.0f}/h",
+                          fill=EVE["green"] if fed else EVE["red"], font=("Consolas", 8))
+            y += 16
+
+        for warn in a["warnings"]:
+            c.create_text(8, y, anchor=tk.NW, text=f"⚠ {warn}", fill=EVE["red"],
+                          font=("Segoe UI", 8), width=right_x - 16)
+            y += 14 * (1 + len(warn) // 52)
+        c.config(height=max(56, y + 2))
 
     def _required_p0(self, product, chain_name):
         """Retourne les ressources P0 nécessaires au produit pour une chaîne d'extraction."""
@@ -1533,6 +1746,22 @@ class PIGeneratorApp:
         if not recipe:
             self.bom_product_lbl.config(text="")
             return
+
+        # Build the colony the current settings describe so the layout panel can
+        # measure it. Cheap enough to redo on every keystroke.
+        try:
+            self.current_preview = self._template_service.generate({
+                "product_name": product,
+                "chain_name": chain,
+                "planet_type": self.planet_var.get(),
+                "cc_level": self.cc_var.get(),
+                "planet_diameter": 10000.0,
+                "layout": self._layout_options(),
+            })
+        except Exception as exc:
+            _debug(f"_update_bom - preview failed: {exc}")
+            self.current_preview = None
+        self._refresh_layout_panel()
 
         self.bom_product_lbl.config(text=product)
 
@@ -1637,6 +1866,7 @@ class PIGeneratorApp:
             "cc_level": cc_level,
             "planet_diameter": diameter,
             "use_sf": self.sf_var.get(),
+            "layout": self._layout_options(),
         })
         if template is None:
             messagebox.showerror("Error",

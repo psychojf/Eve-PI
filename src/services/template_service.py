@@ -5,15 +5,21 @@ import datetime
 import math
 import traceback
 from collections import deque
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from src.debug_log import _debug
 from src.pi_data import (
     CC_LEVELS,
     CHAINS,
+    COMMODITY_SIZE,
+    CYCLE_HOURS,
+    DEFAULT_COLLECTION_HOURS,
+    DEFAULT_YIELD_PER_HEAD,
     HTIF_PLANET_TYPES,
     LINK_CPU_COST,
     LINK_POWER_COST,
+    MAX_EXTRACTOR_HEADS,
     NAME_TO_ID,
     NAME_TO_TIER,
     P1_TO_P0,
@@ -23,13 +29,184 @@ from src.pi_data import (
     RECIPES_P1_P2,
     RECIPES_P2_P3,
     RECIPES_P3_P4,
+    STORAGE_CAPACITY_M3,
     STRUCTURE_IDS,
     STRUCTURES,
 )
 
+ID_TO_NAME = {tid: name for name, tid in NAME_TO_ID.items()}
+STRUCT_ID_TO_NAME = {tid: name for name, per_planet in STRUCTURE_IDS.items()
+                     for tid in per_planet.values() if tid is not None}
+_ALL_RECIPES = (RECIPES_P3_P4, RECIPES_P2_P3, RECIPES_P1_P2, RECIPES_P0_P1)
+
+
+def find_recipe(product_name):
+    """Retourne la recette d'un produit, quel que soit son palier."""
+    for recipes in _ALL_RECIPES:
+        if product_name in recipes:
+            return recipes[product_name]
+    return None
+
+
+@dataclass
+class LayoutOptions:
+    """Ce que le joueur veut de la colonie, plutôt qu'un simple « remplis le CC ».
+
+    Les champs à None sont décidés par le générateur ; renseignés, ils forcent
+    la valeur et le générateur se contente de la placer et de la valider.
+    """
+    yield_per_head: int = DEFAULT_YIELD_PER_HEAD
+    collection_hours: int = DEFAULT_COLLECTION_HOURS
+    use_sf: bool = False
+    extractors: Optional[int] = None
+    heads: Optional[int] = None
+    factories: Optional[int] = None
+    launch_pads: Optional[int] = None
+    storage: Optional[int] = None
+
+    @classmethod
+    def from_config(cls, data):
+        """Construit des options depuis un dict (None/absent → valeur par défaut)."""
+        if isinstance(data, cls):
+            return data
+        data = data or {}
+        known = {f: data.get(f) for f in cls.__dataclass_fields__}
+        for field, default in (("yield_per_head", DEFAULT_YIELD_PER_HEAD),
+                               ("collection_hours", DEFAULT_COLLECTION_HOURS),
+                               ("use_sf", False)):
+            if known.get(field) in (None, ""):
+                known[field] = default
+        return cls(**known)
+
+
+def _clamp(value, low, high, default):
+    """Applique une valeur manuelle en la bornant ; None → valeur automatique."""
+    if value in (None, ""):
+        return max(low, min(high, default))
+    try:
+        return max(low, min(high, int(value)))
+    except (TypeError, ValueError):
+        return max(low, min(high, default))
+
+
+def hourly_rate(quantity, facility):
+    """Convertit une quantité par cycle en quantité par heure pour cette usine."""
+    return quantity / CYCLE_HOURS.get(facility, 1.0)
+
+
+def factories_supported(supply_per_hour, intake_per_hour):
+    """Nombre d'usines qu'un débit d'intrants alimente réellement (au moins 1)."""
+    if intake_per_hour <= 0:
+        return 1
+    return max(1, int(supply_per_hour // intake_per_hour))
+
+
+def pads_for_buffer(m3_per_hour, hours, capacity=None):
+    """Nombre de Launch Pads nécessaires pour tamponner ce débit pendant N heures."""
+    capacity = capacity or STORAGE_CAPACITY_M3["Launch Pad"]
+    if m3_per_hour <= 0 or hours <= 0:
+        return 1
+    return max(1, math.ceil(m3_per_hour * hours / capacity))
+
 def get_tier(name):
     """Retourne le palier (P0–P4) d'un matériau par son nom, None si inconnu."""
     return NAME_TO_TIER.get(name)
+
+
+def analyze_template(template, options=None):
+    """Mesure une colonie déjà générée : budget, flux horaires, autonomie.
+
+    Tout est déduit des pins eux-mêmes (structure + schéma), donc la fonction
+    marche pour n'importe quelle chaîne, y compris un template chargé depuis la
+    bibliothèque. Sert à la fois au bandeau de validation de l'UI et aux tests.
+    """
+    opts = LayoutOptions.from_config(options)
+    pins = template.get("P", [])
+    links = template.get("L", [])
+    cc_level = template.get("CmdCtrLv", 0)
+
+    counts = {}
+    produced, consumed = {}, {}      # commodity -> units/hour
+    p0_supply = 0.0
+    heads_total = 0
+    cpu = pw = 0
+
+    for pin in pins:
+        sname = STRUCT_ID_TO_NAME.get(pin.get("T"))
+        if sname is None:
+            continue
+        counts[sname] = counts.get(sname, 0) + 1
+        cpu += STRUCTURES[sname]["cpu"]
+        pw += STRUCTURES[sname]["power"]
+        heads = pin.get("H", 0) or 0
+        if heads:
+            heads_total += heads
+            cpu += heads * STRUCTURES["Extractor Head"]["cpu"]
+            pw += heads * STRUCTURES["Extractor Head"]["power"]
+
+        product = ID_TO_NAME.get(pin.get("S"))
+        if not product:
+            continue
+        if sname == "Extractor Control Unit":
+            # Extractors make raw material out of nothing but time.
+            rate = heads * opts.yield_per_head
+            p0_supply += rate
+            produced[product] = produced.get(product, 0) + rate
+            continue
+        recipe = find_recipe(product)
+        if not recipe:
+            continue
+        produced[product] = produced.get(product, 0) + hourly_rate(recipe["output"], sname)
+        for inp_name, inp_qty in recipe["input"]:
+            consumed[inp_name] = consumed.get(inp_name, 0) + hourly_rate(inp_qty, sname)
+
+    cpu += len(links) * LINK_CPU_COST
+    pw += len(links) * LINK_POWER_COST
+
+    # What the planet cannot make for itself has to be hauled in; what it makes
+    # beyond its own needs piles up until collected. Both consume pad space.
+    imports = {n: q - produced.get(n, 0) for n, q in consumed.items()
+               if q - produced.get(n, 0) > 1e-9}
+    # Raw material the factories cannot keep up with counts too: it piles up in
+    # storage exactly like finished goods, and once storage is full the
+    # extractor's output is simply lost.
+    exports = {n: q - consumed.get(n, 0) for n, q in produced.items()
+               if q - consumed.get(n, 0) > 1e-9}
+
+    def _volume(flows):
+        return sum(q * COMMODITY_SIZE.get(get_tier(n), 0) for n, q in flows.items())
+
+    import_m3_h = _volume(imports)
+    export_m3_h = _volume(exports)
+    buffer_m3 = sum(STORAGE_CAPACITY_M3.get(n, 0) * c for n, c in counts.items())
+    throughput = import_m3_h + export_m3_h
+    buffer_hours = (buffer_m3 / throughput) if throughput > 0 else float("inf")
+
+    p0_demand = sum(q for n, q in consumed.items() if get_tier(n) == "P0")
+    budget = CC_LEVELS.get(cc_level, CC_LEVELS[0])
+
+    warnings = []
+    if cpu > budget["cpu"]:
+        warnings.append(f"CPU over budget by {cpu - budget['cpu']:,}")
+    if pw > budget["power"]:
+        warnings.append(f"Power over budget by {pw - budget['power']:,}")
+    if p0_demand > p0_supply + 1e-9:
+        short = p0_demand - p0_supply
+        warnings.append(f"Extractors {short:,.0f}/h short of what the factories eat")
+    if buffer_hours < opts.collection_hours:
+        warnings.append(f"Storage only lasts {buffer_hours:.0f}h, "
+                        f"not the {opts.collection_hours}h asked for")
+
+    return {
+        "cpu_used": cpu, "cpu_max": budget["cpu"],
+        "power_used": pw, "power_max": budget["power"],
+        "structures": counts, "heads": heads_total,
+        "p0_supply_h": p0_supply, "p0_demand_h": p0_demand,
+        "imports": imports, "exports": exports,
+        "import_m3_h": import_m3_h, "export_m3_h": export_m3_h,
+        "buffer_m3": buffer_m3, "buffer_hours": buffer_hours,
+        "warnings": warnings,
+    }
 
 # Tier(s) at which each chain's bill of materials stops decomposing.
 # P4 recipes can require P1 directly (e.g. Reactive Metals in Nano-Factory),
@@ -88,6 +265,7 @@ def get_full_supply_chain(product_name, target_chain):
 BASE_SPACING = 0.012
 CENTER_LAT = 1.57079
 MAX_ARM_LEN = 4
+MAX_LAUNCH_PADS = 4
 
 def _make_pin(lat, lon, structure_type_id, schematic_id=None, heads=0):
     """Crée un dict représentant une structure (pin) dans le template JSON EVE."""
@@ -172,24 +350,28 @@ def _place_factory_row(row_lat, row_center_lon, count, spacing):
 # DISPATCHER
 # =============================================================================
 
-def generate_template_json(product_name, chain_name, planet_type, cc_level, planet_diameter, use_sf=False):
+def generate_template_json(product_name, chain_name, planet_type, cc_level, planet_diameter,
+                           use_sf=False, layout=None):
     """Aiguille vers le bon générateur de template selon la chaîne de production choisie."""
+    opts = LayoutOptions.from_config(layout)
+    if use_sf:
+        opts.use_sf = True
     if chain_name == "P0 → P1 (Extraction)":
-        return _gen_extraction_template(product_name, planet_type, cc_level, planet_diameter, use_sf=use_sf)
+        return _gen_extraction_template(product_name, planet_type, cc_level, planet_diameter, opts)
     elif chain_name == "P0 → P2 (Extraction)":
-        return _gen_p0_to_p2_template(product_name, planet_type, cc_level, planet_diameter)
+        return _gen_p0_to_p2_template(product_name, planet_type, cc_level, planet_diameter, opts)
     elif chain_name == "P1 → P2 (Factory)":
         recipe = RECIPES_P1_P2.get(product_name)
         return _gen_single_stage_template(product_name, planet_type, cc_level, planet_diameter,
                                           recipe, "Advanced Industry Facility",
-                                          f"P1→P2 {product_name}") if recipe else None
+                                          f"P1→P2 {product_name}", opts) if recipe else None
     elif chain_name == "P1 → P3 (Factory)":
         return _gen_p1_to_p3_template(product_name, planet_type, cc_level, planet_diameter)
     elif chain_name == "P2 → P3 (Factory)":
         recipe = RECIPES_P2_P3.get(product_name)
         return _gen_single_stage_template(product_name, planet_type, cc_level, planet_diameter,
                                           recipe, "Advanced Industry Facility",
-                                          f"P2→P3 {product_name}") if recipe else None
+                                          f"P2→P3 {product_name}", opts) if recipe else None
     elif chain_name == "P2 → P4 (Factory)":
         return _gen_p2_to_p4_template(product_name, planet_type, cc_level, planet_diameter)
     elif chain_name == "P1 → P4 (Factory)":
@@ -204,15 +386,29 @@ def generate_template_json(product_name, chain_name, planet_type, cc_level, plan
         recipe = RECIPES_P3_P4.get(product_name)
         return _gen_single_stage_template(product_name, planet_type, cc_level, planet_diameter,
                                           recipe, "High-Tech Industry Facility",
-                                          f"P3→P4 {product_name}") if recipe else None
+                                          f"P3→P4 {product_name}", opts) if recipe else None
     return None
+
+
+# Chains whose layout is fixed by geometry and cannot honour manual counts or
+# extra pads — the UI greys those controls out for them.
+CONFIGURABLE_CHAINS = frozenset({
+    "P0 → P1 (Extraction)", "P0 → P2 (Extraction)",
+    "P1 → P2 (Factory)", "P2 → P3 (Factory)", "P3 → P4 (Factory)",
+})
 
 # =====================================================================
 # P0 -> P1 EXTRACTION
 # =====================================================================
 
-def _gen_extraction_template(product_name, planet_type, cc_level, diameter, use_sf=False):
-    """Génère un template P0→P1 avec ECU, BIFs, Launch Pad et optionnellement un Storage Facility."""
+def _gen_extraction_template(product_name, planet_type, cc_level, diameter, options=None):
+    """Génère un template P0→P1 : ECU(s), BIFs, Launch Pad(s), Storage optionnel.
+
+    Le nombre d'usines suit ce que les extracteurs sortent réellement, pas la
+    place restante dans le budget du CC : une usine basique avale 6 000 unités
+    brutes par heure, et un extracteur n'en produit pas douze fois autant.
+    """
+    opts = LayoutOptions.from_config(options)
     recipe = RECIPES_P0_P1[product_name]
     p0_name = recipe["input"][0][0]
     p0_tid  = NAME_TO_ID[p0_name]
@@ -222,35 +418,85 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, use_
     bif_type = STRUCTURE_IDS["Basic Industry Facility"][planet_type]
     ecu_type = STRUCTURE_IDS["Extractor Control Unit"][planet_type]
     lp_type  = STRUCTURE_IDS["Launch Pad"][planet_type]
+    use_sf   = bool(opts.use_sf) or bool(opts.storage)
     sf_type  = STRUCTURE_IDS["Storage Facility"][planet_type] if use_sf else None
 
     sp = BASE_SPACING
-    num_heads = min(10, 2 + cc_level * 2)
+    num_heads = _clamp(opts.heads, 1, MAX_EXTRACTOR_HEADS,
+                       default=min(MAX_EXTRACTOR_HEADS, 2 + cc_level * 2))
+    num_ecu = _clamp(opts.extractors, 1, 4, default=1)
+    num_sf  = _clamp(opts.storage, 0, 4, default=1 if opts.use_sf else 0)
 
     ecu_cpu = (STRUCTURES["Extractor Control Unit"]["cpu"]
                + num_heads * STRUCTURES["Extractor Head"]["cpu"])
     ecu_pw  = (STRUCTURES["Extractor Control Unit"]["power"]
                + num_heads * STRUCTURES["Extractor Head"]["power"])
-    fixed_cpu = STRUCTURES["Launch Pad"]["cpu"] + ecu_cpu + LINK_CPU_COST
-    fixed_pw  = STRUCTURES["Launch Pad"]["power"] + ecu_pw + LINK_POWER_COST
-    if use_sf:
-        fixed_cpu += STRUCTURES["Storage Facility"]["cpu"] + LINK_CPU_COST
-        fixed_pw  += STRUCTURES["Storage Facility"]["power"] + LINK_POWER_COST
 
-    bif_cpu = STRUCTURES["Basic Industry Facility"]["cpu"]
-    bif_pw  = STRUCTURES["Basic Industry Facility"]["power"]
-    num_bif = _calc_max_factories(cc_level, fixed_cpu, fixed_pw, bif_cpu, bif_pw)
-    if num_bif < 1:
-        return None
+    # How many factories the extractors can actually keep running, and how many
+    # launch pads it takes to hold the output between collection trips.
+    p0_supply = num_ecu * num_heads * opts.yield_per_head
+    p0_per_bif = hourly_rate(recipe["input"][0][1], "Basic Industry Facility")
+    p1_m3_per_bif = (hourly_rate(recipe["output"], "Basic Industry Facility")
+                     * COMMODITY_SIZE["P1"])
+
+    balanced_bif = factories_supported(p0_supply, p0_per_bif)
+    num_bif = _clamp(opts.factories, 1, 14, default=balanced_bif)
+    num_lp = _clamp(opts.launch_pads, 1, 4,
+                    default=pads_for_buffer(num_bif * p1_m3_per_bif, opts.collection_hours))
+
+    # Trim to whatever the command centre can actually power, factories first.
+    def _fixed(lps, ecus, sfs):
+        cpu = (lps * STRUCTURES["Launch Pad"]["cpu"] + ecus * ecu_cpu
+               + sfs * STRUCTURES["Storage Facility"]["cpu"]
+               + (lps - 1 + ecus + sfs) * LINK_CPU_COST)
+        pw  = (lps * STRUCTURES["Launch Pad"]["power"] + ecus * ecu_pw
+               + sfs * STRUCTURES["Storage Facility"]["power"]
+               + (lps - 1 + ecus + sfs) * LINK_POWER_COST)
+        return cpu, pw
+
+    while True:
+        fixed_cpu, fixed_pw = _fixed(num_lp, num_ecu, num_sf)
+        room = _calc_max_factories(cc_level, fixed_cpu, fixed_pw,
+                                   STRUCTURES["Basic Industry Facility"]["cpu"],
+                                   STRUCTURES["Basic Industry Facility"]["power"])
+        if room >= 1:
+            num_bif = min(num_bif, room)
+            break
+        # Shed the least essential structure and retry.
+        if num_sf > 0:
+            num_sf -= 1
+        elif num_lp > 1:
+            num_lp -= 1
+        elif num_ecu > 1:
+            num_ecu -= 1
+        elif num_heads > 1:
+            num_heads -= 1
+            ecu_cpu = (STRUCTURES["Extractor Control Unit"]["cpu"]
+                       + num_heads * STRUCTURES["Extractor Head"]["cpu"])
+            ecu_pw = (STRUCTURES["Extractor Control Unit"]["power"]
+                      + num_heads * STRUCTURES["Extractor Head"]["power"])
+        else:
+            return None
+        use_sf = num_sf > 0
+        sf_type = STRUCTURE_IDS["Storage Facility"][planet_type] if use_sf else None
 
     pins = []
+    lp_pins = []
     pins.append(_make_pin(CENTER_LAT, 0.0, lp_type))
     lp_1b = 1
+    lp_pins.append(lp_1b)
+    for i in range(1, num_lp):
+        side = -1 if i % 2 == 1 else 1
+        pins.append(_make_pin(CENTER_LAT - sp, side * ((i + 1) // 2) * sp, lp_type))
+        lp_pins.append(len(pins))
 
     sf_1b = None
+    sf_pins = []
     if use_sf:
-        pins.append(_make_pin(CENTER_LAT + sp * 0.6, 0.0, sf_type))
-        sf_1b = len(pins)
+        for i in range(num_sf):
+            pins.append(_make_pin(CENTER_LAT + sp * 0.6, i * sp, sf_type))
+            sf_pins.append(len(pins))
+        sf_1b = sf_pins[0]
 
     hub_1b = sf_1b if use_sf else lp_1b
     hub_lat = pins[hub_1b - 1]["La"]
@@ -292,8 +538,12 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, use_
         pins.append(_make_pin(lat, lon, bif_type, schematic_id=p1_tid))
 
     ecu_lat = CENTER_LAT + sp * 5
-    pins.append(_make_pin(ecu_lat, 0.0, ecu_type, schematic_id=p0_tid, heads=num_heads))
-    ecu_1b = len(pins)
+    ecu_pins = []
+    for i in range(num_ecu):
+        lon = 0.0 if num_ecu == 1 else (-1 if i % 2 == 0 else 1) * ((i // 2) + 1) * 2 * sp
+        pins.append(_make_pin(ecu_lat, lon, ecu_type, schematic_id=p0_tid, heads=num_heads))
+        ecu_pins.append(len(pins))
+    ecu_1b = ecu_pins[0]
 
     parent = {}
     left_chain  = [first_bif_1b + i for i in range(main_count) if i % 2 == 0]
@@ -334,11 +584,16 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, use_
     for i in range(num_bif):
         pin = first_bif_1b + i
         links.append({"D": parent.get(pin, hub_1b), "Lv": 0, "S": pin})
+    for extra_lp in lp_pins[1:]:
+        links.append({"D": lp_1b, "Lv": 0, "S": extra_lp})
     if use_sf:
-        links.append({"D": lp_1b, "Lv": 0, "S": sf_1b})
-        links.append({"D": sf_1b, "Lv": 0, "S": ecu_1b})
+        for sf_pin in sf_pins:
+            links.append({"D": lp_1b, "Lv": 0, "S": sf_pin})
+        for ecu_pin in ecu_pins:
+            links.append({"D": sf_1b, "Lv": 0, "S": ecu_pin})
     else:
-        links.append({"D": lp_1b, "Lv": 0, "S": ecu_1b})
+        for ecu_pin in ecu_pins:
+            links.append({"D": lp_1b, "Lv": 0, "S": ecu_pin})
 
     num_pins = len(pins)
     routes = []
@@ -348,17 +603,23 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, use_
         bif_pin = first_bif_1b + i
         path = _bfs_path(links, p0_src, bif_pin, num_pins)
         if path:
-            routes.append({"P": path, "Q": 3000, "T": p0_tid})
+            routes.append({"P": path, "Q": recipe["input"][0][1], "T": p0_tid})
 
+    # Spread the output across the pads so the buffer is actually usable —
+    # a single pad would fill up while the others sat empty.
     for i in range(num_bif):
         bif_pin = first_bif_1b + i
-        path = _bfs_path(links, bif_pin, lp_1b, num_pins)
+        dest_lp = lp_pins[i % len(lp_pins)]
+        path = _bfs_path(links, bif_pin, dest_lp, num_pins)
         if path:
-            routes.append({"P": path, "Q": 20, "T": p1_tid})
+            routes.append({"P": path, "Q": recipe["output"], "T": p1_tid})
 
-    ecu_qty = max(num_bif * 3000, 125000)
     ecu_dest = sf_1b if use_sf else lp_1b
-    routes.append({"P": [ecu_1b, ecu_dest], "Q": ecu_qty, "T": p0_tid})
+    ecu_qty = max(int(num_heads * opts.yield_per_head), 1)
+    for ecu_pin in ecu_pins:
+        path = _bfs_path(links, ecu_pin, ecu_dest, num_pins)
+        if path:
+            routes.append({"P": path, "Q": ecu_qty, "T": p0_tid})
 
     return {
         "CmdCtrLv": cc_level, "Cmt": f"P0→P1 {product_name}",
@@ -375,7 +636,7 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, use_
 _MIN_ECU_HEADS = 6
 _MAX_P2_FACTORIES = 4
 
-def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter):
+def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, options=None):
     """Génère un template P0→P2 : ECU → BIF (P1) → AIF (P2) sur une seule planète.
 
     Chaque P1 de la recette dont le P0 est présent sur ce type de planète est
@@ -384,6 +645,7 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter):
     qu'une des deux ressources.
     """
     try:
+        opts = LayoutOptions.from_config(options)
         recipe = RECIPES_P1_P2.get(product_name)
         if not recipe:
             return None
@@ -409,8 +671,9 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter):
 
         # ── Sizing ───────────────────────────────────────────────────
         # One BIF makes 40 P1/h and one P2 AIF eats 40 of each P1/h, so the
-        # balanced ratio is one BIF per local P1 per AIF. Maximise factories
-        # first, then spend what is left on extractor heads.
+        # balanced ratio is one BIF per local P1 per AIF. The extractors cap
+        # the whole thing: a chain is only worth building as wide as the raw
+        # material actually arriving.
         n_ecu = len(local)
 
         def _cost(n_aif, heads):
@@ -431,14 +694,23 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter):
             return cpu, pw
 
         cc = CC_LEVELS[cc_level]
+        p0_per_bif = hourly_rate(RECIPES_P0_P1[local[0][0]]["input"][0][1],
+                                 "Basic Industry Facility")
+        # Work down from the widest chain the extractors could ever feed, and
+        # for each width run the extractors no harder than that width needs —
+        # spare heads are pure wasted power on a planet this tight.
+        ceiling = factories_supported(MAX_EXTRACTOR_HEADS * opts.yield_per_head, p0_per_bif)
+        ceiling = _clamp(opts.factories, 1, _MAX_P2_FACTORIES, default=ceiling)
         best = None
-        for n_aif in range(_MAX_P2_FACTORIES, 0, -1):
-            for heads in range(10, _MIN_ECU_HEADS - 1, -1):
-                cpu, pw = _cost(n_aif, heads)
-                if cpu <= cc["cpu"] and pw <= cc["power"]:
-                    best = (n_aif, heads)
-                    break
-            if best:
+        for n_aif in range(min(ceiling, _MAX_P2_FACTORIES), 0, -1):
+            heads_needed = math.ceil(n_aif * p0_per_bif / max(1, opts.yield_per_head))
+            heads_needed = _clamp(opts.heads, 1, MAX_EXTRACTOR_HEADS,
+                                  default=max(1, heads_needed))
+            if heads_needed > MAX_EXTRACTOR_HEADS:
+                continue
+            cpu, pw = _cost(n_aif, heads_needed)
+            if cpu <= cc["cpu"] and pw <= cc["power"]:
+                best = (n_aif, heads_needed)
                 break
         if best is None:
             return None
@@ -496,12 +768,12 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter):
         routes = []
 
         # Extractors → LP, then LP → BIFs (P0), BIFs → LP (P1)
-        p0_recipe_qty = 3000
         for p1_name, _, p0_name in local:
             p0_tid = NAME_TO_ID[p0_name]
+            p0_recipe_qty = RECIPES_P0_P1[p1_name]["input"][0][1]
             ecu_pin = ecu_pins[p0_name]
             routes.append({"P": [ecu_pin, lp_1b],
-                           "Q": max(bif_per_p1 * p0_recipe_qty, 125000), "T": p0_tid})
+                           "Q": max(int(num_heads * opts.yield_per_head), 1), "T": p0_tid})
             for bif_pin in bif_pins[p1_name]:
                 path = _bfs_path(links, lp_1b, bif_pin, num_pins)
                 if path:
@@ -538,7 +810,7 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter):
 # =====================================================================
 
 def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
-                               recipe, facility, comment):
+                               recipe, facility, comment, options=None):
     """Générateur d'usine à un étage : importe les intrants aux LPs, les usines
     produisent le produit, la sortie repart au LP.
 
@@ -546,44 +818,84 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
     l'usine (AIF ou HTIF, cette dernière limitée aux planètes Barren/Temperate).
     """
     try:
+        opts = LayoutOptions.from_config(options)
         facility_type_id = STRUCTURE_IDS[facility][planet_type]
         if facility_type_id is None:
             return None
         lp_type = STRUCTURE_IDS["Launch Pad"][planet_type]
         sp = BASE_SPACING
 
-        # Optimization calculation to find max structures that fit in budget
-        best = None
-        for try_lps in range(1, 4):
-            backbone = max(0, try_lps - 1)
-            fixed_cpu = try_lps * STRUCTURES["Launch Pad"]["cpu"] + backbone * LINK_CPU_COST
-            fixed_pw = try_lps * STRUCTURES["Launch Pad"]["power"] + backbone * LINK_POWER_COST
+        # Volume one factory moves per hour, in and out. Both sides sit in the
+        # pads between visits, so both count against how long the colony runs
+        # unattended.
+        flow_m3_per_factory = (
+            sum(hourly_rate(q, facility) * COMMODITY_SIZE.get(get_tier(n), 0)
+                for n, q in recipe["input"])
+            + hourly_rate(recipe["output"], facility)
+            * COMMODITY_SIZE.get(get_tier(product_name), 0))
+
+        def _max_factories(lps):
+            backbone = max(0, lps - 1)
+            fixed_cpu = lps * STRUCTURES["Launch Pad"]["cpu"] + backbone * LINK_CPU_COST
+            fixed_pw = lps * STRUCTURES["Launch Pad"]["power"] + backbone * LINK_POWER_COST
             avail_cpu = CC_LEVELS[cc_level]["cpu"] - fixed_cpu
             avail_pw = CC_LEVELS[cc_level]["power"] - fixed_pw
             cost_cpu = STRUCTURES[facility]["cpu"] + LINK_CPU_COST
             cost_pw = STRUCTURES[facility]["power"] + LINK_POWER_COST
-            
             if cost_cpu <= 0 or cost_pw <= 0:
-                continue
-                
+                return 0
             n = max(0, min(avail_cpu // cost_cpu, avail_pw // cost_pw))
-            n = min(n, try_lps * MAX_ARM_LEN * 2)
-            if n >= 1 and (best is None or n > best[1]):
-                best = (try_lps, n)
-                
-        if best is None:
+            return min(n, lps * MAX_ARM_LEN * 2)
+
+        def _hours(lps, n):
+            capacity = lps * STORAGE_CAPACITY_M3["Launch Pad"]
+            if not flow_m3_per_factory or n <= 0:
+                return float("inf")
+            return capacity / (n * flow_m3_per_factory)
+
+        # More pads buys buffer at the cost of factories, and past a point the
+        # only way to last a full day is to build fewer factories. Take the
+        # widest colony that still survives the requested interval; if none
+        # can, take the one that lasts longest.
+        meets, longest = None, None
+        for try_lps in range(1, MAX_LAUNCH_PADS + 1):
+            room = _max_factories(try_lps)
+            if room < 1:
+                continue
+            capacity = try_lps * STORAGE_CAPACITY_M3["Launch Pad"]
+            if flow_m3_per_factory and opts.collection_hours:
+                affordable = int(capacity // (opts.collection_hours * flow_m3_per_factory))
+            else:
+                affordable = room
+            n_ok = min(room, affordable)
+            if n_ok >= 1 and (meets is None or n_ok > meets[1]):
+                meets = (try_lps, n_ok)
+            if longest is None or _hours(try_lps, room) > _hours(*longest):
+                longest = (try_lps, room)
+
+        chosen = meets or longest
+        if chosen is None:
             return None
-            
-        num_lps, num_factories = best
+        num_lps, num_factories = chosen
+
+        # A manual count is an instruction, not a suggestion: place it as asked
+        # and let the validation panel report what it costs.
+        if opts.launch_pads:
+            num_lps = _clamp(opts.launch_pads, 1, MAX_LAUNCH_PADS, default=num_lps)
+            num_factories = min(num_factories, _max_factories(num_lps)) or 1
+        if opts.factories:
+            num_factories = _clamp(opts.factories, 1, num_lps * MAX_ARM_LEN * 2,
+                                   default=num_factories)
+        if num_factories < 1:
+            return None
 
         # Distributing factory quantities across the determined amount of LPs
         per_lp = [0] * num_lps
         for i in range(num_factories):
             per_lp[i % num_lps] += 1
 
-        lp_lats = [CENTER_LAT]
-        if num_lps >= 2: lp_lats.append(CENTER_LAT + sp)
-        if num_lps >= 3: lp_lats.append(CENTER_LAT - sp)
+        lp_lats = [CENTER_LAT, CENTER_LAT + sp, CENTER_LAT - sp,
+                   CENTER_LAT + 2 * sp][:num_lps]
 
         pins = []
         lp_arms = []
@@ -1386,6 +1698,7 @@ class TemplateService:
             config["cc_level"],
             config["planet_diameter"],
             use_sf=config.get("use_sf", use_sf),
+            layout=config.get("layout"),
         )
 
     def get_supply_chain(self, product_name: str, chain_name: str) -> dict:
