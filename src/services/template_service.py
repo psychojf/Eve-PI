@@ -633,8 +633,9 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, opti
 
 # An extractor with fewer heads than this cannot keep even one BIF fed, so the
 # sizing search never trades heads below it for extra factories.
-_MIN_ECU_HEADS = 6
-_MAX_P2_FACTORIES = 4
+# Widest P2 stage this layout can place. High yields can feed more than the
+# power budget allows anyway, so this only ever binds on rich deposits.
+_MAX_P2_FACTORIES = 8
 
 def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, options=None):
     """Génère un template P0→P2 : ECU → BIF (P1) → AIF (P2) sur une seule planète.
@@ -717,12 +718,31 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, option
         num_aif, num_heads = best
         bif_per_p1 = num_aif
 
+        # Pads have to hold the P2 coming out, the P1 lines hauled in for
+        # whatever this planet cannot mine, and the raw surplus the factories
+        # do not keep up with.
+        flow_m3_h = hourly_rate(recipe["output"], "Advanced Industry Facility") * num_aif \
+            * COMMODITY_SIZE.get(get_tier(product_name), 0)
+        for p1_name, p1_qty in imported:
+            flow_m3_h += (hourly_rate(p1_qty, "Advanced Industry Facility") * num_aif
+                          * COMMODITY_SIZE.get(get_tier(p1_name), 0))
+        surplus = max(0, len(local) * num_heads * opts.yield_per_head
+                      - bif_per_p1 * len(local) * p0_per_bif)
+        flow_m3_h += surplus * COMMODITY_SIZE["P0"]
+        num_lp = _clamp(opts.launch_pads, 1, MAX_LAUNCH_PADS,
+                        default=pads_for_buffer(flow_m3_h, opts.collection_hours))
+
         # ── Pins ─────────────────────────────────────────────────────
         # Launch Pad hub in the middle, AIFs below it, one BIF row per local
         # P1 above it, extractors furthest out.
         pins = []
         pins.append(_make_pin(CENTER_LAT, 0.0, lp_type))
         lp_1b = 1
+        lp_pins = [lp_1b]
+        for i in range(1, num_lp):
+            side = -1 if i % 2 == 1 else 1
+            pins.append(_make_pin(CENTER_LAT - 2 * sp, side * ((i + 1) // 2) * sp, lp_type))
+            lp_pins.append(len(pins))
 
         aif_pins = []
         for i in range(num_aif):
@@ -756,6 +776,8 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, option
         # The LP is both the P0/P1 buffer and the export pad, so every route
         # below is a single hop and the topology stays trivially valid.
         links = []
+        for extra_lp in lp_pins[1:]:
+            links.append({"D": lp_1b, "Lv": 0, "S": extra_lp})
         for pin in aif_pins:
             links.append({"D": lp_1b, "Lv": 0, "S": pin})
         for chain in bif_pins.values():
@@ -783,13 +805,15 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, option
                     routes.append({"P": path, "Q": RECIPES_P0_P1[p1_name]["output"],
                                    "T": NAME_TO_ID[p1_name]})
 
-        # LP → AIFs for every P1 (locally made or hauled in), AIFs → LP (P2)
-        for aif_pin in aif_pins:
+        # LP → AIFs for every P1 (locally made or hauled in), AIFs → LP (P2),
+        # output spread across the pads so the buffer is usable.
+        for idx, aif_pin in enumerate(aif_pins):
             path = _bfs_path(links, lp_1b, aif_pin, num_pins)
             if path:
                 for p1_name, p1_qty in recipe["input"]:
                     routes.append({"P": list(path), "Q": p1_qty, "T": NAME_TO_ID[p1_name]})
-            path = _bfs_path(links, aif_pin, lp_1b, num_pins)
+            dest_lp = lp_pins[idx % len(lp_pins)]
+            path = _bfs_path(links, aif_pin, dest_lp, num_pins)
             if path:
                 routes.append({"P": path, "Q": recipe["output"],
                                "T": NAME_TO_ID[product_name]})

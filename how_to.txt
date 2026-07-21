@@ -101,21 +101,32 @@ Work down the numbered panels:
      that actually shape a colony are yours:
 
      Collect every — how long the colony must run without
-       you. The generator adds launch pads, and if need be
-       drops factories, until the pads can hold that many
-       hours of materials. Ask for 48h and you get a smaller,
-       slower colony you can ignore for two days; ask for 6h
-       and you get maximum output you must service often.
+       you. It is a MINIMUM, not a target: the generator adds
+       launch pads, and if that is not enough drops
+       factories, until the colony can survive that long
+       unattended. If it already lasts longer, nothing
+       changes and the panel says so — "runs 160h untended
+       (48h asked, already covered)".
 
-       This bites hardest on factory planets, where the
-       imports alone fill a pad quickly. A P3 → P4 planet at
-       level 5 goes from 16 facilities on 2 pads at 6h to 8
-       facilities on 4 pads at 24h. On extraction planets it
-       usually changes nothing: P1 is compact enough that a
-       single pad already holds several days of output — a
-       balanced level 5 extraction planet runs about 150
-       hours untended — so don't be surprised when the layout
-       stays put.
+       So whether this control does anything depends entirely
+       on the chain:
+
+         P3 → P4 — changes every step. At level 5: 16
+           facilities on 2 pads at 6h, 12 on 3 pads at 12h,
+           8 on 4 pads at 24h, 4 on 4 pads at 48h.
+         P1 → P2, P2 → P3 — nothing until 48h, because the
+           default build already survives about 30 hours.
+         P0 → P1, P0 → P2 — usually nothing at any setting.
+           P1 and P2 are compact, so one pad already holds
+           several days: a balanced level 5 extraction planet
+           runs roughly 150 hours untended.
+
+       In short, it bites on planets you have to feed. A
+       planet that mines its own input has almost nothing
+       accumulating except its finished goods, and those take
+       days to fill a pad. If you want more storage there
+       anyway, tick "Set counts myself" and raise Pads by
+       hand — each pad added multiplies the time.
 
      Extractor yield — units per head per hour, shown only
        for extraction chains. This is the number the whole
@@ -137,8 +148,11 @@ Work down the numbered panels:
 
        CPU and power bars against your command center,
          green until 90%, amber to 100%, red beyond it.
-       "runs Nh untended" — green if it meets the interval
-         you asked for, amber if it falls short.
+       "runs Nh untended (Nh asked)" — green when it meets
+         the interval, amber when it falls short. When it is
+         already comfortably past it, the line reads
+         "already covered", which is your confirmation that
+         the interval is satisfied rather than ignored.
        "extract N/h · factories use N/h" on extraction
          chains — red when the factories outrun the ground.
        Any number of ⚠ warning lines in red.
@@ -322,6 +336,14 @@ The layout panel is greyed out
   — Manual counts are only available for the extraction and
     single-stage factory chains. P1 → P3, P1 → P4 and
     P2 → P4 build a fixed geometry that cannot be resized.
+
+"Collect every" changes nothing
+  — Almost always because the colony already outlasts the
+    interval; the panel confirms this with "already covered"
+    on the untended line. It is a minimum to meet, not a size
+    to hit, so it only acts when the colony would fall short.
+    Extraction planets rarely need it at all. Raise Pads
+    manually if you want a bigger buffer regardless.
 
 Radius shows "—" in the Proximity Scout
   — The planet radius table is missing. The app downloads it

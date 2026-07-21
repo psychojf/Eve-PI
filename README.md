@@ -30,7 +30,11 @@ colony those imply:
 - **Collection interval** (6 / 12 / 24 / 48 hours). Launch pads hold 10,000 m³
   each and must cover both the inputs waiting to be consumed and the outputs
   piling up. The generator adds pads, then drops factories, until the colony
-  survives the interval unattended.
+  survives the interval unattended. It is a floor, not a target: a colony that
+  already lasts longer is left alone, which is why the setting visibly reshapes
+  a P3→P4 planet (16 facilities on 2 pads at 6h, 4 on 4 pads at 48h) and does
+  nothing at all on an extraction planet, where one pad already holds days of
+  compact P1 output.
 
 Anything you set by hand is placed as asked and validated rather than overruled —
 `analyze_template()` reports CPU, power, material balance and buffer hours for

@@ -1651,10 +1651,17 @@ class PIGeneratorApp:
         y += 26
 
         # One fact per line — at 420px wide anything else collides.
+        # Always name the target: without it, a colony that already outlasts
+        # the interval looks like the setting is being ignored.
         runs = a["buffer_hours"]
-        runs_txt = ("no output to store" if runs == float("inf")
-                    else f"runs {runs:.0f}h untended")
-        ok = runs >= self.interval_var.get()
+        target = self.interval_var.get()
+        ok = runs >= target
+        if runs == float("inf"):
+            runs_txt = "nothing accumulates — collect whenever"
+        elif ok:
+            runs_txt = f"runs {runs:.0f}h untended  ({target}h asked, already covered)"
+        else:
+            runs_txt = f"runs {runs:.0f}h untended  ({target}h asked)"
         c.create_text(8, y, anchor=tk.NW, text=runs_txt,
                       fill=EVE["green"] if ok else EVE["orange"],
                       font=("Segoe UI", 9, "bold"))
