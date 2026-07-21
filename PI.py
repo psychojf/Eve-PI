@@ -19,15 +19,15 @@ import ssl
 from src.debug_log import _debug
 from src.pi_data import (
     CHAINS,
+    COMMODITY_SIZE,
     HTIF_PLANET_TYPES,
     NAME_TO_ID,
-    PLANET_PI_PRIORITY,
+    NAME_TO_TIER,
+    P0_TO_P1,
     PLANET_RESOURCES,
     PLANET_TYPES,
     RECIPES_P0_P1,
     STRUCTURE_IDS,
-    _TIER_BADGE,
-    _TIER_CLR_PI,
 )
 from src.services.template_service import (
     TemplateService,
@@ -91,6 +91,13 @@ STRUCT_TYPE_TO_NAME = {
 # Reverse lookup: commodity type_id → commodity name (used by LP tooltips)
 ID_TO_COMMODITY = {tid: name for name, tid in NAME_TO_ID.items()}
 
+# Commodity volume (m³/unit) by type_id, and Launch Pad capacity — used by the
+# "cycles until LP full" tooltip. Volumes follow the project's COMMODITY_SIZE
+# convention (half the raw EVE m³), so all volume math here stays consistent.
+ID_TO_VOLUME = {tid: COMMODITY_SIZE[NAME_TO_TIER[name]]
+                for name, tid in NAME_TO_ID.items()}
+LAUNCHPAD_CAPACITY_M3 = 10000   # a Launch Pad holds 10,000 m³
+
 # ── System name autocomplete cache ─────────────────────────────────────
 _SYSTEM_NAMES_CACHE: list = []   # populated lazily
 _SYSTEM_NAMES_LOCK = threading.Lock()
@@ -138,8 +145,20 @@ def _ensure_system_names():
 _PLANET_RADII: dict = {}   # planet_id (int) -> radius (int, km)
 _PLANET_RADII_LOCK = threading.Lock()
 
+# Fuzzwork moved its CSV dumps into a /csv/ sub-folder (the old flat path 404s)
+# and mapCelestialStatistics no longer carries a radius column — mapDenormalize
+# does, keyed by itemID. Both changes silently emptied the radius table.
+_RADII_CSV_URL = "https://www.fuzzwork.co.uk/dump/latest/csv/mapDenormalize.csv"
+_RADII_MIN_ROWS = 50_000   # a healthy dump yields ~450k; less means truncated
+
 def _ensure_planet_radii():
-    """Charge planet_id→rayon (km) depuis le cache local (90 j) ou le CSV SDE de Fuzzwork."""
+    """Charge planet_id→rayon (km) depuis le cache local, sinon depuis le SDE Fuzzwork.
+
+    Le rayon d'une planète existante ne change jamais : un cache non vide fait
+    donc autorité et on ne télécharge que s'il manque. Le dump fait ~85 Mo et
+    plusieurs minutes de téléchargement, pendant lesquelles tout scan attend ce
+    verrou — le re-télécharger périodiquement ne ferait que geler le scanner.
+    """
     global _PLANET_RADII
     with _PLANET_RADII_LOCK:
         if _PLANET_RADII:
@@ -148,40 +167,97 @@ def _ensure_planet_radii():
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if time.time() - data.get("ts", 0) < 90 * 86400:
-                _PLANET_RADII = {int(k): v for k, v in data["radii"].items()}
-                _debug(f"_ensure_planet_radii - loaded {len(_PLANET_RADII)} from cache")
+            cached = {int(k): v for k, v in data["radii"].items()}
+            if cached:
+                _PLANET_RADII = cached
+                _debug(f"_ensure_planet_radii - loaded {len(cached)} from cache")
                 return
         except Exception:
             pass
         try:
             import csv as _csv, io as _io
-            _debug("_ensure_planet_radii - downloading mapCelestialStatistics.csv...")
-            url = "https://www.fuzzwork.co.uk/dump/latest/mapCelestialStatistics.csv"
-            req = urllib.request.Request(url, headers={"User-Agent": "EVE-PI-Generator/1.0"})
-            with _esi_urlopen(req, timeout=120) as r:
-                raw = r.read().decode("utf-8")
-            reader = _csv.DictReader(_io.StringIO(raw))
+            _debug("_ensure_planet_radii - downloading mapDenormalize.csv...")
+            req = urllib.request.Request(_RADII_CSV_URL,
+                                         headers={"User-Agent": "EVE-PI-Generator/1.0"})
             radii = {}
-            for row in reader:
-                r_val = row.get("radius", "").strip()
-                if r_val and r_val not in ("None", "", "NULL"):
-                    try:
-                        # Radius in metres → km
-                        radii[int(row["celestialID"])] = int(float(r_val)) // 1000
-                    except Exception:
-                        pass
+            with _esi_urlopen(req, timeout=180) as r:
+                # Streamed rather than read() in one go: the dump is ~85 MB and
+                # utf-8-sig strips the BOM that would otherwise end up glued to
+                # the first column name and break every lookup.
+                for row in _csv.DictReader(_io.TextIOWrapper(r, encoding="utf-8-sig",
+                                                             newline="")):
+                    r_val = (row.get("radius") or "").strip()
+                    if r_val and r_val not in ("None", "NULL"):
+                        try:
+                            # Radius in metres → km
+                            radii[int(row["itemID"])] = int(float(r_val)) // 1000
+                        except Exception:
+                            pass
+            if len(radii) < _RADII_MIN_ROWS:
+                raise ValueError(f"only {len(radii)} radius rows parsed — dump truncated "
+                                 f"or column renamed")
             _PLANET_RADII = radii
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-            with open(cache_path, "w", encoding="utf-8") as f:
-                json.dump({"ts": time.time(), "radii": {str(k): v for k, v in radii.items()}}, f)
+            # Write via a temp file: a crash mid-write would otherwise leave a
+            # half-written cache that can never be read again.
+            tmp_path = cache_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump({"ts": time.time(),
+                           "radii": {str(k): v for k, v in radii.items()}}, f)
+            os.replace(tmp_path, cache_path)
             _debug(f"_ensure_planet_radii - cached {len(radii)} entries")
         except Exception as e:
-            _debug(f"_ensure_planet_radii - failed: {e}")
+            _debug(f"_ensure_planet_radii - download failed: {e}")
 
 def get_planet_radius(planet_id: int) -> int:
     """Retourne le rayon en km d'une planète par son ID, 0 si inconnu."""
     return _PLANET_RADII.get(int(planet_id), 0)
+
+# ── Planet type icons (CCP renders shipped in data/planet_icons) ───────
+# Files are 1024², so every size is rendered once and cached: the cache also
+# holds the only reference to the PhotoImage — drop it and Tk blanks the image.
+_PLANET_ICON_FILES = {
+    "Barren":    "barren_2016.png",  "Gas":     "gas_13.png",
+    "Ice":       "ice_12.png",       "Lava":    "lava_2015.png",
+    "Oceanic":   "oceanic_2014.png", "Plasma":  "plasma_2063.png",
+    "Storm":     "storm_2017.png",   "Temperate": "temperate_11.png",
+}
+_PLANET_ICON_CACHE: dict = {}
+
+# CCP's renders are cinematic close-ups: the planet's limb crosses the frame
+# with starfield behind it, which at icon size just looks like a dark smudge.
+# Cropping this window keeps us inside the planet body on all eight types, and
+# a circular mask turns that surface patch back into a little globe.
+_ICON_CROP_X, _ICON_CROP_Y, _ICON_CROP_SIDE = 0.42, 0.62, 0.42
+
+def get_planet_icon(planet_type, px):
+    """Retourne l'icône Tk ronde d'un type de planète à px pixels, None si indisponible."""
+    key = (planet_type, px)
+    if key in _PLANET_ICON_CACHE:
+        return _PLANET_ICON_CACHE[key]
+    icon = None
+    fname = _PLANET_ICON_FILES.get(planet_type)
+    if fname:
+        try:
+            from PIL import Image as _Img, ImageDraw as _ImgDraw, ImageTk as _ImgTk
+            path = os.path.join(get_base_path(), "data", "planet_icons", fname)
+            with _Img.open(path) as src:
+                im = src.convert("RGBA")
+            w, h = im.size
+            side = int(w * _ICON_CROP_SIDE)
+            cx, cy = int(w * _ICON_CROP_X), int(h * _ICON_CROP_Y)
+            im = im.crop((cx - side // 2, cy - side // 2,
+                          cx + side // 2, cy + side // 2)).resize((px, px), _Img.LANCZOS)
+            # Mask drawn oversized then downscaled — that is what anti-aliases
+            # the rim, since PIL's ellipse has hard edges.
+            mask = _Img.new("L", (px * 4, px * 4), 0)
+            _ImgDraw.Draw(mask).ellipse((0, 0, px * 4 - 1, px * 4 - 1), fill=255)
+            im.putalpha(mask.resize((px, px), _Img.LANCZOS))
+            icon = _ImgTk.PhotoImage(im)
+        except Exception as e:
+            _debug(f"get_planet_icon - {planet_type} @{px}px failed: {e}")
+    _PLANET_ICON_CACHE[key] = icon
+    return icon
 
 def get_base_path():
     """Retourne le dossier racine de l'application (exe compilé ou script)."""
@@ -274,6 +350,23 @@ def _get_cache_path(key_prefix):
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(cache_dir, f"{key_prefix}_planets.json")
 
+def _backfill_planet_radii(systems_data):
+    """Complète les rayons manquants d'un scan depuis la table SDE ; retourne le nombre corrigé.
+
+    Les scans enregistrés pendant que la table des rayons était indisponible
+    contiennent radius=0 ; c'est une simple recherche par planet_id, donc on
+    les répare au chargement au lieu de forcer un rescan complet.
+    """
+    filled = 0
+    for sdata in systems_data.values():
+        for p in sdata.get("planets", []):
+            if not p.get("radius"):
+                r = get_planet_radius(p.get("planet_id", 0))
+                if r:
+                    p["radius"] = r
+                    filled += 1
+    return filled
+
 def _load_scan_cache(key_prefix):
     """Charge le cache de scan (7 j max) ; retourne None si absent ou périmé."""
     path = _get_cache_path(key_prefix)
@@ -284,13 +377,8 @@ def _load_scan_cache(key_prefix):
         # Expire after 7 days
         if time.time() - ts > 7 * 86400:
             return None
-        # Also reject if the scan predates our planet_radii cache —
-        # means radius was 0 when it was saved
-        radii_path = os.path.join(get_base_path(), "data", "planet_radii.json")
-        if os.path.exists(radii_path):
-            radii_mtime = os.path.getmtime(radii_path)
-            if ts < radii_mtime:
-                return None   # stale — force rescan with correct radii
+        if _backfill_planet_radii(data.get("systems", {})):
+            _save_scan_cache(key_prefix, data["systems"])
         return data
     except Exception:
         return None
@@ -303,26 +391,6 @@ def _save_scan_cache(key_prefix, systems_data):
             json.dump({"timestamp": time.time(), "systems": systems_data}, f)
     except Exception:
         pass
-
-def _purge_stale_scan_caches():
-    """Supprime les caches de scan antérieurs à planet_radii.json (données rayon=0 obsolètes)."""
-    try:
-        import glob
-        cache_dir = os.path.join(get_base_path(), "data")
-        radii_path = os.path.join(cache_dir, "planet_radii.json")
-        if not os.path.exists(radii_path):
-            return
-        radii_mtime = os.path.getmtime(radii_path)
-        purged = 0
-        for f in glob.glob(os.path.join(cache_dir, "*_planets.json")):
-            if os.path.getmtime(f) < radii_mtime:
-                os.remove(f)
-                purged += 1
-        if purged:
-            _debug(f"_purge_stale_scan_caches - purged {purged} stale cache(s)")
-    except Exception as e:
-        _debug(f"_purge_stale_scan_caches - error: {e}")
-
 
 # =============================================================================
 # TKINTER UI — EVE Online Theme, persistent window geometry, improved planet map
@@ -739,11 +807,7 @@ class PIGeneratorApp:
             threading.Thread(target=self._run_tray, daemon=True).start()
 
         # Pre-warm SDE caches at startup so scanner is instant on first open
-        def _startup_cache_init():
-            """Pré-charge les rayons planétaires et purge les caches périmés au démarrage."""
-            _ensure_planet_radii()      # blocks until radii loaded
-            _purge_stale_scan_caches()  # then remove any old radius=0 scan caches
-        threading.Thread(target=_startup_cache_init, daemon=True).start()
+        threading.Thread(target=_ensure_planet_radii, daemon=True).start()
 
     def _setup_styles(self):
         """Configure les styles ttk et les options de police/couleur pour le thème EVE actif."""
@@ -1397,29 +1461,47 @@ class PIGeneratorApp:
         except Exception as e:
             _debug(f"_update_chain_list - Error: {e}")
 
+    def _required_p0(self, product, chain_name):
+        """Retourne les ressources P0 nécessaires au produit pour une chaîne d'extraction."""
+        return {name for name in get_full_supply_chain(product, chain_name)
+                if get_tier(name) == "P0"}
+
+    def _planets_for_extraction(self, product, chain_name):
+        """Types de planètes fournissant au moins un P0 requis, les plus complets d'abord.
+
+        Une chaîne P0→P2 reste utilisable quand la planète n'a qu'une des deux
+        ressources (l'autre P1 s'importe), d'où le tri par couverture plutôt
+        qu'un filtre strict.
+        """
+        needed = self._required_p0(product, chain_name)
+        if not needed:
+            return list(PLANET_TYPES.keys())
+        scored = []
+        for ptype, resources in PLANET_RESOURCES.items():
+            have = len(needed & set(resources))
+            if have:
+                scored.append((-have, ptype))
+        if not scored:
+            return list(PLANET_TYPES.keys())
+        return [ptype for _, ptype in sorted(scored)]
+
     def _on_chain_changed(self):
         """Met à jour le filtre de types de planètes et la visibilité SF après un changement de chaîne."""
         chain_name = self.chain_var.get()
-        is_extraction = (chain_name == "P0 → P1 (Extraction)")
+        chain_info = CHAINS.get(chain_name, {})
 
-        # SF checkbox: only for extraction
-        if is_extraction:
+        # SF checkbox: only chains whose generator can place one
+        if chain_info.get("supports_sf"):
             self.sf_frame.pack(fill=tk.X, padx=8, pady=(0, 6))
         else:
             self.sf_frame.pack_forget()
 
-        # Planet type: for P4 chains restrict to Barren/Temperate, else all
-        needs_barren_temp = chain_name in ("P1 → P4 (Factory)", "P2 → P4 (Factory)")
-        if needs_barren_temp:
+        # Planet type: P4 needs a High-Tech Industry Facility, which only exists
+        # on Barren/Temperate; chains that extract need the right resources.
+        if chain_info.get("target_tier") == "P4":
             valid_planets = list(HTIF_PLANET_TYPES)
-        elif is_extraction:
-            # Only planet types whose resources include this product's P0
-            recipe = RECIPES_P0_P1.get(self.product_var.get())
-            p0 = recipe["input"][0][0] if recipe else None
-            valid_planets = sorted(
-                ptype for ptype, p0_list in PLANET_RESOURCES.items() if p0 in p0_list)
-            if not valid_planets:
-                valid_planets = list(PLANET_TYPES.keys())
+        elif chain_info.get("extracts"):
+            valid_planets = self._planets_for_extraction(self.product_var.get(), chain_name)
         else:
             valid_planets = list(PLANET_TYPES.keys())
 
@@ -1492,21 +1574,33 @@ class PIGeneratorApp:
             y += 4
             c.create_line(8, y, right_x, y, fill=EVE["border"], width=1)
             y += 4
-            if chain == "P0 → P1 (Extraction)":
-                # P0 comes from the extractor — nothing to haul in
-                draw_row("EXTRACTED ON-PLANET — no imports needed", "", EVE["green"])
-                for name, qty in sorted(bom.items()):
+
+            def draw_materials(names):
+                for name in sorted(names):
                     tier = get_tier(name)
                     clr  = TIER_CLR.get(tier, EVE["fg"])
-                    draw_row(f"  {name}", f"{qty}×  [{tier}]", clr, indent=4)
+                    draw_row(f"  {name}", f"{bom[name]}×  [{tier}]", clr, indent=4)
+
+            if chain_info.get("extracts"):
+                # A P0 the chosen planet holds is mined here; one it does not
+                # hold has to arrive as the P1 that would have been made from it.
+                on_planet = set(PLANET_RESOURCES.get(self.planet_var.get(), []))
+                extracted = {n for n in bom if get_tier(n) != "P0" or n in on_planet}
+                missing   = set(bom) - extracted
+                if extracted:
+                    draw_row("⛏ EXTRACTED ON-PLANET", "", EVE["green"])
+                    draw_materials(extracted)
+                if missing:
+                    draw_row("⬆ SEND TO LAUNCH PAD — not on this planet", "", EVE["orange"])
+                    for name in sorted(missing):
+                        p1 = P0_TO_P1.get(name, name)
+                        clr = TIER_CLR.get(get_tier(p1), EVE["fg"])
+                        draw_row(f"  {p1}", f"[{get_tier(p1)}]", clr, indent=4)
             else:
                 # These are the materials the player must manually send to
                 # the Launch Pad(s) — the planet cannot produce them.
                 draw_row("⬆ SEND TO LAUNCH PAD (per cycle)", "", EVE["orange"])
-                for name, qty in sorted(bom.items()):
-                    tier = get_tier(name)
-                    clr  = TIER_CLR.get(tier, EVE["fg"])
-                    draw_row(f"  {name}", f"{qty}×  [{tier}]", clr, indent=4)
+                draw_materials(bom)
 
         c.config(height=max(80, y + 8))
         # Resize main window to fit content after BOM height changes
@@ -1524,7 +1618,7 @@ class PIGeneratorApp:
                                    "Please select a product, chain, and planet type.")
             return
 
-        if chain in ("P2 → P4 (Factory)", "P1 → P4 (Factory)") \
+        if CHAINS.get(chain, {}).get("target_tier") == "P4" \
                 and planet not in HTIF_PLANET_TYPES:
             messagebox.showwarning("Invalid Planet",
                                    "P4 production requires a Barren or Temperate planet.")
@@ -1958,34 +2052,160 @@ class PIGeneratorApp:
             ]
             canvas.create_polygon(points, fill="#1a1a1a", outline=color, width=1, tags=tags)
 
-        # ── Manual imports per Launch Pad ─────────────────────────────────
-        # A route leaving an LP with a commodity that no structure on the
-        # planet produces means the player must haul that commodity in.
+        # ── Per-pin commodity flows ───────────────────────────────────────
+        # Endpoint model: a route's source is P[0] and its final dest is
+        # P[-1]; pins in between are routing waypoints, not consumers. Used
+        # by the hover tooltips and by the Launch Pad import detection below.
+        # (A route leaving an LP with a commodity that no structure on the
+        # planet produces means the player must haul that commodity in.)
         lp_idx0 = {i for i, p in enumerate(pins)
                    if STRUCT_TYPE_TO_NAME.get(p.get("T")) == "Launch Pad"}
         produced_tids = {p.get("S") for p in pins if p.get("S")}
         lp_imports = {}   # 0-based LP pin idx -> {commodity tid -> {dest pin -> qty}}
+        pin_in = {}       # 0-based pin idx -> {commodity tid -> qty received /cycle}
+        pin_out = {}      # 0-based pin idx -> {commodity tid -> qty sent /cycle}
         for rt in template.get("R", []):
             rpath = rt.get("P") or []
             if len(rpath) < 2:
                 continue
             src0, dst0 = rpath[0] - 1, rpath[-1] - 1
             tid = rt.get("T")
+            qty = rt.get("Q", 0)
+            pin_out.setdefault(src0, {})
+            pin_out[src0][tid] = pin_out[src0].get(tid, 0) + qty
+            pin_in.setdefault(dst0, {})
+            pin_in[dst0][tid] = pin_in[dst0].get(tid, 0) + qty
             if src0 in lp_idx0 and dst0 not in lp_idx0 and tid not in produced_tids:
-                lp_imports.setdefault(src0, {}).setdefault(tid, {})[dst0] = rt.get("Q", 0)
+                lp_imports.setdefault(src0, {}).setdefault(tid, {})[dst0] = qty
 
-        def _show_lp_tooltip(event, pin_idx):
-            canvas.delete("tooltip")
-            imports = lp_imports.get(pin_idx, {})
-            if imports:
-                lines = ["⬆  Send to this Launch Pad:"]
-                for tid, dests in sorted(imports.items(),
-                                         key=lambda kv: ID_TO_COMMODITY.get(kv[0], "")):
-                    name = ID_TO_COMMODITY.get(tid, f"type {tid}")
-                    total = sum(dests.values())
-                    lines.append(f"   {name}  —  {total:,} /cycle")
+        # "Cycles until Launch Pad full" applies only to pure factory planets:
+        # no Storage Facility (extra buffer), and no extraction / P0→P1 — i.e.
+        # no Extractor Control Unit or Basic Industry Facility. What remains
+        # runs entirely on Advanced / High-Tech facilities' 1-hour cycle, so
+        # cycle count maps cleanly to real time.
+        _present = {STRUCT_TYPE_TO_NAME.get(p.get("T")) for p in pins}
+        show_lp_fill = not (_present & {"Storage Facility",
+                                        "Extractor Control Unit",
+                                        "Basic Industry Facility"})
+
+        def _commodity(tid):
+            return ID_TO_COMMODITY.get(tid, f"type {tid}")
+
+        def _flow_lines(flows):
+            """Indented '<name>  —  <qty> /cycle' lines, sorted by name."""
+            return [f"   {_commodity(tid)}  —  {qty:,} /cycle"
+                    for tid, qty in sorted(flows.items(),
+                                           key=lambda kv: _commodity(kv[0]))]
+
+        def _cycles_when(cycles):
+            # 1 cycle == 1 hour for Advanced / High-Tech facilities.
+            if cycles >= 48:
+                return f"~{cycles / 24:.0f} d"
+            if cycles >= 1:
+                return f"~{cycles:.0f} h"
+            return "<1 h"
+
+        def _lp_fill_lines(ins, outs):
+            """Buffer-timing block for a Launch Pad on a pure factory planet.
+
+            Per commodity, net = routed-in − routed-out:
+              • net > 0  → finished product PILING UP → "LP fills in N cycles"
+              • net < 0  → raw input being HANDED OUT → "Full pad lasts N cycles"
+            An output LP (product accumulating) shows the fill countdown; a pure
+            input LP (only distributes materials) shows how long a full 10,000 m³
+            load lasts before it starves the factories. A dual-role LP that does
+            both shows the fill countdown — its imports are assumed kept topped
+            up. Every in-scope facility runs a 1-hour cycle, so cycles == hours.
+            """
+            if not show_lp_fill:
+                return []
+            gains, drains = {}, {}
+            gain_vol = drain_vol = 0.0
+            for tid in set(ins) | set(outs):
+                net = ins.get(tid, 0) - outs.get(tid, 0)
+                if net > 0:
+                    gains[tid] = net
+                    gain_vol += net * ID_TO_VOLUME.get(tid, 0.0)
+                elif net < 0:
+                    drains[tid] = -net
+                    drain_vol += (-net) * ID_TO_VOLUME.get(tid, 0.0)
+            if gain_vol > 0:              # output LP — finished product accumulates
+                cycles = int(LAUNCHPAD_CAPACITY_M3 // gain_vol)
+                header = f"LP fills in {cycles:,} cycles  ({_cycles_when(cycles)})"
+                flows = gains
+            elif drain_vol > 0:           # input LP — a full 10,000 m³ load drains
+                cycles = int(LAUNCHPAD_CAPACITY_M3 // drain_vol)
+                header = f"Full pad lasts {cycles:,} cycles  ({_cycles_when(cycles)})"
+                flows = drains
             else:
-                lines = ["⬆  Send to this Launch Pad:", "   nothing — collection / export only"]
+                return []
+            lines = ["────────────────────────", header]
+            for tid, qty in sorted(flows.items(), key=lambda kv: _commodity(kv[0])):
+                lines.append(f"   {cycles * qty:,} {_commodity(tid)}")
+            return lines
+
+        def _pin_tooltip_lines(pin_idx):
+            """Facility-type-aware tooltip text for the pin under the cursor."""
+            pin = pins[pin_idx]
+            sname = STRUCT_TYPE_TO_NAME.get(pin.get("T"))
+            ins = pin_in.get(pin_idx, {})
+            outs = pin_out.get(pin_idx, {})
+
+            if sname == "Launch Pad":
+                imports = lp_imports.get(pin_idx, {})
+                lines = ["Launch Pad", "⬆  Send to this Launch Pad:"]
+                if imports:
+                    for tid, dests in sorted(imports.items(),
+                                             key=lambda kv: _commodity(kv[0])):
+                        lines.append(f"   {_commodity(tid)}  —  {sum(dests.values()):,} /cycle")
+                else:
+                    lines.append("   nothing — collection / export only")
+                lines += _lp_fill_lines(ins, outs)
+                return lines
+
+            if sname == "Extractor Control Unit":
+                lines = ["Extractor Control Unit"]
+                extracted = pin.get("S")
+                if extracted:
+                    lines.append(f"Extracts:  {_commodity(extracted)}")
+                heads = pin.get("H", 0)
+                if heads:
+                    lines.append(f"Heads:  {heads}")
+                return lines
+
+            if sname == "Storage Facility":
+                lines = ["Storage Facility"]
+                if ins:
+                    lines.append("Receives:")
+                    lines += _flow_lines(ins)
+                if outs:
+                    lines.append("Sends out:")
+                    lines += _flow_lines(outs)
+                if not ins and not outs:
+                    lines.append("   no routes")
+                return lines
+
+            if sname in ("Basic Industry Facility", "Advanced Industry Facility",
+                         "High-Tech Industry Facility"):
+                lines = [sname]
+                product = pin.get("S")
+                if product:
+                    out_qty = outs.get(product)
+                    if out_qty:
+                        lines.append(f"Produces:  {_commodity(product)}  —  {out_qty:,} /cycle")
+                    else:
+                        lines.append(f"Produces:  {_commodity(product)}")
+                if ins:
+                    lines.append("Consumes:")
+                    lines += _flow_lines(ins)
+                return lines
+
+            # Unrecognised structure type id (rendered as a grey "?")
+            return [f"Unknown structure (type {pin.get('T')})"]
+
+        def _show_pin_tooltip(event, pin_idx):
+            canvas.delete("tooltip")
+            lines = _pin_tooltip_lines(pin_idx)
             # state=DISABLED keeps the tooltip out of mouse hit-testing so it
             # can't steal the <Leave> event from the pin under the cursor.
             tip = canvas.create_text(event.x + 16, event.y, anchor=tk.W,
@@ -2041,11 +2261,10 @@ class PIGeneratorApp:
                                  font=("Segoe UI Symbol", font_size, "bold"),
                                  tags=(pin_tag,))
 
-            if pin_idx in lp_idx0:
-                canvas.tag_bind(pin_tag, "<Enter>",
-                                lambda e, i=pin_idx: _show_lp_tooltip(e, i))
-                canvas.tag_bind(pin_tag, "<Leave>",
-                                lambda e: canvas.delete("tooltip"))
+            canvas.tag_bind(pin_tag, "<Enter>",
+                            lambda e, i=pin_idx: _show_pin_tooltip(e, i))
+            canvas.tag_bind(pin_tag, "<Leave>",
+                            lambda e: canvas.delete("tooltip"))
 
         # Everything drawn so far is the template itself — tag it so pan/zoom
         # can move/scale it as one group. The legend below stays fixed.
@@ -2112,7 +2331,8 @@ class PIGeneratorApp:
 
         cfg = _load_window_config()
         popup.geometry(cfg.get("scanner_geometry", "700x620"))
-        popup.minsize(480, 380)
+        # 540 wide is what the full-name planet-type filter row needs
+        popup.minsize(540, 380)
 
         # Restore last search state
         _last_system = cfg.get("scanner_last_system", "Jita")
@@ -2240,6 +2460,76 @@ class PIGeneratorApp:
         ac_lb.bind("<Return>", _on_ac_pick)
         ac_lb.bind("<Escape>", lambda e: (_hide_ac(), sys_entry.focus_set()))
 
+        # ── Planet type styling ───────────────────────────────────────
+        PLANET_COLORS = {
+            "Barren":    "#9a8060", "Gas":      "#5090b0", "Ice":      "#80b8d0",
+            "Lava":      "#c04020", "Oceanic":  "#2060b0", "Plasma":   "#9040b0",
+            "Storm":     "#406888", "Temperate":"#408840", "Unknown":  "#505070",
+        }
+        # The eight real planet types. Anything ESI reports as something else
+        # (shattered planets and the like) can't host PI, so it never shows.
+        PLANET_ORDER = ["Barren", "Gas", "Ice", "Lava", "Oceanic",
+                        "Plasma", "Storm", "Temperate"]
+
+        # ── Planet-type filter ────────────────────────────────────────
+        # Drop anything stale from a previously saved selection (e.g. "Unknown");
+        # an empty result means "show everything" rather than a dead-end view.
+        active_types = {t for t in (cfg.get("scanner_planet_filter") or ()) if t in PLANET_ORDER}
+        if not active_types:
+            active_types = set(PLANET_ORDER)
+        # Results of the last scan, kept so filtering redraws without rescanning
+        last_results = {"data": None}
+
+        filt = tk.Frame(body, bg=EVE["bg_card"],
+                        highlightbackground=EVE["border"], highlightthickness=1)
+        filt.pack(fill=tk.X, pady=(0, 6))
+
+        tk.Label(filt, text="SHOW", bg=EVE["bg_card"], fg=EVE["accent"],
+                 font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT, padx=(10, 6), pady=6)
+
+        type_btns = {}
+
+        def _paint_filter_btns():
+            """Colore chaque bouton de type selon qu'il est actif ou non."""
+            for t, b in type_btns.items():
+                on = t in active_types
+                b.config(bg=PLANET_COLORS[t] if on else EVE["bg_input"],
+                         fg=EVE["bg_deep"] if on else EVE["fg_dim"])
+
+        def _apply_filter():
+            """Sauvegarde la sélection et redessine les résultats déjà scannés."""
+            _paint_filter_btns()
+            _update_window_config("scanner_planet_filter", sorted(active_types))
+            if last_results["data"] is not None:
+                _render_results(last_results["data"])
+
+        def _toggle_type(t):
+            if t in active_types:
+                active_types.discard(t)
+            else:
+                active_types.add(t)
+            _apply_filter()
+
+        def _all_types():
+            active_types.clear()
+            active_types.update(PLANET_ORDER)
+            _apply_filter()
+
+        for t in PLANET_ORDER:
+            b = tk.Button(filt, text=t.upper(), font=("Segoe UI", 8, "bold"),
+                          relief=tk.FLAT, cursor="hand2", padx=4, pady=1,
+                          borderwidth=0, highlightthickness=0,
+                          command=lambda t=t: _toggle_type(t))
+            b.pack(side=tk.LEFT, padx=1, pady=6)
+            type_btns[t] = b
+
+        tk.Button(filt, text="ALL", font=("Segoe UI", 8, "bold"),
+                  bg=EVE["bg_input"], fg=EVE["accent"], relief=tk.FLAT,
+                  cursor="hand2", padx=8, pady=1, borderwidth=0,
+                  highlightthickness=0, command=_all_types).pack(side=tk.RIGHT, padx=(4, 10))
+
+        _paint_filter_btns()
+
         # ── Scrollable results area ───────────────────────────────────
         results_outer = tk.Frame(body, bg=EVE["bg_deep"])
         results_outer.pack(fill=tk.BOTH, expand=True)
@@ -2256,32 +2546,49 @@ class PIGeneratorApp:
         # Throttled resize — avoids layout storm when user drags window edge
         _resize_pending = [None]
 
+        def _sync_scroll(reset=False):
+            """Recale la région de défilement sur le contenu réel et interdit de défiler au-delà.
+
+            La région doit toujours démarrer à 0 et faire au moins la hauteur
+            visible : sinon le canvas garde une position héritée d'un contenu
+            plus long et on se retrouve à défiler dans le vide au-dessus de la
+            liste.
+            """
+            cards_frame.update_idletasks()
+            view_h = max(1, r_canvas.winfo_height())
+            content_h = cards_frame.winfo_reqheight()
+            width = max(1, r_canvas.winfo_width())
+            r_canvas.configure(scrollregion=(0, 0, width, max(content_h, view_h)))
+            if reset or content_h <= view_h:
+                r_canvas.yview_moveto(0)
+            else:
+                # Re-issue the current position so the canvas clamps it into
+                # the region it just got (Tk only clamps on a view command).
+                r_canvas.yview_moveto(r_canvas.yview()[0])
+
         def _on_cards_conf(e):
-            r_canvas.configure(scrollregion=r_canvas.bbox("all"))
+            _sync_scroll()
 
         def _on_canvas_resize(e):
             if _resize_pending[0]:
                 popup.after_cancel(_resize_pending[0])
-            _resize_pending[0] = popup.after(80, lambda w=e.width: r_canvas.itemconfig(cards_win, width=w))
+
+            def _apply(w=e.width):
+                r_canvas.itemconfig(cards_win, width=w)
+                _sync_scroll()
+            _resize_pending[0] = popup.after(80, _apply)
 
         cards_frame.bind("<Configure>", _on_cards_conf)
         r_canvas.bind("<Configure>", _on_canvas_resize)
 
         def _mw(e):
+            # Nothing to scroll when the content fits — otherwise the view
+            # drifts off the top of the list into empty space.
+            if cards_frame.winfo_reqheight() <= r_canvas.winfo_height():
+                return "break"
             r_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
         r_canvas.bind("<Enter>", lambda e: r_canvas.bind_all("<MouseWheel>", _mw))
         r_canvas.bind("<Leave>", lambda e: r_canvas.unbind_all("<MouseWheel>"))
-
-        # ── Planet type styling ───────────────────────────────────────
-        PLANET_COLORS = {
-            "Barren":    "#9a8060", "Gas":      "#5090b0", "Ice":      "#80b8d0",
-            "Lava":      "#c04020", "Oceanic":  "#2060b0", "Plasma":   "#9040b0",
-            "Storm":     "#406888", "Temperate":"#408840", "Unknown":  "#505070",
-        }
-        PLANET_ICONS = {
-            "Barren": "⬡", "Gas": "◎", "Ice": "✦", "Lava": "◈",
-            "Oceanic": "◉", "Plasma": "◇", "Storm": "◌", "Temperate": "◆",
-        }
 
         def _sec_color(sec):
             """Retourne la couleur selon le statut de sécurité : vert hi-sec, orange lo-sec, rouge null-sec."""
@@ -2289,178 +2596,75 @@ class PIGeneratorApp:
             if sec >= 0.1:  return "#e0a030"
             return "#cc4444"
 
-        def _make_planet_card(parent, security, planet_data, jump_dist):
-            """Crée un canvas-carte cliquable pour une planète avec priorités P0→P1 et rayon."""
+        CARD_H = 46
+        ICON_PX = 36
+
+        def _make_planet_card(parent, planet_data):
+            """Carte compacte d'une planète : vignette, nom, type et rayon — rien d'autre."""
             ptype   = planet_data.get("type", "Unknown")
             pname   = planet_data.get("name", "")
             pradius = planet_data.get("radius", 0)
+            color   = PLANET_COLORS.get(ptype, "#505070")
 
-            color = PLANET_COLORS.get(ptype, "#505070")
-            icon  = PLANET_ICONS.get(ptype, "⬡")
-
-            # Priority-ordered P0→P1 pairs for this planet type
-            # Each entry: (p1_name, p0_name, tier_rank)
-            priority_rows = PLANET_PI_PRIORITY.get(ptype, [])
-
-            # Top-tier (rank 1) items shown as badges in collapsed view
-            top_p1s = [(r[0], r[2]) for r in priority_rows if r[2] == 1]
-
-            # ── Collapsed height (always shown) ──────────────────────
-            # type+sec=22, name=20, radius=26 (larger font),
-            # top-priority badges row=22 (if any), padding=12
-            H_COLL = 22 + (20 if pname else 0) + 26 + (22 if top_p1s else 0) + 12
-
-            # ── Expanded height (click to reveal) ────────────────────
-            # adds: divider=10, header row=20, priority table rows (22 each), bottom pad=10
-            H_EXP  = H_COLL + 10 + 20 + len(priority_rows) * 22 + 10
-
-            # Mutable state: expanded flag + current hover flag
-            state = {"expanded": False, "hovered": False}
-
-            card = tk.Canvas(parent, bg=EVE["bg_card"], height=H_COLL,
-                             highlightthickness=0, cursor="hand2")
+            state = {"hovered": False}
+            card = tk.Canvas(parent, bg=EVE["bg_card"], height=CARD_H,
+                             highlightthickness=0)
 
             def _draw(hovered=None):
                 if hovered is not None:
                     state["hovered"] = hovered
-                # Use target height directly — winfo_height lags during resize
-                expanded = state["expanded"]
-                hov      = state["hovered"]
-                h = H_EXP if expanded else H_COLL
                 card.delete("all")
                 w = card.winfo_width() or 380
+                h = CARD_H
 
-                # Background + border
-                border_clr = EVE["border_hi"] if hov else color
-                bw = 2 if hov else 1
-                card.create_rectangle(0, 0, w - 1, h - 1,
-                                      outline=border_clr, fill=EVE["bg_card"], width=bw)
+                card.create_rectangle(
+                    0, 0, w - 1, h - 1,
+                    outline=EVE["border_hi"] if state["hovered"] else color,
+                    fill=EVE["bg_card"], width=2 if state["hovered"] else 1)
+                card.create_rectangle(0, 0, 4, h, outline="", fill=color)
 
-                # Left colour bar
-                card.create_rectangle(0, 0, 5, h, outline="", fill=color)
+                icon = get_planet_icon(ptype, ICON_PX)
+                if icon is not None:
+                    card.create_image(32, h // 2, image=icon)
+                else:
+                    card.create_oval(32 - 15, h // 2 - 15, 32 + 15, h // 2 + 15,
+                                     fill=color, outline=_lighten(color, 30))
 
-                x  = 14
-                y  = 7
+                card.create_text(58, 9, anchor=tk.NW, text=pname,
+                                 fill=EVE["fg_bright"], font=("Segoe UI", 11))
+                card.create_text(58, 27, anchor=tk.NW, text=ptype.upper(),
+                                 fill=color, font=("Segoe UI", 8, "bold"))
 
-                # Row 1 — icon · type · jump distance · security
-                jlbl    = f"{jump_dist}J" if jump_dist else "★"
-                sec_clr = _sec_color(security)
-                card.create_text(x, y, anchor=tk.NW,
-                                 text=f"{icon}  {ptype.upper()}",
-                                 fill=color, font=("Segoe UI", 11, "bold"))
-                card.create_text(x + 115, y, anchor=tk.NW,
-                                 text=jlbl,
-                                 fill=EVE["fg_dim"], font=("Segoe UI", 10))
-                # Expand/collapse hint on right
-                hint = "▲ collapse" if expanded else "▼ details"
-                card.create_text(w - 10, y, anchor=tk.NE,
-                                 text=hint,
-                                 fill=EVE["fg_dim"], font=("Segoe UI", 9))
-                card.create_text(w - 80, y, anchor=tk.NE,
-                                 text=f"{security:.1f}",
-                                 fill=sec_clr, font=("Segoe UI", 10, "bold"))
-                y += 22
-
-                # Row 2 — planet name
-                if pname:
-                    card.create_text(x, y, anchor=tk.NW,
-                                     text=pname,
-                                     fill=EVE["fg_bright"], font=("Segoe UI", 11))
-                    y += 20
-
-                # Row 3 — radius (always shown, prominent)
-                r_text = f"r = {int(pradius):,} km" if pradius else "r = —"
-                r_clr  = "#e8d48a" if pradius else EVE["fg_dim"]   # warm gold, easy to spot
-                card.create_text(x, y, anchor=tk.NW,
-                                 text=r_text,
-                                 fill=r_clr, font=("Consolas", 13, "bold"))
-                y += 26
-
-                # Row 4 — top-priority P1 badges (🥇 items only, collapsed view)
-                if top_p1s:
-                    rx = x
-                    for p1_name, _ in top_p1s:
-                        item = card.create_text(rx, y, anchor=tk.NW,
-                                                text=f"🥇 {p1_name}",
-                                                fill=_TIER_CLR_PI[1], font=("Segoe UI", 11, "bold"))
-                        # Advance by the real rendered width — a per-character
-                        # estimate overlaps the next badge onto this text.
-                        rx = card.bbox(item)[2] + 12
-                    y += 22
-
-                y += 4   # bottom padding for collapsed view
-
-                # ── Expanded detail section ───────────────────────────
-                if expanded:
-                    # Divider
-                    card.create_line(x, y, w - 10, y, fill=EVE["border"], width=1)
-                    y += 8
-
-                    # Column header
-                    card.create_text(x + 2,   y, anchor=tk.NW,
-                                     text="P0 Resource",
-                                     fill=EVE["fg_dim"], font=("Segoe UI", 9, "bold"))
-                    card.create_text(x + 168, y, anchor=tk.NW,
-                                     text="→  P1 Product",
-                                     fill=EVE["fg_dim"], font=("Segoe UI", 9, "bold"))
-                    card.create_text(w - 12,  y, anchor=tk.NE,
-                                     text="Priority",
-                                     fill=EVE["fg_dim"], font=("Segoe UI", 9, "bold"))
-                    y += 20
-
-                    # Priority rows
-                    for i, (p1_name, p0_name, tier) in enumerate(priority_rows):
-                        row_bg = EVE["bg_input"] if i % 2 == 0 else EVE["bg_card"]
-                        tier_clr = _TIER_CLR_PI[tier]
-                        badge    = _TIER_BADGE[tier]
-                        card.create_rectangle(x - 2, y - 1, w - 10, y + 20,
-                                              outline="", fill=row_bg)
-                        # P0 name (dim)
-                        card.create_text(x + 2, y, anchor=tk.NW,
-                                         text=p0_name,
-                                         fill=EVE["fg_dim"], font=("Segoe UI", 10))
-                        # P1 name (accent)
-                        card.create_text(x + 168, y, anchor=tk.NW,
-                                         text=f"→  {p1_name}",
-                                         fill=EVE["accent"], font=("Segoe UI", 10))
-                        # Tier badge (right-aligned, coloured)
-                        card.create_text(w - 12, y, anchor=tk.NE,
-                                         text=badge,
-                                         fill=tier_clr, font=("Segoe UI", 11))
-                        y += 22
+                r_text = f"{int(pradius):,} km" if pradius else "—"
+                card.create_text(w - 12, h // 2, anchor=tk.E, text=r_text,
+                                 fill="#e8d48a" if pradius else EVE["fg_dim"],
+                                 font=("Consolas", 13, "bold"))
 
             # <Configure> fires when the canvas first gets its real width
             card.bind("<Configure>", lambda e: _draw())
-
-            # Smooth hover — single widget, guaranteed no flicker
             card.bind("<Enter>", lambda e: _draw(hovered=True))
             card.bind("<Leave>", lambda e: _draw(hovered=False))
-
-            # Click → toggle expanded/collapsed; NO changes to PI generator
-            def _on_click(e=None):
-                state["expanded"] = not state["expanded"]
-                new_h = H_EXP if state["expanded"] else H_COLL
-                card.config(height=new_h)
-                _draw()
-                # Force scroll region update so the scrollbar knows about new height
-                cards_frame.update_idletasks()
-                r_canvas.configure(scrollregion=r_canvas.bbox("all"))
-
-            card.bind("<Button-1>", _on_click)
 
             return card
 
         def _render_results(systems_data):
-            """Peuple la zone de résultats avec les sections système et cartes planète triées."""
+            """Peuple la zone de résultats avec les sections système et cartes planète filtrées."""
             for w in cards_frame.winfo_children():
                 w.destroy()
+            last_results["data"] = systems_data
 
             if not systems_data:
                 tk.Label(cards_frame, text="No systems found.",
                          bg=EVE["bg_deep"], fg=EVE["fg_dim"],
                          font=("Segoe UI", 11)).pack(pady=40)
                 status_var.set("No results.")
+                _sync_scroll(reset=True)
                 return
+
+            filtering = len(active_types) < len(PLANET_ORDER)
+
+            def _keep(planets):
+                return [p for p in planets if p.get("type", "Unknown") in active_types]
 
             # Sort systems: origin first, then by jump distance, then alpha
             def sys_sort_key(item):
@@ -2470,21 +2674,26 @@ class PIGeneratorApp:
             sys_list = sorted(systems_data.items(), key=sys_sort_key)
 
             total_planets = 0
+            shown_systems = 0
             # collapsed_state tracks which systems are open (True=expanded)
             collapsed_state = {}
 
             def _make_system_section(sid, sdata):
-                nonlocal total_planets
-                planets = sdata.get("planets", [])
+                nonlocal total_planets, shown_systems
+                # Only the planets passing the type filter reach the UI, so the
+                # header counts and the cards below it always agree.
+                planets = _keep(sdata.get("planets", []))
                 if not planets:
                     return
                 sec   = sdata.get("security", 0)
                 sname = sdata.get("name", str(sid))
                 jdist = sdata.get("jump_dist", 0)
                 total_planets += len(planets)
+                shown_systems += 1
 
-                # All systems start collapsed
-                collapsed_state[sid] = False   # False = collapsed
+                # Collapsed by default, but a filter means the user is hunting
+                # for specific planets — show them without an extra click.
+                collapsed_state[sid] = filtering
 
                 section = tk.Frame(cards_frame, bg=EVE["bg_deep"])
                 section.pack(fill=tk.X, pady=(4, 0))
@@ -2495,7 +2704,7 @@ class PIGeneratorApp:
                                cursor="hand2")
                 hdr.pack(fill=tk.X)
 
-                arrow_var = tk.StringVar(value="▶")
+                arrow_var = tk.StringVar(value="▼" if filtering else "▶")
                 arrow_lbl = tk.Label(hdr, textvariable=arrow_var,
                                      bg=EVE["bg_card"], fg=EVE["accent"],
                                      font=("Segoe UI", 9, "bold"), width=2)
@@ -2519,9 +2728,10 @@ class PIGeneratorApp:
                          bg=EVE["bg_card"], fg=EVE["fg_dim"],
                          font=("Segoe UI", 8)).pack(side=tk.RIGHT, padx=10)
 
-                # ── Planet cards container (hidden by default) ────────
+                # ── Planet cards container ────────────────────────────
                 cards_container = tk.Frame(section, bg=EVE["bg_deep"])
-                # start hidden (collapsed)
+                if filtering:
+                    cards_container.pack(fill=tk.X, pady=(2, 0))
 
                 def _toggle(e=None, sc=cards_container, sid=sid, av=arrow_var):
                     if collapsed_state[sid]:
@@ -2534,23 +2744,28 @@ class PIGeneratorApp:
                         sc.pack(fill=tk.X, pady=(2, 0))
                         av.set("▼")
                         collapsed_state[sid] = True
-                    # Force canvas scroll region update
-                    cards_frame.update_idletasks()
-                    r_canvas.configure(scrollregion=r_canvas.bbox("all"))
+                    _sync_scroll()
 
                 for w in [hdr, arrow_lbl]:
                     w.bind("<Button-1>", _toggle)
 
                 for planet in sorted(planets, key=lambda p: p.get("type", "")):
-                    card = _make_planet_card(cards_container, sec, planet, jdist)
+                    card = _make_planet_card(cards_container, planet)
                     card.pack(fill=tk.X, padx=4, pady=2)
 
             for sid, sdata in sys_list:
                 _make_system_section(sid, sdata)
 
-            status_var.set(
-                f"Found {total_planets} planets across {len(systems_data)} systems  "
-                f"— click a system header to expand")
+            if not total_planets:
+                tk.Label(cards_frame, text="No planet matches the type filter.",
+                         bg=EVE["bg_deep"], fg=EVE["fg_dim"],
+                         font=("Segoe UI", 11)).pack(pady=40)
+                status_var.set("No planet matches the type filter.")
+            else:
+                status_var.set(f"{total_planets} planets · {shown_systems} systems")
+
+            # New content: back to the top, with the scroll region rebuilt for it
+            _sync_scroll(reset=True)
 
         def do_scan():
             """Lance le scan ESI en arrière-plan : résout le système, charge ou construit le cache, affiche les résultats."""
@@ -2581,9 +2796,9 @@ class PIGeneratorApp:
 
             def _bg():
                 try:
-                    # Ensure radii loaded + stale caches purged before scanning
+                    # Radii must be loaded before scanning (and before reading a
+                    # cache, which gets its missing radii backfilled from them)
                     _ensure_planet_radii()
-                    _purge_stale_scan_caches()
                     start_id = _esi_resolve_system(sys_name)
                     if not start_id:
                         popup.after(0, lambda: status_var.set(f"'{sys_name}' not found."))

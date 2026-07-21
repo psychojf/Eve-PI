@@ -10,48 +10,85 @@ Double-click "Eve PI.exe" to launch the app.
   OR
 Run from source:  python PI.py
 
-The main window has five configuration steps on the left,
-a Bill of Materials panel below them, and action buttons
-at the bottom.
+Keep the "data" folder next to the .exe — the planet icons,
+template library and planet radius table are read from
+there, not from inside the executable.
+
+The main window has five configuration steps, a Bill of
+Materials panel below them, and three buttons at the bottom:
+GENERATE TEMPLATE, PROXIMITY SCOUT and TEMPLATE LIBRARY.
 
 -----------------------------------------------------------
 STEP 1 — GENERATING A TEMPLATE
 -----------------------------------------------------------
 
-Follow the steps in order from top to bottom:
+Work down the numbered panels:
 
   1. PRODUCT
-     Click a product name from the list, or type in the
-     search box to filter. Products are grouped by tier
-     (P1 through P4). The list updates automatically based
-     on what your selected chain can produce.
+     Pick what you want the planet to produce. The dropdown
+     lists every PI commodity with its tier, e.g.
+     "Robotics  [P3]", sorted P1 → P4.
+     Choosing a product decides which chains are offered
+     next, so always set this first.
 
   2. CHAIN
-     Select the production chain you want to use.
-     Examples:
-       "P0 → P1 (Extraction)"  — raw resource to P1
-       "P1 → P2 (Factory)"     — P1 inputs to P2 output
-       "P2 → P4 (Factory)"     — P2 inputs to P4 output
-     The available chains update based on your product.
+     How the product gets made. Only chains that can produce
+     the selected product are listed:
+
+       P0 → P1 (Extraction)
+         Extractor + basic factories. The classic mining
+         planet.
+
+       P0 → P2 (Extraction)
+         Self-sufficient planet: extracts its own raw
+         resources, refines them to P1, then to P2. If the
+         planet only holds one of the two raw resources it
+         still works — the other P1 is imported.
+
+       P1 → P2 (Factory)
+         Import P1, produce P2.
+
+       P1 → P3 (Factory)
+         Two-stage planet: one bank of factories turns P1
+         into the P2 intermediates, a second bank turns
+         those into P3. You only haul P1.
+
+       P2 → P3 (Factory)
+         Import finished P2, produce P3. Far more output
+         than P1 → P3, but more hauling.
+
+       P1 → P4 (Factory)
+         Deepest chain: P2 and P3 factories on the planet
+         feed a single High-Tech facility. Least hauling,
+         lowest output.
+
+       P2 → P4 (Factory)
+         Import P2, build P3 on-planet, assemble P4.
+
+       P3 → P4 (Factory)
+         Import finished P3, assemble P4. Highest P4 output,
+         most hauling.
 
   3. PLANET TYPE
-     Pick the planet type where you will build this setup.
-     For extraction chains, this must match a planet that
-     actually produces the raw resource.
+     Only valid planet types are offered:
+       - P4 chains are limited to Barren and Temperate,
+         the only types that allow a High-Tech facility.
+       - Extraction chains list the planet types that
+         actually hold the raw resources, with the most
+         complete ones first.
 
-  4. PLANET RADIUS
-     Choose the size bucket for your specific planet:
-       Auto  — uses the real diameter fetched from ESI
-       XS / S / M / L / XL — manual size override
-     Tip: "Auto" requires you to have scanned or visited
-     the system so the radius cache is populated.
+  4. PLANET RADIUS (km)
+     Type the radius of your actual planet. Find it in-game:
+     select the planet, then Information → Attributes →
+     Radius. Defaults to 5000. This only scales the layout;
+     it does not change the structure count.
 
-  5. CC LEVEL
-     Select your Command Center Upgrades skill level (0–5).
-     Higher levels unlock more CPU/Power and more factories.
-     The available levels are shown as clickable badges.
+  5. COMMAND CENTER LEVEL
+     Your Command Center Upgrades skill (0–5), as clickable
+     badges. Higher levels mean more CPU and power, so the
+     generator fits more factories on the planet.
 
-  After setting all five options, click GENERATE.
+  Then click GENERATE TEMPLATE.
 
 -----------------------------------------------------------
 STEP 2 — READING THE OUTPUT
@@ -59,136 +96,158 @@ STEP 2 — READING THE OUTPUT
 
 A popup window appears with:
 
-  - JSON text (the raw template data)
-  - A visual planet map showing structure layout
-  - "Copy JSON" button — copies the template to clipboard
+  - The JSON template text
+  - A visual planet map of the layout
+  - A "Copy JSON" button
 
 To import into EVE Online:
-  1. Click "Copy JSON" in the popup
-  2. Open EVE Online and enter Planetary Interaction view
-  3. Use the in-game "Import Template" feature and paste
+  1. Click "Copy JSON"
+  2. In EVE, open the planet's Planetary Interaction view
+  3. Use the in-game template import and paste
 
-The map shows:
-  ECU  = Extractor Control Unit (with heads around it)
-  [G]  = Basic Industry Facility (gear icon)
-  [R]  = Advanced Industry Facility (rocket icon)
-  [H]  = High-Tech Industry Facility (H icon)
-  [S]  = Storage Facility
-  [LP] = Launch Pad
+The map has a legend in the corner covering Launch Pad,
+Storage Facility, Basic Industry, Advanced Industry,
+High-Tech Industry and Extractor (ECU).
 
-You can drag to pan the map and scroll to zoom.
-Drag the popup edges to resize it.
+Drag to pan the map, scroll to zoom, and drag the popup
+edges to resize. Hover any structure for a tooltip listing
+what it consumes and produces per cycle. On pure factory
+planets the Launch Pad tooltip also estimates how long it
+takes to fill up, so you know how often to collect.
 
 -----------------------------------------------------------
 BILL OF MATERIALS
 -----------------------------------------------------------
 
-Below the configuration steps, the BOM panel shows the
-full raw-resource (P0) requirements to produce one batch
-of your selected product, along with estimated ISK cost
-(if price data has been loaded).
+The BOM panel below the configuration steps shows, for one
+production cycle:
 
-The breakdown is colour-coded by tier:
-  P0 — raw resources (grey)
-  P1 — basic commodities (green)
-  P2 — refined commodities (blue)
-  P3 — specialized commodities (purple)
-  P4 — advanced commodities (gold)
+  - The facility used and its output per cycle
+  - INPUTS — what the final factory consumes
+  - Either "EXTRACTED ON-PLANET" (green) for what the planet
+    mines itself, or "SEND TO LAUNCH PAD" (orange) for what
+    you must haul in
+
+On a P0 → P2 planet you may see both: the raw resource the
+planet holds is listed as extracted, and the P1 it cannot
+make locally is listed as an import.
+
+Rows are colour-coded by tier — P0 grey, P1 pale blue,
+P2 green, P3 sand, P4 in the theme's accent colour.
 
 -----------------------------------------------------------
-REGION SCANNER
+PROXIMITY SCOUT
 -----------------------------------------------------------
 
-The scanner finds the best PI planets near you.
+Finds the planets around a system so you can pick where to
+set up.
 
-  1. Click "Region Scanner" (bottom of the main window).
-  2. Enter a system name in the search box (autocomplete
-     will suggest matches as you type).
-  3. Choose scan mode:
-       Jump Range  — scan all systems within N jumps
-       Region      — scan all systems in the same region
-  4. Click SCAN.
+  1. Click "PROXIMITY SCOUT" at the bottom of the main
+     window.
+  2. Type a system name — autocomplete suggests matches
+     after two characters.
+  3. Set JUMPS (0–10) for how far out to scan.
+  4. Click SCAN, or press Enter.
 
-Results appear as expandable system cards, sorted by
-estimated PI profit (ISK/hr). Each card shows:
-  - System name and security status
-  - Jump distance from your origin system
-  - Planet cards for each planet in that system
+Results are grouped by system, closest first. Each system
+header shows its security status, the planet types it
+contains, its jump distance and its planet count. Click a
+header to expand or collapse its planets.
 
-Planet cards show:
-  - Planet type and name
-  - Priority P1 products (gold/silver/bronze badges)
-  - Estimated output and ISK value (when prices loaded)
+Each planet card shows the planet's CCP icon, its name, its
+type, and its radius in km — bigger radius means extractor
+heads spread further apart and better yield.
 
-Click a system header to expand/collapse its planet list.
-Click a planet card to expand its full resource detail.
+The SHOW row filters by planet type. Click a type to toggle
+it, or ALL to bring everything back. Filtering redraws
+instantly from the scan you already ran and automatically
+expands the systems that still have matches, so you can hunt
+for, say, every Lava planet within 5 jumps in one glance.
+Your selection is remembered for next time.
 
-Note: The first scan of a region may take 30–60 seconds
-while the app fetches data from ESI. Results are cached
-locally so subsequent scans of the same area are instant.
+The first scan of an area takes a while — a few jumps means
+hundreds of ESI requests. Results are cached locally, so
+re-running the same system and jump count is instant. The
+cache is kept for 7 days.
+
+-----------------------------------------------------------
+TEMPLATE LIBRARY
+-----------------------------------------------------------
+
+"TEMPLATE LIBRARY" opens 83 bundled DalShooth templates,
+grouped into Miner (0.0), Miner (Low-Sec) and Factory.
+Double-click one to open it in the same preview window used
+for generated templates, then copy it as usual.
 
 -----------------------------------------------------------
 SETTINGS
 -----------------------------------------------------------
 
-Click the gear icon in the title bar to open Settings.
+Click the gear icon in the title bar.
 
-  Theme       — change the UI colour scheme
-  Opacity     — adjust window transparency (0.5–1.0)
+  Opacity — window transparency
+  Theme   — 23 EVE faction colour schemes
 
-Window positions are saved automatically when you close
-or move the windows.
+Click APPLY to confirm. Window positions and sizes are saved
+automatically as you move and resize them.
+
+The "?" button opens the About panel.
 
 -----------------------------------------------------------
 SYSTEM TRAY
 -----------------------------------------------------------
 
-Click the minimize button (–) to hide the main window to
-the system tray. A small icon will appear in the taskbar
-notification area.
+Click the minimize button (—) to hide the main window to the
+system tray.
 
-  Single-click tray icon  — show/hide the window
-  Right-click tray icon   — menu with Show / Exit options
+  Single-click tray icon  — bring the window back
+  Right-click tray icon   — menu with Show / Exit
   Double-click title bar  — collapse/expand the window
 
 -----------------------------------------------------------
 TIPS
 -----------------------------------------------------------
 
-- For P4 products, use the "P1 → P4" chain on a single
-  planet if you have CC level 4 or 5, or split into
-  separate extraction and factory planets at lower levels.
+- Chains within a tier trade hauling against output. For P4:
+  P1 → P4 hauls the least and yields one High-Tech facility;
+  P3 → P4 hauls finished P3 and yields many. P2 → P4 sits in
+  between. The same applies to P1 → P3 versus P2 → P3.
 
-- The "P2 → P4" chain assumes you are importing P2
-  materials from off-planet and only doing final assembly.
+- P0 → P2 is the low-maintenance option: a planet that feeds
+  itself needs no imports at all when it holds both raw
+  resources.
 
-- Planet radii matter: a planet classified as "XL" can
-  fit more extractor heads spread further apart, improving
-  resource yield.
+- Run the Proximity Scout before committing to a system, and
+  use the type filter to find the planet types your chain
+  needs.
 
-- Run the scanner before setting up a new PI operation —
-  it highlights which planets in your area have the
-  highest-value resources.
+- Radius matters. Check it in-game and type the real value
+  before generating.
 
 -----------------------------------------------------------
 TROUBLESHOOTING
 -----------------------------------------------------------
 
-"No systems found"
-  — Check your internet connection; the scanner fetches
-    live data from ESI.
+"Could not generate template"
+  — The Command Center level is too low for that layout.
+    Raise it, or choose a chain with fewer structures.
 
-Template popup is blank / map is empty
-  — Try a different planet type or CC level. Some combos
-    (e.g., Gas planet + High-Tech Facility) are not valid
-    and will return no layout.
+Radius shows "—" in the Proximity Scout
+  — The planet radius table is missing. The app downloads it
+    once from the Fuzzwork SDE dump (~85 MB, several
+    minutes) and caches it in data/planet_radii.json. Make
+    sure that file is present next to the executable.
 
-Prices show as 0 or "N/A"
-  — Price data loads in the background on startup. Wait
-    a few seconds and re-open the scanner.
+Planet cards show plain coloured circles instead of icons
+  — data/planet_icons is missing next to the executable.
+
+"No systems found" / scan errors
+  — Check your internet connection; the scout reads live
+    data from ESI.
 
 App crashes on launch (from source)
-  — Make sure Pillow is installed: pip install Pillow
-  — pystray is optional but required for tray support.
+  — Install the dependencies: pip install -r requirements.txt
+  — pystray is optional, but required for tray support.
 
 ===========================================================
+</content>

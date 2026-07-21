@@ -51,7 +51,7 @@ NAME_TO_ID = {name: tid for items in COMMODITIES.values() for name, tid in items
 
 NAME_TO_TIER = {name: tier for tier, items in COMMODITIES.items() for name in items}
 
-COMMODITY_SIZE = {"P0": 0.005, "P1": 0.19, "P2": 0.75, "P3": 3.0, "P4": 50.0}
+COMMODITY_SIZE = {"P0": 0.01, "P1": 0.38, "P2": 1.5, "P3": 6.0, "P4": 100.0}  # m³/unit, EVE values
 
 RECIPES_P0_P1 = {
     "Bacteria":           {"input": [("Micro Organisms", 3000)],    "output": 20},
@@ -249,10 +249,21 @@ CC_LEVELS = {
 LINK_CPU_COST = 15
 LINK_POWER_COST = 8
 
+# "extracts": the planet mines its own P0, so the chain is limited to planet
+#   types that actually hold those resources and needs no P0 hauled in.
+# "supports_sf": the generator can add an optional Storage Facility.
 CHAINS = {
-    "P0 → P1 (Extraction)":   {"source_tier": "P0", "target_tier": "P1", "recipes": RECIPES_P0_P1,  "facility": "Basic Industry Facility"},
+    "P0 → P1 (Extraction)":   {"source_tier": "P0", "target_tier": "P1", "recipes": RECIPES_P0_P1,  "facility": "Basic Industry Facility",     "extracts": True, "supports_sf": True},
+    "P0 → P2 (Extraction)":   {"source_tier": "P0", "target_tier": "P2", "recipes": RECIPES_P1_P2,  "facility": "Advanced Industry Facility",  "extracts": True},
     "P1 → P2 (Factory)":      {"source_tier": "P1", "target_tier": "P2", "recipes": RECIPES_P1_P2,  "facility": "Advanced Industry Facility"},
     "P1 → P3 (Factory)":      {"source_tier": "P1", "target_tier": "P3", "recipes": RECIPES_P2_P3,  "facility": "Advanced Industry Facility"},
+    "P2 → P3 (Factory)":      {"source_tier": "P2", "target_tier": "P3", "recipes": RECIPES_P2_P3,  "facility": "Advanced Industry Facility"},
     "P1 → P4 (Factory)":      {"source_tier": "P1", "target_tier": "P4", "recipes": RECIPES_P3_P4,  "facility": "High-Tech Industry Facility"},
     "P2 → P4 (Factory)":      {"source_tier": "P2", "target_tier": "P4", "recipes": RECIPES_P3_P4,  "facility": "High-Tech Industry Facility"},
+    "P3 → P4 (Factory)":      {"source_tier": "P3", "target_tier": "P4", "recipes": RECIPES_P3_P4,  "facility": "High-Tech Industry Facility"},
 }
+
+# P1 product → the single P0 resource it is refined from (reverse of RECIPES_P0_P1),
+# and the other way round. The mapping is one-to-one: 15 raw resources, 15 P1s.
+P1_TO_P0 = {p1: recipe["input"][0][0] for p1, recipe in RECIPES_P0_P1.items()}
+P0_TO_P1 = {p0: p1 for p1, p0 in P1_TO_P0.items()}

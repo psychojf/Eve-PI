@@ -16,6 +16,8 @@ from src.pi_data import (
     LINK_POWER_COST,
     NAME_TO_ID,
     NAME_TO_TIER,
+    P1_TO_P0,
+    PLANET_RESOURCES,
     PLANET_TYPES,
     RECIPES_P0_P1,
     RECIPES_P1_P2,
@@ -34,10 +36,13 @@ def get_tier(name):
 # so P4 chains also stop at P1.
 _BOM_STOP_TIERS = {
     "P0 → P1 (Extraction)": ("P0",),
+    "P0 → P2 (Extraction)": ("P0",),
     "P1 → P2 (Factory)":    ("P1",),
     "P1 → P3 (Factory)":    ("P1",),
+    "P2 → P3 (Factory)":    ("P2",),
     "P1 → P4 (Factory)":    ("P1",),
     "P2 → P4 (Factory)":    ("P2", "P1"),
+    "P3 → P4 (Factory)":    ("P3", "P1"),
 }
 
 def get_full_supply_chain(product_name, target_chain):
@@ -171,16 +176,35 @@ def generate_template_json(product_name, chain_name, planet_type, cc_level, plan
     """Aiguille vers le bon générateur de template selon la chaîne de production choisie."""
     if chain_name == "P0 → P1 (Extraction)":
         return _gen_extraction_template(product_name, planet_type, cc_level, planet_diameter, use_sf=use_sf)
+    elif chain_name == "P0 → P2 (Extraction)":
+        return _gen_p0_to_p2_template(product_name, planet_type, cc_level, planet_diameter)
     elif chain_name == "P1 → P2 (Factory)":
-        return _gen_p1_to_p2_template(product_name, planet_type, cc_level, planet_diameter)
+        recipe = RECIPES_P1_P2.get(product_name)
+        return _gen_single_stage_template(product_name, planet_type, cc_level, planet_diameter,
+                                          recipe, "Advanced Industry Facility",
+                                          f"P1→P2 {product_name}") if recipe else None
     elif chain_name == "P1 → P3 (Factory)":
         return _gen_p1_to_p3_template(product_name, planet_type, cc_level, planet_diameter)
+    elif chain_name == "P2 → P3 (Factory)":
+        recipe = RECIPES_P2_P3.get(product_name)
+        return _gen_single_stage_template(product_name, planet_type, cc_level, planet_diameter,
+                                          recipe, "Advanced Industry Facility",
+                                          f"P2→P3 {product_name}") if recipe else None
     elif chain_name == "P2 → P4 (Factory)":
         return _gen_p2_to_p4_template(product_name, planet_type, cc_level, planet_diameter)
     elif chain_name == "P1 → P4 (Factory)":
         return _build_p4_template(product_name, planet_type, cc_level, planet_diameter,
                                   include_p2_factories=True,
                                   comment=f"P1→P4 {product_name}")
+    elif chain_name == "P3 → P4 (Factory)":
+        # HTIF only exists on Barren/Temperate, so the facility lookup would
+        # come back empty anywhere else.
+        if planet_type not in HTIF_PLANET_TYPES:
+            return None
+        recipe = RECIPES_P3_P4.get(product_name)
+        return _gen_single_stage_template(product_name, planet_type, cc_level, planet_diameter,
+                                          recipe, "High-Tech Industry Facility",
+                                          f"P3→P4 {product_name}") if recipe else None
     return None
 
 # =====================================================================
@@ -337,21 +361,194 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, use_
     routes.append({"P": [ecu_1b, ecu_dest], "Q": ecu_qty, "T": p0_tid})
 
     return {
-        "CmdCtrLv": cc_level, "Cmt": f"{product_name} Extract",
+        "CmdCtrLv": cc_level, "Cmt": f"P0→P1 {product_name}",
         "Diam": float(diameter),
         "L": links, "P": pins, "Pln": planet_id, "R": routes,
     }
 
 # =====================================================================
+# P0 -> P2 SELF-SUFFICIENT PLANET
+# =====================================================================
+
+# An extractor with fewer heads than this cannot keep even one BIF fed, so the
+# sizing search never trades heads below it for extra factories.
+_MIN_ECU_HEADS = 6
+_MAX_P2_FACTORIES = 4
+
+def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter):
+    """Génère un template P0→P2 : ECU → BIF (P1) → AIF (P2) sur une seule planète.
+
+    Chaque P1 de la recette dont le P0 est présent sur ce type de planète est
+    produit sur place (ECU + BIFs) ; les autres restent à importer au Launch
+    Pad, ce qui rend la chaîne utilisable même quand la planète ne fournit
+    qu'une des deux ressources.
+    """
+    try:
+        recipe = RECIPES_P1_P2.get(product_name)
+        if not recipe:
+            return None
+
+        available_p0 = PLANET_RESOURCES.get(planet_type, [])
+        local, imported = [], []
+        for p1_name, p1_qty in recipe["input"]:
+            p0_name = P1_TO_P0.get(p1_name)
+            if p0_name and p0_name in available_p0:
+                local.append((p1_name, p1_qty, p0_name))
+            else:
+                imported.append((p1_name, p1_qty))
+
+        # Nothing extracted here means this is really a P1→P2 factory planet.
+        if not local:
+            return None
+
+        aif_type = STRUCTURE_IDS["Advanced Industry Facility"][planet_type]
+        bif_type = STRUCTURE_IDS["Basic Industry Facility"][planet_type]
+        ecu_type = STRUCTURE_IDS["Extractor Control Unit"][planet_type]
+        lp_type  = STRUCTURE_IDS["Launch Pad"][planet_type]
+        sp = BASE_SPACING
+
+        # ── Sizing ───────────────────────────────────────────────────
+        # One BIF makes 40 P1/h and one P2 AIF eats 40 of each P1/h, so the
+        # balanced ratio is one BIF per local P1 per AIF. Maximise factories
+        # first, then spend what is left on extractor heads.
+        n_ecu = len(local)
+
+        def _cost(n_aif, heads):
+            n_bif = n_aif * len(local)
+            n_links = n_ecu + n_bif + n_aif          # star topology on the LP
+            cpu = (STRUCTURES["Launch Pad"]["cpu"]
+                   + n_ecu * (STRUCTURES["Extractor Control Unit"]["cpu"]
+                              + heads * STRUCTURES["Extractor Head"]["cpu"])
+                   + n_bif * STRUCTURES["Basic Industry Facility"]["cpu"]
+                   + n_aif * STRUCTURES["Advanced Industry Facility"]["cpu"]
+                   + n_links * LINK_CPU_COST)
+            pw  = (STRUCTURES["Launch Pad"]["power"]
+                   + n_ecu * (STRUCTURES["Extractor Control Unit"]["power"]
+                              + heads * STRUCTURES["Extractor Head"]["power"])
+                   + n_bif * STRUCTURES["Basic Industry Facility"]["power"]
+                   + n_aif * STRUCTURES["Advanced Industry Facility"]["power"]
+                   + n_links * LINK_POWER_COST)
+            return cpu, pw
+
+        cc = CC_LEVELS[cc_level]
+        best = None
+        for n_aif in range(_MAX_P2_FACTORIES, 0, -1):
+            for heads in range(10, _MIN_ECU_HEADS - 1, -1):
+                cpu, pw = _cost(n_aif, heads)
+                if cpu <= cc["cpu"] and pw <= cc["power"]:
+                    best = (n_aif, heads)
+                    break
+            if best:
+                break
+        if best is None:
+            return None
+        num_aif, num_heads = best
+        bif_per_p1 = num_aif
+
+        # ── Pins ─────────────────────────────────────────────────────
+        # Launch Pad hub in the middle, AIFs below it, one BIF row per local
+        # P1 above it, extractors furthest out.
+        pins = []
+        pins.append(_make_pin(CENTER_LAT, 0.0, lp_type))
+        lp_1b = 1
+
+        aif_pins = []
+        for i in range(num_aif):
+            side = -1 if i % 2 == 0 else 1
+            step = (i // 2) + 1
+            pins.append(_make_pin(CENTER_LAT - sp, side * step * sp, aif_type,
+                                  schematic_id=NAME_TO_ID[product_name]))
+            aif_pins.append(len(pins))
+
+        bif_pins = {}      # p1 name -> [pin, ...]
+        for row, (p1_name, _, _) in enumerate(local):
+            row_lat = CENTER_LAT + sp * (row + 1)
+            chain = []
+            for i in range(bif_per_p1):
+                side = -1 if i % 2 == 0 else 1
+                step = (i // 2) + 1
+                pins.append(_make_pin(row_lat, side * step * sp, bif_type,
+                                      schematic_id=NAME_TO_ID[p1_name]))
+                chain.append(len(pins))
+            bif_pins[p1_name] = chain
+
+        ecu_pins = {}      # p0 name -> pin
+        ecu_lat = CENTER_LAT + sp * (len(local) + 3)
+        for i, (_, _, p0_name) in enumerate(local):
+            lon = 0.0 if len(local) == 1 else (-2 * sp if i == 0 else 2 * sp)
+            pins.append(_make_pin(ecu_lat, lon, ecu_type,
+                                  schematic_id=NAME_TO_ID[p0_name], heads=num_heads))
+            ecu_pins[p0_name] = len(pins)
+
+        # ── Links: everything hangs off the Launch Pad ────────────────
+        # The LP is both the P0/P1 buffer and the export pad, so every route
+        # below is a single hop and the topology stays trivially valid.
+        links = []
+        for pin in aif_pins:
+            links.append({"D": lp_1b, "Lv": 0, "S": pin})
+        for chain in bif_pins.values():
+            for pin in chain:
+                links.append({"D": lp_1b, "Lv": 0, "S": pin})
+        for pin in ecu_pins.values():
+            links.append({"D": lp_1b, "Lv": 0, "S": pin})
+
+        num_pins = len(pins)
+        routes = []
+
+        # Extractors → LP, then LP → BIFs (P0), BIFs → LP (P1)
+        p0_recipe_qty = 3000
+        for p1_name, _, p0_name in local:
+            p0_tid = NAME_TO_ID[p0_name]
+            ecu_pin = ecu_pins[p0_name]
+            routes.append({"P": [ecu_pin, lp_1b],
+                           "Q": max(bif_per_p1 * p0_recipe_qty, 125000), "T": p0_tid})
+            for bif_pin in bif_pins[p1_name]:
+                path = _bfs_path(links, lp_1b, bif_pin, num_pins)
+                if path:
+                    routes.append({"P": path, "Q": p0_recipe_qty, "T": p0_tid})
+                path = _bfs_path(links, bif_pin, lp_1b, num_pins)
+                if path:
+                    routes.append({"P": path, "Q": RECIPES_P0_P1[p1_name]["output"],
+                                   "T": NAME_TO_ID[p1_name]})
+
+        # LP → AIFs for every P1 (locally made or hauled in), AIFs → LP (P2)
+        for aif_pin in aif_pins:
+            path = _bfs_path(links, lp_1b, aif_pin, num_pins)
+            if path:
+                for p1_name, p1_qty in recipe["input"]:
+                    routes.append({"P": list(path), "Q": p1_qty, "T": NAME_TO_ID[p1_name]})
+            path = _bfs_path(links, aif_pin, lp_1b, num_pins)
+            if path:
+                routes.append({"P": path, "Q": recipe["output"],
+                               "T": NAME_TO_ID[product_name]})
+
+        return {
+            "CmdCtrLv": cc_level,
+            "Cmt": f"P0→P2 {product_name}",
+            "Diam": float(diameter),
+            "L": links, "P": pins, "Pln": PLANET_TYPES[planet_type], "R": routes,
+        }
+    except Exception as e:
+        _debug(f"_gen_p0_to_p2_template - Error generating {product_name}: {e}")
+        traceback.print_exc()
+        return None
+
+# =====================================================================
 # FACTORIZED TEMPLATE GENERATOR FOR P1->P2, P2->P3, P1->P3
 # =====================================================================
 
-def _gen_p1_to_p2_template(product_name, planet_type, cc_level, diameter):
-    """Générateur P1→P2 : place AIFs + LPs et génère liens/routes."""
+def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
+                               recipe, facility, comment):
+    """Générateur d'usine à un étage : importe les intrants aux LPs, les usines
+    produisent le produit, la sortie repart au LP.
+
+    Sert les chaînes P1→P2, P2→P3 et P3→P4 : seules changent la recette et
+    l'usine (AIF ou HTIF, cette dernière limitée aux planètes Barren/Temperate).
+    """
     try:
-        facility = "Advanced Industry Facility"
-        recipe = RECIPES_P1_P2[product_name]
         facility_type_id = STRUCTURE_IDS[facility][planet_type]
+        if facility_type_id is None:
+            return None
         lp_type = STRUCTURE_IDS["Launch Pad"][planet_type]
         sp = BASE_SPACING
 
@@ -444,7 +641,7 @@ def _gen_p1_to_p2_template(product_name, planet_type, cc_level, diameter):
 
         return {
             "CmdCtrLv": cc_level,
-            "Cmt": "Factory Planet",
+            "Cmt": comment,
             "Diam": float(diameter),
             "L": links,
             "P": pins,
@@ -452,7 +649,8 @@ def _gen_p1_to_p2_template(product_name, planet_type, cc_level, diameter):
             "R": routes,
         }
     except Exception as e:
-        _debug(f"[{datetime.datetime.now().isoformat()}] _gen_p1_to_p2_template - Error generating {product_name}: {e}")
+        _debug(f"[{datetime.datetime.now().isoformat()}] _gen_single_stage_template - "
+               f"Error generating {product_name}: {e}")
         traceback.print_exc()
         return None
 
@@ -928,7 +1126,7 @@ def _build_p4_template(product_name, planet_type, cc_level, diameter, include_p2
 
     return {
         "CmdCtrLv": cc_level,
-        "Cmt": comment or f"{planet_type} {product_name}",
+        "Cmt": comment or f"{'P1→P4' if include_p2_factories else 'P2→P4'} {product_name}",
         "Diam": float(diameter),
         "L": links, "P": pins, "Pln": planet_id, "R": routes,
     }
@@ -1157,7 +1355,7 @@ def _gen_p2_to_p4_template(product_name, planet_type, cc_level, diameter):
 
     return {
         "CmdCtrLv": cc_level,
-        "Cmt": f"{planet_type} {product_name}",
+        "Cmt": f"P2→P4 {product_name}",
         "Diam": float(diameter),
         "L": links,
         "P": pins,
