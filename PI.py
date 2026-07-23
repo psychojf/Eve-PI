@@ -5,6 +5,7 @@ from tkinter import ttk, messagebox, scrolledtext
 import json
 import math
 import os
+import re
 import sys
 import platform
 import threading
@@ -1167,6 +1168,20 @@ class PIGeneratorApp:
         win.lift()
         win.focus_force()
 
+    @staticmethod
+    def _at_least(geometry, min_w, min_h):
+        """Impose une taille minimale à une géométrie Tk, position conservée.
+
+        « 375x325+1122+393 » → « 420x460+1122+393 ». Une géométrie illisible est
+        renvoyée telle quelle : mieux vaut une fenêtre mal dimensionnée qu'une
+        fenêtre qui ne s'ouvre pas.
+        """
+        match = re.match(r"^(\d+)x(\d+)([+-]\d+[+-]\d+)?$", (geometry or "").strip())
+        if not match:
+            return f"{min_w}x{min_h}"
+        width, height, position = match.groups()
+        return f"{max(int(width), min_w)}x{max(int(height), min_h)}{position or ''}"
+
     def _show_about(self):
         """Affiche la fenêtre À propos avec version et crédits."""
         about = tk.Toplevel(self.root)
@@ -1181,7 +1196,10 @@ class PIGeneratorApp:
         about.configure(bg=EVE["bg_deep"])
 
         cfg = _load_window_config()
-        about.geometry(cfg.get("about_geometry", "420x340"))
+        # A size saved by an older build can be shorter than the credits now
+        # need, which would silently clip them. Keep the remembered position,
+        # raise the size to fit.
+        about.geometry(self._at_least(cfg.get("about_geometry", "420x460"), 420, 460))
 
         def close_about():
             _update_window_config("about_geometry", about.geometry())
@@ -1203,6 +1221,21 @@ class PIGeneratorApp:
         link.pack(anchor=tk.W)
         link.bind("<Button-1>", lambda e: __import__("webbrowser").open(
             "https://github.com/DalShooth/EVE_PI_Templates"))
+
+        # This tool stops at the template; Planets in Space picks up from there
+        # and tracks the colonies you actually run, across every character.
+        ttk.Label(content, text="\n\U0001F44D  Once it is running:",
+                  style="Sub.TLabel").pack(anchor=tk.W)
+        ttk.Label(content,
+                  text="Planets in Space — web tool for managing\n"
+                       "your PI across all your characters").pack(anchor=tk.W)
+        pis_link = tk.Label(content, text="planetsin.space",
+                            bg=EVE["bg_deep"], fg=EVE["accent"],
+                            font=("Segoe UI", 9, "underline"), cursor="hand2")
+        pis_link.pack(anchor=tk.W)
+        pis_link.bind("<Button-1>", lambda e: __import__("webbrowser").open(
+            "https://planetsin.space/"))
+
         ttk.Label(content, text="\nFly Safe o7", foreground=EVE["accent"]).pack(anchor=tk.W)
         
         about.lift()
