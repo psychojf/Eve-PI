@@ -298,6 +298,59 @@ grouped into Miner (0.0), Miner (Low-Sec) and Factory.
 Double-click one to open it in the same preview window used
 for generated templates, then copy it as usual.
 
+To change a template instead of just copying it, select it
+and click "✎ Edit" — see TEMPLATE EDITOR below. Templates
+you save from the editor show up here in a Custom group at
+the top of the list.
+
+-----------------------------------------------------------
+TEMPLATE EDITOR
+-----------------------------------------------------------
+
+Every bundled template is built for one planet size, and
+link cost grows with link length, so the same colony on a
+bigger planet can blow its CPU and power budget. The
+editor is how you fix that: open a template, re-price it
+for your planet, trim it until it fits, and take corrected
+JSON back out.
+
+Open it from the Template Library: select a template and
+click "✎ Edit", or click "📋 Paste JSON" to start from a
+template copied from anywhere else.
+
+The window shows the map, the live JSON and the same
+validation strip as the main window. You can change:
+
+  - Five counters: Factories, Extractors, Heads per
+    extractor, Launch Pads and Storage.
+  - Planet radius and Command Center level. These move
+    nothing — they change what the existing layout costs,
+    which is usually the whole point.
+  - The template name, as EVE's import list will show it.
+
+As everywhere else, nothing is refused: go over budget and
+the strip turns red and says by how much. "🧲 Fit to
+planet" is the way back — it trims factories from the arm
+tips until the colony fits, then reports what it removed.
+
+Getting the result out:
+
+  - "📋 Copy JSON" — paste into EVE's PI import, exactly
+    as from the preview window.
+  - "⬇ Save to EVE Folder" — writes the file into
+    Documents\EVE\PlanetaryInteractionTemplates, so it
+    appears in the in-game import list after a restart or
+    relog.
+  - "💾 Save to Library" — keeps it in this app under a
+    new "Custom" category, listed at the top of the
+    Template Library. Bundled templates are never
+    overwritten.
+
+A template the editor cannot restructure — one that makes
+two different products, say — still opens, with the
+counters greyed out and the reason shown; you keep the map
+and the analysis.
+
 -----------------------------------------------------------
 SETTINGS
 -----------------------------------------------------------

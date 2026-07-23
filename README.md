@@ -12,6 +12,7 @@ A desktop tool for EVE Online players that generates ready-to-import Planetary I
 - **Visual Preview** — Interactive map of the generated layout with pan, zoom, a structure legend, and per-structure tooltips showing input/output flow per cycle
 - **Proximity Scout** — Scans every system within N jumps of a chosen system and lists their planets with type icons and radii, filterable by planet type
 - **Template Library** — 83 bundled DalShooth templates, browsable and importable from inside the app
+- **Template Editor** — Edit any library or pasted template: five structure counters plus radius, Command Center level and name, validated live rather than blocked; *Fit to planet* trims until the colony fits, and the result copies out, saves into EVE's template folder, or joins the library under a new Custom category
 - **Themes** — 23 EVE faction colour schemes (Caldari, Amarr, Triglavian, Sisters of EVE, …)
 - **System Tray** — Minimize to tray; click the icon to restore
 - **Planet Radius Lookup** — Real planet radii from the EVE SDE, cached locally. Radius drives link length, and link cost scales with length, so it decides how many factories actually fit
@@ -124,12 +125,17 @@ PI/
 ├── src/
 │   ├── pi_data.py               # Commodities, recipes, structures, chains
 │   ├── debug_log.py             # PI_DEBUG-gated logging
-│   └── services/
-│       └── template_service.py  # Template generation + TemplateService
+│   ├── services/
+│   │   ├── template_service.py  # Template generation + TemplateService
+│   │   └── colony_model.py      # Parse/edit model for imported templates
+│   └── ui/
+│       └── template_editor.py   # Template Editor window
 ├── tests/
 │   ├── test_link_cost.py        # Link cost model vs readings taken in-game
 │   ├── test_throughput.py       # BOM panel throughput grouping
 │   ├── test_sweep.py            # Every chain builds an importable colony
+│   ├── test_colony_model.py     # Round-trip identity across the whole library
+│   ├── test_colony_edits.py     # Edit invariants + Fit to planet sweep
 │   ├── golden.py                # Capture/compare every generated template
 │   └── ui_smoke.py              # Drives the real Tk app, dumps the canvases
 ├── docs/superpowers/            # Design specs and implementation plans

@@ -39,11 +39,13 @@ from src.services.template_service import (
     MAX_LAUNCH_PADS,
     TemplateService,
     analyze_template,
+    factory_clamp_note,
     PRODUCTION_FACILITIES,
     get_full_supply_chain,
     get_tier,
     throughput_rows,
 )
+from src.ui.template_editor import open_template_editor
 
 
 # ── System tray (pystray + PIL) ───────────────────────────────────────
@@ -1042,15 +1044,17 @@ class PIGeneratorApp:
             return
 
         files = sorted(f for f in os.listdir(lib_dir) if f.lower().endswith(".json"))
-        if not files:
-            messagebox.showinfo("Empty Library", "No templates found in data/templates/.")
-            return
+        # Une bibliothèque vide reste ouvrable : le bouton Coller y vit aussi.
+        files = files or []
 
-        # Categorize: "Miner - 00 - X", "Miner - LS - X", "Factory - X"
-        categories = {"Miner (0.0)": [], "Miner (Low-Sec)": [], "Factory": []}
+        # Categorize: "Custom - X", "Miner - 00 - X", "Miner - LS - X", "Factory - X"
+        categories = {"Custom": [], "Miner (0.0)": [], "Miner (Low-Sec)": [],
+                      "Factory": []}
         for fname in files:
             stem = fname[:-5]
-            if stem.startswith("Miner - 00"):
+            if stem.startswith("Custom - "):
+                categories["Custom"].append(fname)
+            elif stem.startswith("Miner - 00"):
                 categories["Miner (0.0)"].append(fname)
             elif stem.startswith("Miner - LS"):
                 categories["Miner (Low-Sec)"].append(fname)
@@ -1098,7 +1102,7 @@ class PIGeneratorApp:
             for fname in cat_files:
                 display = fname[:-5]
                 # Trim category prefix for cleaner names
-                for pfx in ("Miner - 00 - ", "Miner - LS - ", "Factory - "):
+                for pfx in ("Custom - ", "Miner - 00 - ", "Miner - LS - ", "Factory - "):
                     if display.startswith(pfx):
                         display = display[len(pfx):]
                         break
@@ -1122,6 +1126,42 @@ class PIGeneratorApp:
             self.current_template = tpl
             self._show_popup(tpl)
 
+        def edit_selected(_event=None):
+            sel = tree.selection()
+            if not sel:
+                return
+            fname = file_by_iid.get(sel[0])
+            if not fname:
+                return
+            path = os.path.join(lib_dir, fname)
+            try:
+                with open(path, "r", encoding="utf-8-sig") as fh:
+                    tpl = json.load(fh)
+            except Exception as e:
+                messagebox.showerror("Load Failed", f"Could not load {fname}:\n{e}",
+                                     parent=win)
+                return
+            open_template_editor(self, tpl, source_name=fname[:-5])
+
+        def paste_json():
+            """Colle un template copié depuis un forum, Discord, ou l'app même."""
+            try:
+                raw = win.clipboard_get()
+            except tk.TclError:
+                messagebox.showinfo("Clipboard empty",
+                                    "Copy a template's JSON first.", parent=win)
+                return
+            try:
+                tpl = json.loads(raw)
+                if not isinstance(tpl, dict) or "P" not in tpl:
+                    raise ValueError("not a PI template (no structure list)")
+            except (ValueError, TypeError) as e:
+                messagebox.showerror("Paste failed",
+                                     f"Clipboard is not template JSON:\n{e}",
+                                     parent=win)
+                return
+            open_template_editor(self, tpl, source_name="pasted")
+
         tree.bind("<Double-Button-1>", open_selected)
         tree.bind("<Return>", open_selected)
 
@@ -1132,6 +1172,19 @@ class PIGeneratorApp:
                   bg=EVE["accent_dim"], fg=EVE["fg_bright"],
                   activebackground=EVE["accent"], activeforeground="white",
                   relief=tk.FLAT, cursor="hand2", command=open_selected).pack(side=tk.LEFT, ipady=4, ipadx=10)
+
+        tk.Button(btn_bar, text="✎  Edit", font=("Segoe UI", 10, "bold"),
+                  bg=EVE["bg_card"], fg=EVE["fg"],
+                  activebackground=EVE["border_hi"], activeforeground=EVE["fg_bright"],
+                  relief=tk.FLAT, cursor="hand2",
+                  command=edit_selected).pack(side=tk.LEFT, padx=(8, 0),
+                                              ipady=4, ipadx=10)
+        tk.Button(btn_bar, text="📋 Paste JSON", font=("Segoe UI", 9, "bold"),
+                  bg=EVE["bg_card"], fg=EVE["fg"],
+                  activebackground=EVE["border_hi"], activeforeground=EVE["fg_bright"],
+                  relief=tk.FLAT, cursor="hand2",
+                  command=paste_json).pack(side=tk.LEFT, padx=(8, 0),
+                                           ipady=4, ipadx=8)
 
         def install_all():
             target = os.path.join(os.path.expanduser("~"), "Documents",
@@ -1764,6 +1817,20 @@ class PIGeneratorApp:
                                f"{a['p0_demand_h']:,.0f}/h",
                           fill=EVE["green"] if fed else EVE["red"], font=("Consolas", 8))
             y += 16
+
+        # A manual factory count above what the pads can seat is clamped by the
+        # generator, which freezes every number above. Say so, or it reads as a
+        # dead calculator.
+        clamp_note = factory_clamp_note(
+            self._layout_options().get("factories"),
+            sum(cnt for name, cnt in a["structures"].items()
+                if name in PRODUCTION_FACILITIES),
+            a["structures"].get("Launch Pad", 0))
+        if clamp_note:
+            c.create_text(8, y, anchor=tk.NW, text=f"⚠ {clamp_note}",
+                          fill=EVE["orange"], font=("Segoe UI", 8),
+                          width=right_x - 16)
+            y += 14 * (1 + len(clamp_note) // 52)
 
         for warn in a["warnings"]:
             c.create_text(8, y, anchor=tk.NW, text=f"⚠ {warn}", fill=EVE["red"],

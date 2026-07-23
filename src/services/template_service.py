@@ -353,6 +353,28 @@ def throughput_rows(analysis, product_name, primary_facility=None):
     }
 
 
+def factory_clamp_note(requested, built, pads):
+    """Explique un nombre d'usines manuel que la géométrie des pads a rogné.
+
+    Le générateur pose deux bras de MAX_ARM_LEN par pad, soit pads*8 usines au
+    maximum ; une demande au-delà est tronquée sans bruit et fige CPU, énergie et
+    autonomie sur la valeur bornée. On ne le signale que lorsque le plafond
+    atteint est bien celui des pads (`built == pads*8`) : en-dessous, c'est le
+    budget CPU/énergie ou le plafond d'extraction qui a tranché, et les jauges le
+    disent déjà. Renvoie une ligne pour le bandeau, ou None si rien n'a été rogné.
+    """
+    if not requested or not pads:
+        return None
+    geo_cap = pads * MAX_ARM_LEN * 2
+    if built < requested and built >= geo_cap:
+        pad_word = "pad" if pads == 1 else "pads"
+        # At the pad ceiling "add a pad" is a dead end — say what the limit is.
+        tail = ("that's the most this planet holds" if pads >= MAX_LAUNCH_PADS
+                else "add a pad to place more")
+        return f"{pads} {pad_word} hold {geo_cap} factories — {tail}"
+    return None
+
+
 # Tier(s) at which each chain's bill of materials stops decomposing.
 # P4 recipes can require P1 directly (e.g. Reactive Metals in Nano-Factory),
 # so P4 chains also stop at P1.
