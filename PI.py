@@ -38,6 +38,7 @@ from src.services.template_service import (
     MAX_LAUNCH_PADS,
     TemplateService,
     analyze_template,
+    PRODUCTION_FACILITIES,
     get_full_supply_chain,
     get_tier,
     throughput_rows,
@@ -1312,6 +1313,9 @@ class PIGeneratorApp:
                               insertbackground=EVE["accent"], relief=tk.FLAT,
                               font=("Consolas", 11), justify=tk.RIGHT)
         diam_entry.pack(side=tk.LEFT)
+        # Radius sets link length, which sets link cost, which sets how many
+        # factories fit — so it has to redraw the panels like any other input.
+        diam_entry.bind("<KeyRelease>", lambda e: self._update_bom())
         tk.Label(radius_row, text=" km  (planet info → Attributes → Radius)",
                  bg=EVE["bg_card"], fg=EVE["fg_dim"],
                  font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(4, 0))
@@ -1557,14 +1561,16 @@ class PIGeneratorApp:
         except Exception as e:
             _debug(f"_update_chain_list - Error: {e}")
 
-    def _planet_radius(self):
-        """Rayon saisi en ④, en km ; 0 si le champ est vide ou illisible.
+    def _planet_diameter(self):
+        """Diamètre à passer au générateur, depuis le rayon saisi en ④.
 
-        Un rayon nul revient à ne facturer que la base des liens — l'ancien
-        comportement, trop optimiste, mais au moins il ne plante pas.
+        L'UI collecte un rayon, le générateur travaille en diamètre — même
+        conversion que _generate, sans quoi l'aperçu et le template produit ne
+        parlent pas de la même planète. Un champ vide vaut 0 : on ne facture
+        alors que la base des liens, trop optimiste mais sans planter.
         """
         try:
-            return max(0.0, float(self.diameter_var.get()))
+            return max(0.0, float(self.diameter_var.get())) * 2.0
         except (ValueError, TypeError, AttributeError):
             return 0.0
 
@@ -1594,9 +1600,37 @@ class PIGeneratorApp:
         self.interval_var.set(hours)
         self._on_layout_change()
 
+    def _prefill_manual_counts(self):
+        """Recopie dans les compteurs ce que le générateur vient de choisir seul.
+
+        À n'appeler qu'au moment où l'on coche la case : current_analysis décrit
+        encore la colonie automatique, alors qu'ensuite ce sont les valeurs
+        manuelles qui la pilotent.
+        """
+        a = self.current_analysis
+        if not a:
+            return
+        counts = a.get("structures", {})
+        ecus = counts.get("Extractor Control Unit", 0)
+        # Le générateur pose le même nombre de têtes sur chaque extracteur et
+        # le champ en attend une par extracteur ; l'analyse renvoie le total.
+        heads_total = a.get("heads", 0)
+        values = {
+            "extractors": ecus,
+            "heads": (heads_total // ecus) if ecus else 0,
+            "factories": sum(c for n, c in counts.items()
+                             if n in PRODUCTION_FACILITIES),
+            "launch_pads": counts.get("Launch Pad", 0),
+        }
+        for key, var in self.manual_vars.items():
+            var.set(str(values.get(key, 0)))
+
     def _toggle_manual_layout(self):
         """Affiche ou masque les compteurs manuels."""
         if self.manual_var.get():
+            # Partir de la colonie automatique : on voit ce qu'elle contient
+            # sans avoir à générer, et cocher la case ne la change pas.
+            self._prefill_manual_counts()
             self.manual_frame.pack(fill=tk.X, padx=8, pady=(2, 0),
                                    before=self.layout_canvas)
         else:
@@ -1787,7 +1821,7 @@ class PIGeneratorApp:
                 "cc_level": self.cc_var.get(),
                 # Link cost scales with radius, so the preview has to measure
                 # the planet you actually picked or the CPU bar lies.
-                "planet_diameter": self._planet_radius(),
+                "planet_diameter": self._planet_diameter(),
                 "layout": self._layout_options(),
             })
         except Exception as exc:

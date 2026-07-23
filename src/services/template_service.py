@@ -134,26 +134,31 @@ def link_cost(distance_km):
             math.ceil(LINK_POWER_BASE + LINK_POWER_PER_KM * distance_km))
 
 
-def link_cost_per_spacing(radius_km, spacings=1):
-    """Coût d'un lien long de N espacements sur une planète de ce rayon.
+def radius_from_diameter(diameter_km):
+    """Rayon en km à partir du diamètre que transporte le pipeline.
+
+    L'UI saisit un rayon, mais tout le générateur — et la clé « Diam » du
+    template — travaille en diamètre. La longueur d'un arc, elle, se calcule sur
+    le rayon : confondre les deux double le prix de chaque lien.
+    """
+    try:
+        return max(0.0, float(diameter_km or 0.0)) / 2.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def link_cost_per_spacing(diameter_km, spacings=1):
+    """Coût d'un lien long de N espacements sur une planète de ce diamètre.
 
     Les pins sont posés à des angles fixes, donc la longueur réelle d'un lien —
-    et son prix — dépend entièrement du rayon de la planète.
+    et son prix — dépend entièrement de la taille de la planète.
     """
-    return link_cost(BASE_SPACING * spacings * (radius_km or 0.0))
+    return link_cost(BASE_SPACING * spacings * radius_from_diameter(diameter_km))
 
 
 def template_radius(template):
-    """Rayon de la planète en km.
-
-    Stocké sous la clé « Diam » du template — le nom vient du format d'export,
-    mais la valeur saisie est bien le rayon (champ « PLANET RADIUS » de l'UI,
-    lu dans les attributs de la planète en jeu).
-    """
-    try:
-        return float(template.get("Diam") or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
+    """Rayon de la planète en km, déduit du diamètre stocké sous « Diam »."""
+    return radius_from_diameter(template.get("Diam"))
 
 
 def links_cost(template):
@@ -427,7 +432,7 @@ EXTRA_SPACINGS_TWO_TIER = 1
 EXTRA_SPACINGS_P4_BUILDER = 6
 
 
-def _try_budget(num_lps, num_aif, num_htif, num_links, cc_level, radius_km,
+def _try_budget(num_lps, num_aif, num_htif, num_links, cc_level, diameter_km,
                 extra_spacings=EXTRA_SPACINGS_TWO_TIER):
     """Vérifie si la combinaison de structures tient dans le budget CPU/énergie du CC donné.
 
@@ -436,8 +441,8 @@ def _try_budget(num_lps, num_aif, num_htif, num_links, cc_level, radius_km,
     forfaitaire ajoutée pour leurs liens longs.
     """
     cc = CC_LEVELS[cc_level]
-    link_cpu, link_pw = link_cost_per_spacing(radius_km)
-    span_cpu, span_pw = link_cost_per_spacing(radius_km, extra_spacings)
+    link_cpu, link_pw = link_cost_per_spacing(diameter_km)
+    span_cpu, span_pw = link_cost_per_spacing(diameter_km, extra_spacings)
     # Seule la part kilométrique compte en supplément : la base est déjà payée
     # une fois par lien dans num_links.
     extra_cpu = max(0, span_cpu - LINK_CPU_BASE)
@@ -453,12 +458,12 @@ def _try_budget(num_lps, num_aif, num_htif, num_links, cc_level, radius_km,
     return cpu <= cc["cpu"] and pw <= cc["power"], cpu, pw
 
 def _calc_max_factories(cc_level, fixed_cpu, fixed_power, factory_cpu, factory_power,
-                        radius_km):
+                        diameter_km):
     """Calcule le nombre max d'usines pouvant tenir dans le budget restant du CC."""
     cc = CC_LEVELS[cc_level]
     avail_cpu = cc["cpu"] - fixed_cpu
     avail_pw  = cc["power"] - fixed_power
-    link_cpu, link_pw = link_cost_per_spacing(radius_km)
+    link_cpu, link_pw = link_cost_per_spacing(diameter_km)
     cost_cpu = factory_cpu + link_cpu
     cost_pw  = factory_power + link_pw
     if cost_cpu <= 0 or cost_pw <= 0:

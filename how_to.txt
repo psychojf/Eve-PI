@@ -154,12 +154,22 @@ Work down the numbered panels:
        rich, lower it if the extractors run dry.
 
      Set counts myself — tick this to place exact numbers of
-       extractors, heads, factories and pads. 0 means "you
-       decide". Manual values are placed as asked, even bad
-       ones: the panel then tells you what is wrong instead
-       of silently refusing. Available for the extraction and
-       single-stage factory chains; the multi-stage layouts
-       (P1→P3, P1→P4, P2→P4) are fixed by geometry.
+       extractors, heads, factories and pads.
+
+       Ticking it fills the boxes with what the generator
+       just chose on its own, so it doubles as a readout: you
+       see the colony is 21 factories on 4 pads without
+       generating anything. Ticking never changes the layout,
+       it only shows you the numbers behind it. Edit from
+       there, or untick to hand the decision back.
+
+       Heads is per extractor, not the total. 0 in any box
+       means "you decide" for that one. Manual values are
+       placed as asked, even bad ones: the panel then tells
+       you what is wrong instead of silently refusing.
+       Available for the extraction and single-stage factory
+       chains; the multi-stage layouts (P1→P3, P1→P4, P2→P4)
+       are fixed by geometry.
 
      The strip at the bottom of the panel measures whatever
      is currently configured, updating as you type:
