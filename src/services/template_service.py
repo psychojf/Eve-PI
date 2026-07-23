@@ -6,7 +6,7 @@ import math
 import traceback
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from src.debug_log import _debug
 from src.pi_data import (
@@ -17,8 +17,10 @@ from src.pi_data import (
     DEFAULT_COLLECTION_HOURS,
     DEFAULT_YIELD_PER_HEAD,
     HTIF_PLANET_TYPES,
-    LINK_CPU_COST,
-    LINK_POWER_COST,
+    LINK_CPU_BASE,
+    LINK_CPU_PER_KM,
+    LINK_POWER_BASE,
+    LINK_POWER_PER_KM,
     MAX_EXTRACTOR_HEADS,
     NAME_TO_ID,
     NAME_TO_TIER,
@@ -113,6 +115,67 @@ def get_tier(name):
     return NAME_TO_TIER.get(name)
 
 
+def pin_angle(a, b):
+    """Séparation angulaire de deux pins, en radians.
+
+    « La » est un angle polaire (pi/2 = équateur), pas une latitude signée :
+    d'où cos·cos + sin·sin·cos(Δlon) et non l'inverse.
+    """
+    t1, p1 = a.get("La", 0.0), a.get("Lo", 0.0)
+    t2, p2 = b.get("La", 0.0), b.get("Lo", 0.0)
+    cos_d = (math.cos(t1) * math.cos(t2)
+             + math.sin(t1) * math.sin(t2) * math.cos(p1 - p2))
+    return math.acos(max(-1.0, min(1.0, cos_d)))
+
+
+def link_cost(distance_km):
+    """CPU et énergie que coûte un lien de cette longueur, chiffres du jeu."""
+    return (math.ceil(LINK_CPU_BASE + LINK_CPU_PER_KM * distance_km),
+            math.ceil(LINK_POWER_BASE + LINK_POWER_PER_KM * distance_km))
+
+
+def link_cost_per_spacing(radius_km, spacings=1):
+    """Coût d'un lien long de N espacements sur une planète de ce rayon.
+
+    Les pins sont posés à des angles fixes, donc la longueur réelle d'un lien —
+    et son prix — dépend entièrement du rayon de la planète.
+    """
+    return link_cost(BASE_SPACING * spacings * (radius_km or 0.0))
+
+
+def template_radius(template):
+    """Rayon de la planète en km.
+
+    Stocké sous la clé « Diam » du template — le nom vient du format d'export,
+    mais la valeur saisie est bien le rayon (champ « PLANET RADIUS » de l'UI,
+    lu dans les attributs de la planète en jeu).
+    """
+    try:
+        return float(template.get("Diam") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def links_cost(template):
+    """Somme du CPU et de l'énergie de tous les liens d'un template."""
+    pins = template.get("P", [])
+    radius = template_radius(template)
+    cpu = pw = 0
+    for link in template.get("L", []):
+        src, dst = link.get("S", 0), link.get("D", 0)
+        # Indices 1-based dans le format ; un lien qui pointe dans le vide ne
+        # doit pas faire exploser l'analyse, il coûte au moins sa base.
+        if not (1 <= src <= len(pins)) or not (1 <= dst <= len(pins)):
+            cpu += LINK_CPU_BASE
+            pw += LINK_POWER_BASE
+            continue
+        km = pin_angle(pins[src - 1], pins[dst - 1]) * radius
+        c, p = link_cost(km)
+        cpu += c
+        pw += p
+    return cpu, pw
+
+
 def analyze_template(template, options=None):
     """Mesure une colonie déjà générée : budget, flux horaires, autonomie.
 
@@ -160,8 +223,12 @@ def analyze_template(template, options=None):
         for inp_name, inp_qty in recipe["input"]:
             consumed[inp_name] = consumed.get(inp_name, 0) + hourly_rate(inp_qty, sname)
 
-    cpu += len(links) * LINK_CPU_COST
-    pw += len(links) * LINK_POWER_COST
+    # Links are priced by length, so the same layout costs more on a bigger
+    # planet. Charging a flat rate here is what let the tool bless templates
+    # that EVE then refused to import.
+    link_cpu, link_pw = links_cost(template)
+    cpu += link_cpu
+    pw += link_pw
 
     # What the planet cannot make for itself has to be hauled in; what it makes
     # beyond its own needs piles up until collected. Both consume pad space.
@@ -203,10 +270,83 @@ def analyze_template(template, options=None):
         "structures": counts, "heads": heads_total,
         "p0_supply_h": p0_supply, "p0_demand_h": p0_demand,
         "imports": imports, "exports": exports,
+        "produced": produced, "consumed": consumed,
         "import_m3_h": import_m3_h, "export_m3_h": export_m3_h,
         "buffer_m3": buffer_m3, "buffer_hours": buffer_hours,
         "warnings": warnings,
     }
+
+# Structures that actually make something. Launch pads, storage and extractor
+# control units are infrastructure and stay out of the facility row.
+PRODUCTION_FACILITIES = (
+    "Basic Industry Facility",
+    "Advanced Industry Facility",
+    "High-Tech Industry Facility",
+)
+
+
+class Flow(NamedTuple):
+    """Un flux horaire d'une marchandise franchissant la frontière de la colonie."""
+    name: str
+    tier: str
+    per_hour: float
+    m3_per_hour: float
+
+
+def _flow(name, per_hour):
+    """Construit un Flow en attachant le palier et le volume horaire."""
+    tier = get_tier(name) or "P0"
+    return Flow(name, tier, per_hour, per_hour * COMMODITY_SIZE.get(tier, 0.0))
+
+
+def _sorted_flows(mapping):
+    """Trie par volume décroissant — ce qui remplit le cargo passe en premier.
+
+    Le nom départage les égalités pour que l'ordre ne saute pas d'un
+    rafraîchissement à l'autre.
+    """
+    return sorted((_flow(n, q) for n, q in mapping.items()),
+                  key=lambda f: (-f.m3_per_hour, f.name))
+
+
+def throughput_rows(analysis, product_name, primary_facility=None):
+    """Regroupe une analyse en blocs d'affichage pour la BOM.
+
+    Tout est horaire et à l'échelle de la colonie entière : c'est la seule unité
+    qui se compose, un cycle ne durant pas la même chose selon l'usine.
+    """
+    produced = analysis.get("produced", {})
+    exports = analysis.get("exports", {})
+
+    # Rien ne fabrique un P0 : tout P0 produit sort forcément d'un extracteur.
+    extracted = {n: q for n, q in produced.items() if get_tier(n) == "P0"}
+    collect = {n: q for n, q in exports.items() if n == product_name}
+    surplus = {n: q for n, q in exports.items() if n != product_name}
+
+    counts = analysis.get("structures", {})
+    facilities = []
+    if primary_facility in counts and primary_facility in PRODUCTION_FACILITIES:
+        facilities.append((primary_facility, counts[primary_facility]))
+    for name in sorted(counts):
+        if name in PRODUCTION_FACILITIES and name != primary_facility:
+            facilities.append((name, counts[name]))
+
+    haul_in = _sorted_flows(analysis.get("imports", {}))
+    collect_rows = _sorted_flows(collect)
+    surplus_rows = _sorted_flows(surplus)
+
+    return {
+        "facilities": facilities,
+        "extracted": _sorted_flows(extracted),
+        "haul_in": haul_in,
+        "collect": collect_rows,
+        "surplus": surplus_rows,
+        "haul_in_m3_h": sum(f.m3_per_hour for f in haul_in),
+        # Le surplus occupe le même espace de stockage que le produit fini, donc
+        # il compte dans le volume à ramasser (et recolle à export_m3_h).
+        "collect_m3_h": sum(f.m3_per_hour for f in collect_rows + surplus_rows),
+    }
+
 
 # Tier(s) at which each chain's bill of materials stops decomposing.
 # P4 recipes can require P1 directly (e.g. Reactive Metals in Nano-Factory),
@@ -277,26 +417,50 @@ def _make_pin(lat, lon, structure_type_id, schematic_id=None, heads=0):
         "T": structure_type_id,
     }
 
-def _try_budget(num_lps, num_aif, num_htif, num_links, cc_level):
-    """Vérifie si la combinaison de structures tient dans le budget CPU/énergie du CC donné."""
+# Les générateurs multi-étages posent leurs pins à des positions figées : la
+# plupart des liens font un espacement, quelques-uns en font deux ou trois. Le
+# surplus, mesuré sur toutes leurs dispositions possibles, plafonne à 1 pour
+# P1→P3 et P2→P4, et à 6 pour le constructeur P4. Sans cette marge l'estimation
+# sous-évalue et la colonie sort du budget sur une grosse planète ; trop large,
+# elle coûte des usines pour rien (test ImportableEverywhere garde les deux).
+EXTRA_SPACINGS_TWO_TIER = 1
+EXTRA_SPACINGS_P4_BUILDER = 6
+
+
+def _try_budget(num_lps, num_aif, num_htif, num_links, cc_level, radius_km,
+                extra_spacings=EXTRA_SPACINGS_TWO_TIER):
+    """Vérifie si la combinaison de structures tient dans le budget CPU/énergie du CC donné.
+
+    Un lien coûte selon sa longueur, donc selon le rayon de la planète. Ses
+    seuls appelants sont les générateurs à géométrie figée, d'où la marge
+    forfaitaire ajoutée pour leurs liens longs.
+    """
     cc = CC_LEVELS[cc_level]
+    link_cpu, link_pw = link_cost_per_spacing(radius_km)
+    span_cpu, span_pw = link_cost_per_spacing(radius_km, extra_spacings)
+    # Seule la part kilométrique compte en supplément : la base est déjà payée
+    # une fois par lien dans num_links.
+    extra_cpu = max(0, span_cpu - LINK_CPU_BASE)
+    extra_pw = max(0, span_pw - LINK_POWER_BASE)
     cpu = (num_lps  * STRUCTURES["Launch Pad"]["cpu"] +
            num_aif  * STRUCTURES["Advanced Industry Facility"]["cpu"] +
            num_htif * STRUCTURES["High-Tech Industry Facility"]["cpu"] +
-           num_links * LINK_CPU_COST)
+           num_links * link_cpu + extra_cpu)
     pw = (num_lps  * STRUCTURES["Launch Pad"]["power"] +
           num_aif  * STRUCTURES["Advanced Industry Facility"]["power"] +
           num_htif * STRUCTURES["High-Tech Industry Facility"]["power"] +
-          num_links * LINK_POWER_COST)
+          num_links * link_pw + extra_pw)
     return cpu <= cc["cpu"] and pw <= cc["power"], cpu, pw
 
-def _calc_max_factories(cc_level, fixed_cpu, fixed_power, factory_cpu, factory_power):
+def _calc_max_factories(cc_level, fixed_cpu, fixed_power, factory_cpu, factory_power,
+                        radius_km):
     """Calcule le nombre max d'usines pouvant tenir dans le budget restant du CC."""
     cc = CC_LEVELS[cc_level]
     avail_cpu = cc["cpu"] - fixed_cpu
     avail_pw  = cc["power"] - fixed_power
-    cost_cpu = factory_cpu + LINK_CPU_COST
-    cost_pw  = factory_power + LINK_POWER_COST
+    link_cpu, link_pw = link_cost_per_spacing(radius_km)
+    cost_cpu = factory_cpu + link_cpu
+    cost_pw  = factory_power + link_pw
     if cost_cpu <= 0 or cost_pw <= 0:
         return 0
     return max(0, min(avail_cpu // cost_cpu, avail_pw // cost_pw))
@@ -445,20 +609,23 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, opti
                     default=pads_for_buffer(num_bif * p1_m3_per_bif, opts.collection_hours))
 
     # Trim to whatever the command centre can actually power, factories first.
+    link_cpu, link_pw = link_cost_per_spacing(diameter)
+
     def _fixed(lps, ecus, sfs):
         cpu = (lps * STRUCTURES["Launch Pad"]["cpu"] + ecus * ecu_cpu
                + sfs * STRUCTURES["Storage Facility"]["cpu"]
-               + (lps - 1 + ecus + sfs) * LINK_CPU_COST)
+               + (lps - 1 + ecus + sfs) * link_cpu)
         pw  = (lps * STRUCTURES["Launch Pad"]["power"] + ecus * ecu_pw
                + sfs * STRUCTURES["Storage Facility"]["power"]
-               + (lps - 1 + ecus + sfs) * LINK_POWER_COST)
+               + (lps - 1 + ecus + sfs) * link_pw)
         return cpu, pw
 
     while True:
         fixed_cpu, fixed_pw = _fixed(num_lp, num_ecu, num_sf)
         room = _calc_max_factories(cc_level, fixed_cpu, fixed_pw,
                                    STRUCTURES["Basic Industry Facility"]["cpu"],
-                                   STRUCTURES["Basic Industry Facility"]["power"])
+                                   STRUCTURES["Basic Industry Facility"]["power"],
+                                   diameter)
         if room >= 1:
             num_bif = min(num_bif, room)
             break
@@ -685,13 +852,13 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, option
                               + heads * STRUCTURES["Extractor Head"]["cpu"])
                    + n_bif * STRUCTURES["Basic Industry Facility"]["cpu"]
                    + n_aif * STRUCTURES["Advanced Industry Facility"]["cpu"]
-                   + n_links * LINK_CPU_COST)
+                   + n_links * link_cost_per_spacing(diameter)[0])
             pw  = (STRUCTURES["Launch Pad"]["power"]
                    + n_ecu * (STRUCTURES["Extractor Control Unit"]["power"]
                               + heads * STRUCTURES["Extractor Head"]["power"])
                    + n_bif * STRUCTURES["Basic Industry Facility"]["power"]
                    + n_aif * STRUCTURES["Advanced Industry Facility"]["power"]
-                   + n_links * LINK_POWER_COST)
+                   + n_links * link_cost_per_spacing(diameter)[1])
             return cpu, pw
 
         cc = CC_LEVELS[cc_level]
@@ -858,14 +1025,18 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
             + hourly_rate(recipe["output"], facility)
             * COMMODITY_SIZE.get(get_tier(product_name), 0))
 
+        # One link per extra factory, one spacing long (arms are chained), so
+        # its price is fixed by the planet's radius.
+        link_cpu, link_pw = link_cost_per_spacing(diameter)
+
         def _max_factories(lps):
             backbone = max(0, lps - 1)
-            fixed_cpu = lps * STRUCTURES["Launch Pad"]["cpu"] + backbone * LINK_CPU_COST
-            fixed_pw = lps * STRUCTURES["Launch Pad"]["power"] + backbone * LINK_POWER_COST
+            fixed_cpu = lps * STRUCTURES["Launch Pad"]["cpu"] + backbone * link_cpu
+            fixed_pw = lps * STRUCTURES["Launch Pad"]["power"] + backbone * link_pw
             avail_cpu = CC_LEVELS[cc_level]["cpu"] - fixed_cpu
             avail_pw = CC_LEVELS[cc_level]["power"] - fixed_pw
-            cost_cpu = STRUCTURES[facility]["cpu"] + LINK_CPU_COST
-            cost_pw = STRUCTURES[facility]["power"] + LINK_POWER_COST
+            cost_cpu = STRUCTURES[facility]["cpu"] + link_cpu
+            cost_pw = STRUCTURES[facility]["power"] + link_pw
             if cost_cpu <= 0 or cost_pw <= 0:
                 return 0
             n = max(0, min(avail_cpu // cost_cpu, avail_pw // cost_pw))
@@ -1038,7 +1209,7 @@ def _gen_p1_to_p3_template(product_name, planet_type, cc_level, diameter):
                 break
             n_aif = n + sum(n_each)
             est_links = (num_lps - 1) + n_aif + (1 if num_lps == 4 else 0)
-            if _try_budget(num_lps, n_aif, 0, est_links, cc_level)[0]:
+            if _try_budget(num_lps, n_aif, 0, est_links, cc_level, diameter)[0]:
                 best_n_p3 = n
             else:
                 break
@@ -1051,7 +1222,7 @@ def _gen_p1_to_p3_template(product_name, planet_type, cc_level, diameter):
                     break
                 n_aif = n + sum(n_each)
                 est_links = (num_lps - 1) + n_aif
-                if _try_budget(num_lps, n_aif, 0, est_links, cc_level)[0]:
+                if _try_budget(num_lps, n_aif, 0, est_links, cc_level, diameter)[0]:
                     best_n_p3 = n
                 else:
                     break
@@ -1278,7 +1449,8 @@ def _build_p4_template(product_name, planet_type, cc_level, diameter, include_p2
     def _fits():
         total_aif = sum(p2_counts.values()) + sum(p3_counts.values())
         total_links = max(0, num_lps - 1) + total_aif + num_htf
-        return _try_budget(num_lps, total_aif, num_htf, total_links, cc_level)[0]
+        return _try_budget(num_lps, total_aif, num_htf, total_links, cc_level, diameter,
+                           EXTRA_SPACINGS_P4_BUILDER)[0]
 
     while True:
         if _fits():
@@ -1524,7 +1696,7 @@ def _gen_p2_to_p4_template(product_name, planet_type, cc_level, diameter):
         for a in range(6, 2 * u - 1, -1):
             n_aif = num_p3 * a
             n_links = (lps_try - 1) + u + n_aif
-            if _try_budget(lps_try, n_aif, u, n_links, cc_level)[0]:
+            if _try_budget(lps_try, n_aif, u, n_links, cc_level, diameter)[0]:
                 best = (u, a, lps_try)
                 break
         if best:

@@ -27,7 +27,6 @@ from src.pi_data import (
     HTIF_PLANET_TYPES,
     NAME_TO_ID,
     NAME_TO_TIER,
-    P0_TO_P1,
     PLANET_RESOURCES,
     PLANET_TYPES,
     RECIPES_P0_P1,
@@ -35,10 +34,13 @@ from src.pi_data import (
 )
 from src.services.template_service import (
     CONFIGURABLE_CHAINS,
+    MAX_ARM_LEN,
+    MAX_LAUNCH_PADS,
     TemplateService,
     analyze_template,
     get_full_supply_chain,
     get_tier,
+    throughput_rows,
 )
 
 
@@ -746,6 +748,7 @@ class PIGeneratorApp:
         self.root.resizable(False, False)
         self.current_template = None
         self.current_preview = None   # colony the ⑥ LAYOUT panel is measuring
+        self.current_analysis = None  # its measurements, shared by ⑥ and the BOM
         self._main_hidden = False
         self._tray_icon = None
         self._sw = None
@@ -1398,9 +1401,14 @@ class PIGeneratorApp:
 
         self.manual_frame = tk.Frame(self.grp_layout, bg=EVE["bg_card"])
         self.manual_vars = {}
+        # Ceilings match what the generators actually honour, so the arrows can
+        # reach every layout you are allowed to ask for. The factory cap is the
+        # geometric limit at full pads; fewer pads lower it and the generator
+        # clamps, and the validation strip reports anything over CPU budget.
         manual_rows = (
             (("extractors", "Extractors", 4), ("heads", "Heads", MAX_EXTRACTOR_HEADS)),
-            (("factories", "Factories", 16), ("launch_pads", "Pads", 4)),
+            (("factories", "Factories", MAX_LAUNCH_PADS * MAX_ARM_LEN * 2),
+             ("launch_pads", "Pads", MAX_LAUNCH_PADS)),
         )
         for pair in manual_rows:
             line = tk.Frame(self.manual_frame, bg=EVE["bg_card"])
@@ -1549,6 +1557,17 @@ class PIGeneratorApp:
         except Exception as e:
             _debug(f"_update_chain_list - Error: {e}")
 
+    def _planet_radius(self):
+        """Rayon saisi en ④, en km ; 0 si le champ est vide ou illisible.
+
+        Un rayon nul revient à ne facturer que la base des liens — l'ancien
+        comportement, trop optimiste, mais au moins il ne plante pas.
+        """
+        try:
+            return max(0.0, float(self.diameter_var.get()))
+        except (ValueError, TypeError, AttributeError):
+            return 0.0
+
     def _layout_options(self):
         """Assemble les réglages du panneau ⑥ en options pour le générateur."""
         try:
@@ -1624,7 +1643,11 @@ class PIGeneratorApp:
             c.config(height=26)
             return
 
-        a = analyze_template(tpl, self._layout_options())
+        # Always set alongside current_preview in _update_bom; the only other
+        # caller here is the width-change binding, which cannot alter options.
+        a = self.current_analysis
+        if a is None:
+            a = analyze_template(tpl, self._layout_options())
         # On the first draw the canvas has no real width yet; 392 matches the
         # 420px window, and the <Configure> binding redraws once it is laid out.
         right_x = c.winfo_width() - 8
@@ -1762,12 +1785,19 @@ class PIGeneratorApp:
                 "chain_name": chain,
                 "planet_type": self.planet_var.get(),
                 "cc_level": self.cc_var.get(),
-                "planet_diameter": 10000.0,
+                # Link cost scales with radius, so the preview has to measure
+                # the planet you actually picked or the CPU bar lies.
+                "planet_diameter": self._planet_radius(),
                 "layout": self._layout_options(),
             })
         except Exception as exc:
             _debug(f"_update_bom - preview failed: {exc}")
             self.current_preview = None
+        # Measure once per redraw: the ⑥ panel and the BOM blocks below both
+        # read this, and walking every pin twice per keystroke is wasteful.
+        self.current_analysis = (analyze_template(self.current_preview,
+                                                  self._layout_options())
+                                 if self.current_preview is not None else None)
         self._refresh_layout_panel()
 
         self.bom_product_lbl.config(text=product)
@@ -1795,48 +1825,66 @@ class PIGeneratorApp:
                               fill=color, font=("Consolas", 9))
             y += lh
 
-        draw_row(f"  {chain_info['facility']}", f"⊞ {recipe['output']}/cycle", EVE["fg_dim"])
+        rows = (throughput_rows(self.current_analysis, product,
+                                chain_info["facility"])
+                if self.current_analysis else None)
+
+        facilities = rows["facilities"] if rows else []
+        if facilities:
+            # The chain's own facility is not always the bulk of the colony:
+            # P1→P4 builds one HTIF and 23 AIF, so list every producer.
+            name, count = facilities[0]
+            draw_row(f"  {name}", f"×{count}   ⊞ {recipe['output']}/cycle",
+                     EVE["fg_dim"])
+            for name, count in facilities[1:]:
+                draw_row(f"  + {name}", f"×{count}", EVE["fg_dim"], indent=4)
+        else:
+            draw_row(f"  {chain_info['facility']}",
+                     f"⊞ {recipe['output']}/cycle", EVE["fg_dim"])
+
         c.create_line(8, y, right_x, y, fill=EVE["border"], width=1)
         y += 4
 
-        draw_row("INPUTS", "", EVE["accent"])
+        draw_row("INPUTS · one factory, per cycle", "", EVE["accent"])
         for inp_name, inp_qty in recipe["input"]:
             tier = get_tier(inp_name)
             clr  = TIER_CLR.get(tier, EVE["fg"])
             draw_row(f"  {inp_name}", f"{inp_qty}×  [{tier}]", clr, indent=4)
 
-        bom = get_full_supply_chain(product, chain)
-        if bom:
+        if rows:
             y += 4
             c.create_line(8, y, right_x, y, fill=EVE["border"], width=1)
             y += 4
 
-            def draw_materials(names):
-                for name in sorted(names):
-                    tier = get_tier(name)
-                    clr  = TIER_CLR.get(tier, EVE["fg"])
-                    draw_row(f"  {name}", f"{bom[name]}×  [{tier}]", clr, indent=4)
+            def draw_flows(flows, indent=4):
+                for flow in flows:
+                    clr = TIER_CLR.get(flow.tier, EVE["fg"])
+                    draw_row(f"  {flow.name}",
+                             f"{flow.per_hour:,.0f}/h  [{flow.tier}]",
+                             clr, indent=indent)
 
-            if chain_info.get("extracts"):
-                # A P0 the chosen planet holds is mined here; one it does not
-                # hold has to arrive as the P1 that would have been made from it.
-                on_planet = set(PLANET_RESOURCES.get(self.planet_var.get(), []))
-                extracted = {n for n in bom if get_tier(n) != "P0" or n in on_planet}
-                missing   = set(bom) - extracted
-                if extracted:
-                    draw_row("⛏ EXTRACTED ON-PLANET", "", EVE["green"])
-                    draw_materials(extracted)
-                if missing:
-                    draw_row("⬆ SEND TO LAUNCH PAD — not on this planet", "", EVE["orange"])
-                    for name in sorted(missing):
-                        p1 = P0_TO_P1.get(name, name)
-                        clr = TIER_CLR.get(get_tier(p1), EVE["fg"])
-                        draw_row(f"  {p1}", f"[{get_tier(p1)}]", clr, indent=4)
-            else:
-                # These are the materials the player must manually send to
-                # the Launch Pad(s) — the planet cannot produce them.
-                draw_row("⬆ SEND TO LAUNCH PAD (per cycle)", "", EVE["orange"])
-                draw_materials(bom)
+            def draw_subtotal(m3):
+                draw_row("", f"{m3:,.0f} m³/h", EVE["fg_dim"])
+
+            if rows["extracted"]:
+                draw_row("⛏ EXTRACTED ON-PLANET", "", EVE["green"])
+                draw_flows(rows["extracted"])
+
+            if rows["haul_in"]:
+                draw_row("⬆ HAUL IN · whole colony, per hour", "", EVE["orange"])
+                draw_flows(rows["haul_in"])
+                draw_subtotal(rows["haul_in_m3_h"])
+
+            if rows["collect"] or rows["surplus"]:
+                draw_row("⬇ COLLECT · whole colony, per hour", "", EVE["accent"])
+                draw_flows(rows["collect"])
+                if rows["surplus"]:
+                    # Raw material the factories cannot keep up with: it fills
+                    # storage exactly like finished goods, then spills.
+                    draw_row("  surplus — piles up in storage", "",
+                             EVE["fg_dim"], indent=4)
+                    draw_flows(rows["surplus"], indent=8)
+                draw_subtotal(rows["collect_m3_h"])
 
         c.config(height=max(80, y + 8))
         # Resize main window to fit content after BOM height changes

@@ -246,8 +246,15 @@ CC_LEVELS = {
     5: {"cpu": 25415, "power": 19000, "cost": 2100000},
 }
 
-LINK_CPU_COST = 15
-LINK_POWER_COST = 8
+# A link's cost scales with its length: these are the base and the per-km slope,
+# measured in-game by dragging links of known length on planets of known radius
+# (0.20 CPU/km and 0.15 MW/km came out of two same-planet pairs, exactly).
+# Charging only the base is what made full templates fail to import: on a
+# 30,000 km planet the real cost of a colony's links is thousands of CPU.
+LINK_CPU_BASE = 15
+LINK_CPU_PER_KM = 0.20
+LINK_POWER_BASE = 10
+LINK_POWER_PER_KM = 0.15
 
 # Schematic cycle length per facility, in hours. Rates are recipe quantity
 # divided by these: a Basic Industry Facility running a P1 schematic turns

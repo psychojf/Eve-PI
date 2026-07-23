@@ -8,13 +8,13 @@ A desktop tool for EVE Online players that generates ready-to-import Planetary I
 - **Eight Production Chains** — `P0→P1`, `P0→P2`, `P1→P2`, `P1→P3`, `P2→P3`, `P1→P4`, `P2→P4`, `P3→P4`
 - **Colonies sized to work, not just to fit** — Factory counts follow what the extractors actually produce and how often you are willing to collect, rather than filling the CPU budget with factories that would starve
 - **Manual override with live validation** — Set exact structure counts yourself; the layout panel reports CPU, power, material balance and how long the colony runs untended instead of silently refusing
-- **Bill of Materials** — Breaks a product down into what the planet extracts itself and what you have to haul to the Launch Pad
+- **Bill of Materials** — One factory's recipe, plus the whole colony's hourly throughput: what it extracts, what you must haul in, and what you collect — so you can size one planet against another
 - **Visual Preview** — Interactive map of the generated layout with pan, zoom, a structure legend, and per-structure tooltips showing input/output flow per cycle
 - **Proximity Scout** — Scans every system within N jumps of a chosen system and lists their planets with type icons and radii, filterable by planet type
 - **Template Library** — 83 bundled DalShooth templates, browsable and importable from inside the app
 - **Themes** — 23 EVE faction colour schemes (Caldari, Amarr, Triglavian, Sisters of EVE, …)
 - **System Tray** — Minimize to tray; click the icon to restore
-- **Planet Radius Lookup** — Real planet radii from the EVE SDE, cached locally so templates are placed at the correct scale
+- **Planet Radius Lookup** — Real planet radii from the EVE SDE, cached locally. Radius drives link length, and link cost scales with length, so it decides how many factories actually fit
 
 ## How colonies are sized
 
@@ -44,9 +44,14 @@ The rates behind all of this live in `src/pi_data.py`: `CYCLE_HOURS` (30 minutes
 for basic facilities, 1 hour for advanced and high-tech), `COMMODITY_SIZE`,
 `STORAGE_CAPACITY_M3` and `DEFAULT_YIELD_PER_HEAD`.
 
-Two known simplifications: link CPU/power cost is charged at a flat rate per
-link, where EVE scales it with distance, and structure spacing is a constant
-angle regardless of planet size.
+Link cost is charged the way EVE charges it — `15 + 0.20 CPU` and
+`10 + 0.15 MW` per km of link — so the planet radius you enter genuinely changes
+how many factories fit. Measured in-game against links of known length on
+planets of known radius; the readings are asserted in `tests/test_link_cost.py`.
+
+One known simplification remains: structure spacing is a constant angle
+regardless of planet size, so links on a large planet are long and expensive
+rather than being packed tighter.
 
 ## Requirements
 
@@ -71,13 +76,31 @@ python PI.py
 Set `PI_DEBUG=1` for verbose debug logging on the console. On Windows also set
 `PYTHONIOENCODING=utf-8`, since chain names contain `→`.
 
-There is no automated test suite. When changing template generation, the
-convention is to capture every product × chain × planet template before the
-change and diff it after, so unrelated layouts are provably untouched, and to
-sweep every combination through `analyze_template()` checking for pin indices in
-range, a connected network, routes that only travel over real links, valid
-schematics, extractor head limits and CPU/power within the command centre
-budget. A full sweep is ~3,600 templates and runs in about a minute.
+Run the tests with:
+
+```
+python -m unittest discover -s tests
+```
+
+Stdlib `unittest` only — no test dependency is installed, and none belongs in
+`requirements.txt`, which `build.spec` ships into the executable. The suite
+covers the link cost model against readings taken in-game, the throughput
+grouping, and a sweep asserting that every chain × product × planet builds a
+colony inside its CPU and power budget at small, medium and large planet radii.
+That last one is the guard against generating templates EVE will refuse.
+
+Two extra tools, neither part of the unittest run:
+
+- `python tests/golden.py` captures every product × chain × planet template to
+  `tests/baseline_golden.json`; `python tests/golden.py compare` diffs the
+  current code against it. Run the capture before a refactor and the compare
+  after, and unrelated layouts are provably untouched. ~1,000 templates,
+  about a minute. The baseline is a local working artifact, not something to
+  keep.
+- `python tests/ui_smoke.py` drives the real Tk app and dumps what the BOM and
+  layout canvases render for three representative chains. The UI can only be
+  exercised from inside `mainloop()` — a `root.update()` polling loop makes the
+  app's worker threads die with "main thread is not in main loop".
 
 ## Compiled Executable
 
@@ -103,6 +126,13 @@ PI/
 │   ├── debug_log.py             # PI_DEBUG-gated logging
 │   └── services/
 │       └── template_service.py  # Template generation + TemplateService
+├── tests/
+│   ├── test_link_cost.py        # Link cost model vs readings taken in-game
+│   ├── test_throughput.py       # BOM panel throughput grouping
+│   ├── test_sweep.py            # Every chain builds an importable colony
+│   ├── golden.py                # Capture/compare every generated template
+│   └── ui_smoke.py              # Drives the real Tk app, dumps the canvases
+├── docs/superpowers/            # Design specs and implementation plans
 └── data/
     ├── planet_icons/            # CCP planet renders, one per planet type
     ├── templates/               # 83 bundled DalShooth templates

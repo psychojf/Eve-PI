@@ -80,8 +80,22 @@ Work down the numbered panels:
   4. PLANET RADIUS (km)
      Type the radius of your actual planet. Find it in-game:
      select the planet, then Information → Attributes →
-     Radius. Defaults to 5000. This only scales the layout;
-     it does not change the structure count.
+     Radius. Defaults to 5000.
+
+     Get this right — it decides how many factories you get.
+     A link's CPU and power cost grow with its length, and
+     structures sit at fixed angles, so the same layout on a
+     bigger planet means longer links and a bigger bill:
+
+       CPU   = 15 + 0.20 per km
+       Power = 10 + 0.15 per km
+
+     On a 1,200 km planet a link is ~14 km and costs about
+     18 CPU. On a 30,000 km planet the same link is ~360 km
+     and costs 87. Across a whole colony that is the
+     difference between 21 factories and 18. Enter a radius
+     smaller than the real one and the tool will hand you a
+     template EVE refuses to import.
 
      On a P0 → P1 planet a checkbox also appears here:
      "Include Storage Facility (P0 buffer)". It puts a
@@ -114,8 +128,12 @@ Work down the numbered panels:
          P3 → P4 — changes every step. At level 5: 16
            facilities on 2 pads at 6h, 12 on 3 pads at 12h,
            8 on 4 pads at 24h, 4 on 4 pads at 48h.
-         P1 → P2, P2 → P3 — nothing until 48h, because the
-           default build already survives about 30 hours.
+         P1 → P2 — nothing until 48h; the default build
+           already survives about 34 hours.
+         P2 → P3 — nothing until 24h (23 facilities on 3
+           pads becomes 20 on 4), then 13 on 4 pads at 48h.
+           Its P3 output is bulkier, so it fills pads faster
+           and only lasts about 21 hours by default.
          P0 → P1, P0 → P2 — usually nothing at any setting.
            P1 and P2 are compact, so one pad already holds
            several days: a balanced level 5 extraction planet
@@ -148,6 +166,9 @@ Work down the numbered panels:
 
        CPU and power bars against your command center,
          green until 90%, amber to 100%, red beyond it.
+         These include every link priced by its real length,
+         so they move when you change the planet radius in
+         ④ even though nothing else about the colony did.
        "runs Nh untended (Nh asked)" — green when it meets
          the interval, amber when it falls short. When it is
          already comfortably past it, the line reads
@@ -191,18 +212,34 @@ takes to fill up, so you know how often to collect.
 BILL OF MATERIALS
 -----------------------------------------------------------
 
-The BOM panel below the configuration steps shows, for one
-production cycle:
+The BOM panel below the configuration steps has two halves.
 
-  - The facility used and its output per cycle
-  - INPUTS — what the final factory consumes
-  - Either "EXTRACTED ON-PLANET" (green) for what the planet
-    mines itself, or "SEND TO LAUNCH PAD" (orange) for what
-    you must haul in
+The top names every production facility the colony builds,
+with how many of each, followed by INPUTS — one factory's
+recipe for one cycle, the same numbers EVE shows you in the
+facility window.
 
-On a P0 → P2 planet you may see both: the raw resource the
-planet holds is listed as extracted, and the P1 it cannot
-make locally is listed as an import.
+The blocks below it describe the WHOLE colony, per hour:
+
+  - "EXTRACTED ON-PLANET" (green) — what your extractor
+    heads pull out of the ground each hour
+  - "HAUL IN" (orange) — what you must ship to the Launch
+    Pad each hour to keep the factories fed
+  - "COLLECT" (accent) — what piles up for you to pick up
+
+Under COLLECT, a "surplus" sub-list means raw material your
+factories cannot keep up with. It fills storage exactly like
+finished goods and is then lost, so either add a factory or
+pull an extractor head.
+
+Each colony-wide block ends with its volume in m3/h, so you
+can size a hauler against it.
+
+Because these are hourly totals for the whole planet, you
+can size one planet against another: if a P2 → P4 planet
+eats 60 Transmitters/h and a P1 → P2 planet makes 105/h,
+one feeds it with room to spare. That is how you build
+modular factory planets you can clone.
 
 Rows are colour-coded by tier — P0 grey, P1 pale blue,
 P2 green, P3 sand, P4 in the theme's accent colour.
