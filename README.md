@@ -7,7 +7,8 @@ A desktop tool for EVE Online players that generates ready-to-import Planetary I
 - **Template Generation** — Produces JSON templates for any PI product (P1–P4) across all planet types and Command Center levels (0–5)
 - **Eight Production Chains** — `P0→P1`, `P0→P2`, `P1→P2`, `P1→P3`, `P2→P3`, `P1→P4`, `P2→P4`, `P3→P4`
 - **Colonies sized to work, not just to fit** — Factory counts follow what the extractors actually produce and how often you are willing to collect, rather than filling the CPU budget with factories that would starve
-- **Manual override with live validation** — Set exact structure counts yourself; the layout panel reports CPU, power, material balance and how long the colony runs untended instead of silently refusing
+- **Manual override with live validation** — Set exact structure counts yourself, arm length included; the layout panel reports CPU, power, link load, material balance and how long the colony runs untended instead of silently refusing
+- **Routes that drain the right pad first** — Every factory pulls from its own launch pad before any other, so multi-pad colonies consume in parallel instead of emptying one pad while the rest sit full
 - **Bill of Materials** — One factory's recipe, plus the whole colony's hourly throughput: what it extracts, what you must haul in, and what you collect — so you can size one planet against another
 - **Visual Preview** — Interactive map of the generated layout with pan, zoom, a structure legend, and per-structure tooltips showing input/output flow per cycle
 - **Proximity Scout** — Scans every system within N jumps of a chosen system and lists their planets with type icons and radii, filterable by planet type
@@ -20,7 +21,7 @@ A desktop tool for EVE Online players that generates ready-to-import Planetary I
 ## How colonies are sized
 
 PI has no single correct layout, so the generator does not try to invent one. It
-starts from two numbers you control in the **⑥ LAYOUT** panel and builds the
+starts from the numbers you control in the **⑥ LAYOUT** panel and builds the
 colony those imply:
 
 - **Extractor yield** (default 2000 units per head per hour). Factory counts are
@@ -36,10 +37,19 @@ colony those imply:
   a P3→P4 planet (16 facilities on 2 pads at 6h, 4 on 4 pads at 48h) and does
   nothing at all on an extraction planet, where one pad already holds days of
   compact P1 output.
+- **Arm length** (default 4, up to 8). Factories hang off a pad in two
+  daisy-chained arms, so a pad seats `2 × arm length`. The old fixed 4 was a
+  layout convention inherited from the spreadsheet, not a game rule — EVE
+  enforces only the CC budget and link capacity. Stretching arms trades link
+  headroom for pad count, which is how a 24-factory colony fits on two pads
+  instead of three: dropping the third pad frees 3,600 CPU and 700 MW, enough
+  for the extra factories. Applies to the single-stage factory chains
+  (`P1→P2`, `P2→P3`, `P3→P4`); the extraction and multi-stage layouts place
+  their factories by their own geometry and ignore it.
 
 Anything you set by hand is placed as asked and validated rather than overruled —
-`analyze_template()` reports CPU, power, material balance and buffer hours for
-any template, including ones loaded from the bundled library.
+`analyze_template()` reports CPU, power, link load, material balance and buffer
+hours for any template, including ones loaded from the bundled library.
 
 The rates behind all of this live in `src/pi_data.py`: `CYCLE_HOURS` (30 minutes
 for basic facilities, 1 hour for advanced and high-tech), `COMMODITY_SIZE`,
@@ -50,9 +60,39 @@ Link cost is charged the way EVE charges it — `15 + 0.20 CPU` and
 how many factories fit. Measured in-game against links of known length on
 planets of known radius; the readings are asserted in `tests/test_link_cost.py`.
 
-One known simplification remains: structure spacing is a constant angle
+Link *capacity* is modelled separately from link cost: `link_flows()` walks every
+route and sums the m³/h crossing each link, and the layout panel warns when a
+level-0 link is asked to carry more than the 1,250 m³/h the game gives it.
+Traffic stacks toward the pad, so the innermost link of an arm carries every
+factory behind it — which is what makes long arms a real trade rather than a free
+win. Light commodities never come close (24 P1→P2 factories on arms of 6 peak
+around 227 m³/h), while bulky ones bite quickly: a `P3→P4` planet on arms of 6
+runs at 1,123 m³/h and arms of 7 go over. Only the first input route per factory
+and commodity counts, since the rest are idle fallbacks (see *Route priority*).
+
+Two known simplifications remain: structure spacing is a constant angle
 regardless of planet size, so links on a large planet are long and expensive
-rather than being packed tighter.
+rather than being packed tighter; and the capacity model judges only level-0
+links, because the generators never emit upgraded ones and each upgrade level
+carries a capacity the model does not track.
+
+## Route priority
+
+EVE drains a factory's input routes in the order they were created, and a
+template's `R` list *is* that order. Every generator therefore emits each
+factory's own pad first and the other pads after.
+
+This matters as soon as a colony has more than one pad. Emitting the pads in a
+fixed order instead made all factories name the same pad first, so one pad
+drained while the others sat full — visible in game as a colony that stalls with
+stock still on the shelf. With local-first order the rows consume in parallel and
+the cross-pad routes become what they should be: fallbacks that only engage once
+a row's own pad runs dry, which is also what lets an under-consuming branch feed
+its neighbours instead of needing its backbone links deleted.
+
+Route order is baked into the template at generation time, so an already-built
+colony keeps whatever priority it was imported with — fixing one means recreating
+its input routes.
 
 ## Requirements
 
@@ -86,7 +126,8 @@ python -m unittest discover -s tests
 Stdlib `unittest` only — no test dependency is installed, and none belongs in
 `requirements.txt`, which `build.spec` ships into the executable. The suite
 covers the link cost model against readings taken in-game, the throughput
-grouping, and a sweep asserting that every chain × product × planet builds a
+grouping, the arm-length override with its link-capacity guard and local-first
+route order, and a sweep asserting that every chain × product × planet builds a
 colony inside its CPU and power budget at small, medium and large planet radii.
 That last one is the guard against generating templates EVE will refuse.
 
@@ -134,6 +175,8 @@ PI/
 │   ├── test_link_cost.py        # Link cost model vs readings taken in-game
 │   ├── test_throughput.py       # BOM panel throughput grouping
 │   ├── test_sweep.py            # Every chain builds an importable colony
+│   ├── test_arm_length.py       # Arm-length override, link capacity, route order
+│   ├── test_layout_clamp.py     # Manual factory count trimmed by pad geometry
 │   ├── test_colony_model.py     # Round-trip identity across the whole library
 │   ├── test_colony_edits.py     # Edit invariants + Fit to planet sweep
 │   ├── golden.py                # Capture/compare every generated template

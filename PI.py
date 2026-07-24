@@ -36,6 +36,7 @@ from src.pi_data import (
 from src.services.template_service import (
     CONFIGURABLE_CHAINS,
     MAX_ARM_LEN,
+    MAX_ARM_LEN_HARD,
     MAX_LAUNCH_PADS,
     TemplateService,
     analyze_template,
@@ -1264,7 +1265,7 @@ class PIGeneratorApp:
         content.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
 
         ttk.Label(content, text="EVE Online — PI Template Generator", style="Header.TLabel").pack(anchor=tk.W, pady=(0,5))
-        ttk.Label(content, text="Version 1.6", style="Sub.TLabel").pack(anchor=tk.W)
+        ttk.Label(content, text="Version 2.7", style="Sub.TLabel").pack(anchor=tk.W)
         ttk.Label(content, text="\nBased on the Planetary Interaction Template\nGenerator spreadsheet by Razkin\n(Pandemic Horde).").pack(anchor=tk.W)
         ttk.Label(content, text="\nBundled Template Library:", style="Sub.TLabel").pack(anchor=tk.W)
         ttk.Label(content, text="Templates by DalShooth").pack(anchor=tk.W)
@@ -1493,12 +1494,15 @@ class PIGeneratorApp:
         self.manual_vars = {}
         # Ceilings match what the generators actually honour, so the arrows can
         # reach every layout you are allowed to ask for. The factory cap is the
-        # geometric limit at full pads; fewer pads lower it and the generator
-        # clamps, and the validation strip reports anything over CPU budget.
+        # geometric limit at full pads with arms stretched to the hard maximum;
+        # fewer pads or shorter arms lower it and the generator clamps, and the
+        # validation strip reports anything over CPU budget. Arm len 0 = auto
+        # (two arms of MAX_ARM_LEN per pad, the compact Razkin default).
         manual_rows = (
             (("extractors", "Extractors", 4), ("heads", "Heads", MAX_EXTRACTOR_HEADS)),
-            (("factories", "Factories", MAX_LAUNCH_PADS * MAX_ARM_LEN * 2),
+            (("factories", "Factories", MAX_LAUNCH_PADS * MAX_ARM_LEN_HARD * 2),
              ("launch_pads", "Pads", MAX_LAUNCH_PADS)),
+            (("arm_length", "Arm len", MAX_ARM_LEN_HARD),),
         )
         for pair in manual_rows:
             line = tk.Frame(self.manual_frame, bg=EVE["bg_card"])
@@ -1821,11 +1825,13 @@ class PIGeneratorApp:
         # A manual factory count above what the pads can seat is clamped by the
         # generator, which freezes every number above. Say so, or it reads as a
         # dead calculator.
+        layout_opts = self._layout_options()
         clamp_note = factory_clamp_note(
-            self._layout_options().get("factories"),
+            layout_opts.get("factories"),
             sum(cnt for name, cnt in a["structures"].items()
                 if name in PRODUCTION_FACILITIES),
-            a["structures"].get("Launch Pad", 0))
+            a["structures"].get("Launch Pad", 0),
+            arm_len=layout_opts.get("arm_length") or MAX_ARM_LEN)
         if clamp_note:
             c.create_text(8, y, anchor=tk.NW, text=f"⚠ {clamp_note}",
                           fill=EVE["orange"], font=("Segoe UI", 8),

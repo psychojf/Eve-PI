@@ -65,6 +65,7 @@ class LayoutOptions:
     factories: Optional[int] = None
     launch_pads: Optional[int] = None
     storage: Optional[int] = None
+    arm_length: Optional[int] = None
 
     @classmethod
     def from_config(cls, data):
@@ -181,6 +182,50 @@ def links_cost(template):
     return cpu, pw
 
 
+def link_flows(template, options=None):
+    """Débit m³/h en régime permanent sur chaque lien, clé (pin_bas, pin_haut).
+
+    Les routes d'entrée au-delà de la première par (usine, matière) sont des
+    secours — muettes tant que chaque pad a du stock — donc seule la première
+    compte ; les routes de sortie sont une par usine et comptent toutes. Les
+    routes d'un extracteur débitent au rendement supposé des têtes. Une route
+    que le modèle ne sait pas chiffrer est ignorée plutôt que devinée.
+    """
+    opts = LayoutOptions.from_config(options)
+    pins = template.get("P", [])
+    flows = {}
+    primary_seen = set()
+    for route in template.get("R") or []:
+        path = route.get("P") or []
+        if len(path) < 2:
+            continue
+        src, dst = path[0], path[-1]
+        if not (1 <= src <= len(pins)) or not (1 <= dst <= len(pins)):
+            continue
+        size = COMMODITY_SIZE.get(get_tier(ID_TO_NAME.get(route.get("T"))), 0)
+        src_pin, dst_pin = pins[src - 1], pins[dst - 1]
+        src_sname = STRUCT_ID_TO_NAME.get(src_pin.get("T"))
+        dst_sname = STRUCT_ID_TO_NAME.get(dst_pin.get("T"))
+        if dst_sname in PRODUCTION_FACILITIES:
+            if (dst, route.get("T")) in primary_seen:
+                continue
+            primary_seen.add((dst, route.get("T")))
+            rate_h = hourly_rate(route.get("Q", 0), dst_sname)
+        elif src_sname in PRODUCTION_FACILITIES:
+            rate_h = hourly_rate(route.get("Q", 0), src_sname)
+        elif src_sname == "Extractor Control Unit":
+            rate_h = (src_pin.get("H", 0) or 0) * opts.yield_per_head
+        else:
+            continue
+        m3_h = rate_h * size
+        if m3_h <= 0:
+            continue
+        for a, b in zip(path, path[1:]):
+            key = (a, b) if a < b else (b, a)
+            flows[key] = flows.get(key, 0.0) + m3_h
+    return flows
+
+
 def analyze_template(template, options=None):
     """Mesure une colonie déjà générée : budget, flux horaires, autonomie.
 
@@ -269,6 +314,22 @@ def analyze_template(template, options=None):
         warnings.append(f"Storage only lasts {buffer_hours:.0f}h, "
                         f"not the {opts.collection_hours}h asked for")
 
+    # The innermost link of an arm carries every factory behind it, so a long
+    # arm can quietly outgrow what the game lets routes use. Only level-0
+    # links are judged: the generator never emits upgraded ones, and each
+    # upgrade level has its own capacity this model does not track.
+    flows = link_flows(template, opts)
+    level = {}
+    for lk in links:
+        s, d = lk.get("S"), lk.get("D")
+        if isinstance(s, int) and isinstance(d, int):
+            level[(s, d) if s < d else (d, s)] = lk.get("Lv", 0) or 0
+    link_peak = max(flows.values(), default=0.0)
+    for key, m3_h in sorted(flows.items()):
+        if m3_h > LINK_CAPACITY_M3H and level.get(key, 0) == 0:
+            warnings.append(f"Link {key[0]}–{key[1]} needs {m3_h:,.0f} m³/h — "
+                            f"over the {LINK_CAPACITY_M3H:,} a level-0 link moves")
+
     return {
         "cpu_used": cpu, "cpu_max": budget["cpu"],
         "power_used": pw, "power_max": budget["power"],
@@ -278,6 +339,7 @@ def analyze_template(template, options=None):
         "produced": produced, "consumed": consumed,
         "import_m3_h": import_m3_h, "export_m3_h": export_m3_h,
         "buffer_m3": buffer_m3, "buffer_hours": buffer_hours,
+        "link_peak_m3_h": link_peak, "link_capacity_m3_h": LINK_CAPACITY_M3H,
         "warnings": warnings,
     }
 
@@ -353,19 +415,20 @@ def throughput_rows(analysis, product_name, primary_facility=None):
     }
 
 
-def factory_clamp_note(requested, built, pads):
+def factory_clamp_note(requested, built, pads, arm_len=None):
     """Explique un nombre d'usines manuel que la géométrie des pads a rogné.
 
-    Le générateur pose deux bras de MAX_ARM_LEN par pad, soit pads*8 usines au
-    maximum ; une demande au-delà est tronquée sans bruit et fige CPU, énergie et
-    autonomie sur la valeur bornée. On ne le signale que lorsque le plafond
-    atteint est bien celui des pads (`built == pads*8`) : en-dessous, c'est le
-    budget CPU/énergie ou le plafond d'extraction qui a tranché, et les jauges le
-    disent déjà. Renvoie une ligne pour le bandeau, ou None si rien n'a été rogné.
+    Le générateur pose deux bras de `arm_len` par pad (MAX_ARM_LEN par défaut,
+    plus si l'option arm_length l'allonge) ; une demande au-delà est tronquée
+    sans bruit et fige CPU, énergie et autonomie sur la valeur bornée. On ne le
+    signale que lorsque le plafond atteint est bien celui des pads
+    (`built == pads*arm_len*2`) : en-dessous, c'est le budget CPU/énergie ou le
+    plafond d'extraction qui a tranché, et les jauges le disent déjà. Renvoie
+    une ligne pour le bandeau, ou None si rien n'a été rogné.
     """
     if not requested or not pads:
         return None
-    geo_cap = pads * MAX_ARM_LEN * 2
+    geo_cap = pads * (arm_len or MAX_ARM_LEN) * 2
     if built < requested and built >= geo_cap:
         pad_word = "pad" if pads == 1 else "pads"
         # At the pad ceiling "add a pad" is a dead end — say what the limit is.
@@ -432,7 +495,14 @@ def get_full_supply_chain(product_name, target_chain):
 BASE_SPACING = 0.012
 CENTER_LAT = 1.57079
 MAX_ARM_LEN = 4
+# The game itself has no arm-length rule — only link capacity: a level-0 link
+# moves 1250 m³/h and a P1→P2 factory pushes ~38 m³/h through its arm, so an
+# arm saturates past 30 factories. 8 keeps ample headroom; it is the ceiling
+# for the manual arm_length override and for what the editor agrees to parse,
+# while MAX_ARM_LEN stays the compact default the generator picks on its own.
+MAX_ARM_LEN_HARD = 8
 MAX_LAUNCH_PADS = 4
+LINK_CAPACITY_M3H = 1250   # level-0 link throughput, from the game
 
 def _make_pin(lat, lon, structure_type_id, schematic_id=None, heads=0):
     """Crée un dict représentant une structure (pin) dans le template JSON EVE."""
@@ -515,21 +585,21 @@ def _bfs_path(links, src_1b, dst_1b, num_pins):
                 queue.append((nb, path + [nb]))
     return None
 
-def _place_factory_row(row_lat, row_center_lon, count, spacing):
+def _place_factory_row(row_lat, row_center_lon, count, spacing, arm_len=MAX_ARM_LEN):
     """Dispose count usines en bras gauche/droit autour d'un point central ; retourne positions et index."""
     positions = []
     left_arm = []
     right_arm = []
     placed = 0
 
-    for i in range(min(count, MAX_ARM_LEN)):
+    for i in range(min(count, arm_len)):
         lon = row_center_lon - (i + 1) * spacing
         positions.append((row_lat, lon))
         left_arm.append(placed)
         placed += 1
 
     remaining = count - placed
-    for i in range(min(remaining, MAX_ARM_LEN)):
+    for i in range(min(remaining, arm_len)):
         lon = row_center_lon + (i + 1) * spacing
         positions.append((row_lat, lon))
         right_arm.append(placed)
@@ -1043,6 +1113,12 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
         lp_type = STRUCTURE_IDS["Launch Pad"][planet_type]
         sp = BASE_SPACING
 
+        # Arm length is a convention, not a game rule: longer arms only cost
+        # link headroom (a level-0 link feeds 30+ P1→P2 factories), so a
+        # manual arm_length may stretch rows up to MAX_ARM_LEN_HARD —
+        # e.g. 2 pads × 2 arms of 6 = the 24-factory dual-P2 layout.
+        arm_len = _clamp(opts.arm_length, 1, MAX_ARM_LEN_HARD, default=MAX_ARM_LEN)
+
         # Volume one factory moves per hour, in and out. Both sides sit in the
         # pads between visits, so both count against how long the colony runs
         # unattended.
@@ -1067,7 +1143,7 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
             if cost_cpu <= 0 or cost_pw <= 0:
                 return 0
             n = max(0, min(avail_cpu // cost_cpu, avail_pw // cost_pw))
-            return min(n, lps * MAX_ARM_LEN * 2)
+            return min(n, lps * arm_len * 2)
 
         def _hours(lps, n):
             capacity = lps * STORAGE_CAPACITY_M3["Launch Pad"]
@@ -1106,7 +1182,7 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
             num_lps = _clamp(opts.launch_pads, 1, MAX_LAUNCH_PADS, default=num_lps)
             num_factories = min(num_factories, _max_factories(num_lps)) or 1
         if opts.factories:
-            num_factories = _clamp(opts.factories, 1, num_lps * MAX_ARM_LEN * 2,
+            num_factories = _clamp(opts.factories, 1, num_lps * arm_len * 2,
                                    default=num_factories)
         if num_factories < 1:
             return None
@@ -1125,7 +1201,8 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
         # Placing the factory pins first (Razkin standard)
         for lp_idx in range(num_lps):
             row_lat = lp_lats[lp_idx]
-            positions, arms_local = _place_factory_row(row_lat, 0.0, per_lp[lp_idx], sp)
+            positions, arms_local = _place_factory_row(row_lat, 0.0, per_lp[lp_idx],
+                                                       sp, arm_len)
             pin_base = len(pins) + 1
             for lat, lon in positions:
                 pins.append(_make_pin(lat, lon, facility_type_id, schematic_id=NAME_TO_ID[product_name]))

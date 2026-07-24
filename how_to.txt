@@ -154,7 +154,7 @@ Work down the numbered panels:
        rich, lower it if the extractors run dry.
 
      Set counts myself — tick this to place exact numbers of
-       extractors, heads, factories and pads.
+       extractors, heads, factories, pads and arm length.
 
        Ticking it fills the boxes with what the generator
        just chose on its own, so it doubles as a readout: you
@@ -171,6 +171,34 @@ Work down the numbered panels:
        chains; the multi-stage layouts (P1→P3, P1→P4, P2→P4)
        are fixed by geometry.
 
+     Arm len — how many factories may chain off one side of a
+       pad. Factories hang off a pad in two arms, so a pad
+       seats twice this number: the default 4 gives the
+       familiar 8 per pad, 6 gives 12, and the maximum 8
+       gives 16. Leave it at 0 for the default.
+
+       Raise it when you want the same factory count on
+       fewer pads. A pad costs 3600 CPU and 700 power, so
+       dropping one pays for several extra factories — the
+       24-factory build (Pads 2, Factories 24, Arm len 6) is
+       the standard use: it fits inside a level 5 command
+       center where 24 factories on three pads does not, and
+       leaves you two banks of 12 to split between two
+       different P2 products on the same planet.
+
+       The cost is link load. Traffic stacks toward the pad,
+       so the link nearest it carries every factory behind
+       it, and a level-0 link moves 1250 m3 an hour. Light
+       cargo never notices: 24 P1 → P2 factories on arms of 6
+       peak at about 227. Bulky cargo does — a P3 → P4 planet
+       on arms of 6 already runs at 1123, and arms of 7 go
+       over. The panel tells you either way, so there is
+       nothing to compute by hand.
+
+       Affects the single-stage factory chains (P1 → P2,
+       P2 → P3, P3 → P4). Extraction planets place their
+       factories around the extractor instead and ignore it.
+
      The strip at the bottom of the panel measures whatever
      is currently configured, updating as you type:
 
@@ -186,7 +214,9 @@ Work down the numbered panels:
          the interval is satisfied rather than ignored.
        "extract N/h · factories use N/h" on extraction
          chains — red when the factories outrun the ground.
-       Any number of ⚠ warning lines in red.
+       Any number of ⚠ warning lines in red, including a
+         link named as carrying more than 1250 m3/h — see
+         Arm len above.
 
      Your interval and yield choices are remembered between
      sessions; the manual counts are not.
@@ -217,6 +247,40 @@ edges to resize. Hover any structure for a tooltip listing
 what it consumes and produces per cycle. On pure factory
 planets the Launch Pad tooltip also estimates how long it
 takes to fill up, so you know how often to collect.
+
+-----------------------------------------------------------
+HOW THE ROUTES ARE ORDERED
+-----------------------------------------------------------
+
+On a colony with more than one launch pad, every factory
+gets an input route from every pad. That is deliberate: a
+factory whose own pad runs dry keeps working off the others
+instead of stopping.
+
+What makes it work is the order. EVE feeds a factory from
+its input routes in the order they were created, so the
+first route wins until it runs out. Every template this tool
+generates therefore lists each factory's OWN pad first, and
+the other pads after it.
+
+The result in game: each row of factories eats from the pad
+in its own row, all pads drain together, and the cross-pad
+routes stay idle until a row actually runs short. Then they
+take over on their own.
+
+You can check it on any factory: open its Routes tab, click
+the sort arrow off so you see creation order, and the first
+input route should come from the same pad its output goes
+to. Sorted by commodity instead, every factory on the planet
+looks identical — that view is alphabetical, not priority,
+so it tells you nothing about which pad gets drained.
+
+One thing worth knowing: this order is written into the
+template when it is generated. A colony you already built
+keeps the order it was imported with, so if an old planet
+drains one pad while the others sit full, regenerate the
+template and rebuild the routes — editing structures alone
+will not reorder them.
 
 -----------------------------------------------------------
 BILL OF MATERIALS
@@ -396,6 +460,14 @@ TIPS
 - Radius matters. Check it in-game and type the real value
   before generating.
 
+- Two products on one factory planet: generate with Pads 2,
+  Factories 24, Arm len 6, then in game set half the
+  factories to the second schematic. Two pads instead of
+  three is what buys the 24th factory, and each bank of 12
+  ends up on its own pad — which the route order then
+  respects, so the two products do not compete for the same
+  stock.
+
 - Extraction planets are power-limited, not CPU-limited. A
   10-head extractor burns 8100 of the 19000 power a level 5
   command center has, which is why a balanced extraction
@@ -431,6 +503,22 @@ TROUBLESHOOTING
   — Only reachable with manual counts. The template is still
     produced so you can see the shape of it, but EVE will
     refuse to build it as-is.
+
+"Link N–N needs N m3/h — over the 1250 a level-0 link moves"
+  — An arm is carrying more than its link can pass. The link
+    closest to the pad carries every factory behind it, so
+    this comes from long arms on a bulky chain, P3 → P4
+    above all. Lower Arm len, spread the same factories over
+    one more pad, or upgrade that link in game. Ignoring it
+    does not break the import; the factories behind that
+    link simply cannot all be fed at once.
+
+All factories drain the same launch pad
+  — The template was generated before route order was fixed,
+    or the colony was built from an old copy. See HOW THE
+    ROUTES ARE ORDERED above: regenerate and rebuild the
+    input routes, since EVE keeps the order a route was
+    created in.
 
 The layout panel is greyed out
   — Manual counts are only available for the extraction and

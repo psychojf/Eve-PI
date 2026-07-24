@@ -11,7 +11,8 @@ import copy
 import dataclasses
 from dataclasses import dataclass, field
 
-from src.services.template_service import MAX_ARM_LEN, STRUCT_ID_TO_NAME
+from src.services.template_service import (MAX_ARM_LEN, MAX_ARM_LEN_HARD,
+                                           STRUCT_ID_TO_NAME)
 
 HUB_KINDS = ("Launch Pad", "Storage Facility")
 FACTORY_KINDS = ("Basic Industry Facility", "Advanced Industry Facility",
@@ -159,8 +160,10 @@ def parse_colony(template):
                     end_hub = nxt[0]
                     break
                 prev, cur = cur, nxt[0]
-            if len(arm) > MAX_ARM_LEN:
-                raise ParseError(f"arm of {len(arm)} pins exceeds {MAX_ARM_LEN}")
+            # Tolerate anything the generator's arm_length override can emit;
+            # the compact MAX_ARM_LEN stays the ceiling for automatic growth.
+            if len(arm) > MAX_ARM_LEN_HARD:
+                raise ParseError(f"arm of {len(arm)} pins exceeds {MAX_ARM_LEN_HARD}")
             arms.append(Arm(hub=h, pins=arm, end_hub=end_hub))
     if len(visited) != n:
         raise ParseError("structures not reachable from any hub")
