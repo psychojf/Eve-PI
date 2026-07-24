@@ -1162,11 +1162,14 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
                     if path:
                         routes.append({"P": path, "Q": recipe["output"], "T": NAME_TO_ID[product_name]})
 
-        # Generating Input routing path (LP to Factories)
+        # Generating Input routing path (LP to Factories). In game a factory
+        # drains its input routes in creation order, so the local pad must come
+        # first — the cross-pad routes then only kick in once it runs dry.
         for lp_idx in range(num_lps):
+            src_order = [lp_idx] + [i for i in range(num_lps) if i != lp_idx]
             for arm in lp_arms[lp_idx]:
                 for f_pin in arm:
-                    for src_lp_idx in range(num_lps):
+                    for src_lp_idx in src_order:
                         src_lp = lp_pin_1b[src_lp_idx]
                         path = _bfs_path(links, src_lp, f_pin, num_pins)
                         if path:
@@ -1605,8 +1608,12 @@ def _build_p4_template(product_name, planet_type, cc_level, diameter, include_p2
             p2_recipe = RECIPES_P1_P2.get(p2n)
             if not p2_recipe:
                 continue
+            # In game a factory drains its input routes in creation order, so
+            # the row's own pad must come first; other pads are overflow.
+            home = info["lp_idx"]
+            src_order = [home] + [i for i in range(num_lps) if i != home]
             for f_pin in chain:
-                for src_lp_idx in range(num_lps):
+                for src_lp_idx in src_order:
                     src_lp = lp_pin_1b[src_lp_idx]
                     path = _bfs_path(links, src_lp, f_pin, num_pins)
                     if path:
@@ -1633,7 +1640,11 @@ def _build_p4_template(product_name, planet_type, cc_level, diameter, include_p2
         for f_pin in p3_info["chain"]:
             for p2n, p2_qty in p3_recipe["input"]:
                 p2_tid = NAME_TO_ID[p2n]
-                for src_lp_idx in range(num_lps):
+                # Route priority is creation order in game: drain the pad where
+                # this P2 actually lands (its producer row's pad, or the P3 hub
+                # pad when imported) before falling back to the others.
+                home = p2_factory_info.get(p2n, {}).get("lp_idx", p3_hub_lp_idx)
+                for src_lp_idx in [home] + [i for i in range(num_lps) if i != home]:
                     src_lp = lp_pin_1b[src_lp_idx]
                     path = _bfs_path(links, src_lp, f_pin, num_pins)
                     if path:
@@ -1647,9 +1658,12 @@ def _build_p4_template(product_name, planet_type, cc_level, diameter, include_p2
             if path:
                 routes.append({"P": path, "Q": p3_out, "T": NAME_TO_ID[p3_name]})
 
+    # P3 outputs land on the hub pad, so the HTF must drain that one first
+    # (in-game route priority is creation order); other pads are overflow.
+    htf_src = [p3_hub_lp_idx] + [i for i in range(num_lps) if i != p3_hub_lp_idx]
     for inp_name, inp_qty in recipe_p4["input"]:
         inp_tid = NAME_TO_ID[inp_name]
-        for src_lp_idx in range(num_lps):
+        for src_lp_idx in htf_src:
             src_lp = lp_pin_1b[src_lp_idx]
             path = _bfs_path(links, src_lp, htf_pin, num_pins)
             if path:
@@ -1686,7 +1700,8 @@ def _gen_p2_to_p4_template(product_name, planet_type, cc_level, diameter):
     At CC5 with a 3-P3 product this reproduces Razkin's full 3/6 layout.
 
     Routing:
-      - P2 → AIF: from ALL LPs via BFS
+      - P2 → AIF: from ALL LPs via BFS, the arm's own LP first (in-game route
+        priority follows creation order, so cross-pad routes act as overflow)
       - P3 output (AIF → local LP): local LP only
       - P3 → HTF: from LOCAL LP of that P3 arm to ALL HTFs
       - P4 output (HTF → paired LP): each HTF to its own LP
@@ -1850,12 +1865,14 @@ def _gen_p2_to_p4_template(product_name, planet_type, cc_level, diameter):
     # --- Routes ---
     routes = []
 
-    # P2 inputs to each AIF (from ALL LPs); P3 output from AIF to LOCAL LP only
+    # P2 inputs to each AIF (from ALL LPs, the arm's own LP first — in-game
+    # route priority is creation order); P3 output from AIF to LOCAL LP only
     for arm_idx, (p3_name, _) in enumerate(arm_p3):
         p3_recipe = RECIPES_P2_P3[p3_name]
         local_lp  = lp_1b[arm_idx]
+        src_order = [local_lp] + [lp for lp in lp_1b if lp != local_lp]
         for aif_pin in arm_pins[arm_idx]:
-            for src_lp in lp_1b:
+            for src_lp in src_order:
                 path = _bfs_path(links, src_lp, aif_pin, num_pins)
                 if path:
                     for p2_name, p2_qty in p3_recipe["input"]:
@@ -1876,8 +1893,11 @@ def _gen_p2_to_p4_template(product_name, planet_type, cc_level, diameter):
     # P1 direct inputs to HTFs (Nano-Factory, Organic Mortar Applicators, Sterile Conduits)
     for p1_name, p1_qty in p1_direct:
         p1_tid = NAME_TO_ID[p1_name]
-        for htf_pin in htf_1b:
-            for src_lp in lp_1b:
+        for col, htf_pin in enumerate(htf_1b):
+            # Each HTF drains its own paired pad first (route priority is
+            # creation order in game); the other pads are overflow.
+            paired = lp_1b[col]
+            for src_lp in [paired] + [lp for lp in lp_1b if lp != paired]:
                 path = _bfs_path(links, src_lp, htf_pin, num_pins)
                 if path:
                     routes.append({"P": list(path), "Q": p1_qty, "T": p1_tid})
