@@ -554,6 +554,35 @@ def apply_theme_colors(name):
     EVE.clear()
     EVE.update(theme)
 
+# Toutes les fenêtres sont en overrideredirect : l'OS ne dessine aucun cadre,
+# et sur un fond sombre le bord se confond avec ce qu'il y a derrière. Ce
+# liseré est volontairement HORS thème — un gris clair fixe reste lisible sur
+# les 22 palettes, alors qu'un EVE["border_hi"] dérivé du fond disparaît sur
+# les thèmes les plus sombres.
+# L'épaisseur ne descend pas sous 1 px en Tk : le réglage de discrétion se
+# fait sur la luminosité. Échelle testée — "#ffffff" blanc pur, "#c8c8c8"
+# doux, "#9a9a9a" clair, "#787878" moyen, "#565656" très discret.
+WINDOW_BORDER       = "#565656"
+WINDOW_BORDER_WIDTH = 1
+
+# Bas de la barre de titre. Ses trois autres côtés sont déjà tracés : elle est
+# collée en haut en fill=X, donc elle touche WINDOW_BORDER à gauche, à droite
+# et en haut. Ce trait referme le cadre.
+# Aligné sur WINDOW_BORDER : au-dessus, le trait interne serait plus clair que
+# le cadre lui-même et prendrait le dessus visuellement. Le garder <= au
+# contour de fenêtre si l'un des deux est retouché.
+TITLE_BAR_BORDER = WINDOW_BORDER
+
+def apply_window_border(window):
+    """Trace le liseré qui matérialise le bord d'une fenêtre sans décoration.
+
+    highlightbackground sert quand la fenêtre n'a pas le focus, highlightcolor
+    quand elle l'a : les deux à la même valeur donnent un contour constant.
+    """
+    window.configure(highlightbackground=WINDOW_BORDER,
+                     highlightcolor=WINDOW_BORDER,
+                     highlightthickness=WINDOW_BORDER_WIDTH)
+
 def _make_tray_icon():
     """Crée l'icône de la zone de notification (charge future.ico ou génère un losange par défaut)."""
     base_dir = get_base_path()
@@ -590,8 +619,8 @@ class SettingsWindow:
         self.app = app
         self.w = tk.Toplevel(parent)
         self.w.overrideredirect(True)
-        self.w.configure(bg=EVE["bg_deep"], highlightbackground=EVE["border_hi"],
-                         highlightcolor=EVE["border_hi"], highlightthickness=1)
+        self.w.configure(bg=EVE["bg_deep"])
+        apply_window_border(self.w)
         self.w.attributes("-topmost", True)
         self.w.attributes("-alpha", app.alpha)
         
@@ -627,7 +656,7 @@ class SettingsWindow:
         xb.bind("<Enter>", lambda e: xb.config(fg=EVE["red"]))
         xb.bind("<Leave>", lambda e: xb.config(fg=EVE["fg_dim"]))
         
-        tk.Frame(self.w, bg=EVE["border"], height=1).pack(fill="x")
+        tk.Frame(self.w, bg=TITLE_BAR_BORDER, height=1).pack(fill="x")
         
         body = tk.Frame(self.w, bg=EVE["bg_deep"])
         body.pack(fill="both", expand=True, padx=12, pady=12)
@@ -815,6 +844,7 @@ class PIGeneratorApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.configure(bg=EVE["bg_deep"])
+        apply_window_border(self.root)
 
         self._build_ui()
         
@@ -888,7 +918,7 @@ class PIGeneratorApp:
         title_bar.pack(fill=tk.X, side=tk.TOP)
         title_bar.pack_propagate(False)
 
-        tk.Frame(title_bar, height=1, bg=EVE["border"]).pack(side=tk.BOTTOM, fill=tk.X)
+        tk.Frame(title_bar, height=1, bg=TITLE_BAR_BORDER).pack(side=tk.BOTTOM, fill=tk.X)
 
         title_label = tk.Label(title_bar, text=f"  {title_text}",
                                bg=EVE["bg_panel"], fg=EVE["fg_dim"], font=("Segoe UI", 9))
@@ -1072,6 +1102,7 @@ class PIGeneratorApp:
         except Exception:
             pass
         win.configure(bg=EVE["bg_deep"])
+        apply_window_border(win)
         cfg = _load_window_config()
         win.geometry(cfg.get("library_geometry", "480x560"))
 
@@ -1248,6 +1279,7 @@ class PIGeneratorApp:
             pass
 
         about.configure(bg=EVE["bg_deep"])
+        apply_window_border(about)
 
         cfg = _load_window_config()
         # A size saved by an older build can be shorter than the credits now
@@ -2088,6 +2120,7 @@ class PIGeneratorApp:
         cfg = _load_window_config()
         popup.geometry(cfg.get("popup_geometry", "800x800"))
         popup.minsize(400, 400)
+        apply_window_border(popup)
 
         def close_popup():
             _update_window_config("popup_geometry", popup.geometry())
@@ -2758,6 +2791,7 @@ class PIGeneratorApp:
         popup.geometry(cfg.get("scanner_geometry", "700x620"))
         # 540 wide is what the full-name planet-type filter row needs
         popup.minsize(540, 380)
+        apply_window_border(popup)
 
         # Restore last search state
         _last_system = cfg.get("scanner_last_system", "Jita")

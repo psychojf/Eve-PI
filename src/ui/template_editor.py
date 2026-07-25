@@ -47,6 +47,7 @@ def open_template_editor(app, template, source_name=None):
     except Exception:
         pass
     win.configure(bg=EVE["bg_deep"])
+    PI.apply_window_border(win)
     cfg = PI._load_window_config()
     win.geometry(cfg.get("editor_geometry", "860x820"))
     win.minsize(560, 560)
