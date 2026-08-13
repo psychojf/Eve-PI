@@ -184,26 +184,6 @@ PI/
 │   │   └── history.py           # Always-on record of what you were working on
 │   └── ui/
 │       └── template_editor.py   # Template Editor window
-├── tests/
-│   ├── test_link_cost.py        # Link cost model vs readings taken in-game
-│   ├── test_throughput.py       # BOM panel throughput grouping
-│   ├── test_sweep.py            # Every chain builds an importable colony
-│   ├── test_arm_length.py       # Arm-length override, link capacity, route order
-│   ├── test_layout_clamp.py     # Manual factory count trimmed by pad geometry
-│   ├── test_colony_model.py     # Round-trip identity across the whole corpus
-│   ├── test_colony_edits.py     # Edit invariants + Fit to planet sweep
-│   ├── test_colony_move.py      # move_pin, crowded_pins, MIN_SEPARATION
-│   ├── test_factory_coverage.py # The extraction-coverage sentence
-│   ├── test_mixed_p2.py         # Per-factory P2 rewrite + batch summary
-│   ├── test_scout_universe.py   # Offline resolve / jump walk / scan shape
-│   ├── test_history.py          # Recording, dedup, cap, persistence
-│   ├── golden.py                # Capture/compare every generated template
-│   ├── ui_smoke.py              # Drives the real Tk app, dumps the canvases
-│   ├── map_smoke.py             # Artwork, links, signals, drag, crowding
-│   ├── mixed_ui_smoke.py        # The Assign-P2-per-factory window
-│   ├── scout_build_smoke.py     # Build-from-a-scanned-planet carry-over
-│   └── history_ui_smoke.py      # Work → close → resume → save to library
-├── docs/superpowers/            # Design specs and implementation plans
 └── data/
     ├── planet_icons/            # CCP planet renders, one per planet type
     ├── planets/                 # Planet artwork for the map (WebP, ~1.1 MB)
