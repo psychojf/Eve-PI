@@ -238,6 +238,10 @@ To import into EVE Online:
   2. In EVE, open the planet's Planetary Interaction view
   3. Use the in-game template import and paste
 
+The colony is drawn on the real artwork of the planet type
+you picked. The planet stays put — panning and zooming move
+the colony over it, not the world behind it.
+
 The map has a legend in the corner covering Launch Pad,
 Storage Facility, Basic Industry, Advanced Industry,
 High-Tech Industry and Extractor (ECU).
@@ -247,6 +251,29 @@ edges to resize. Hover any structure for a tooltip listing
 what it consumes and produces per cycle. On pure factory
 planets the Launch Pad tooltip also estimates how long it
 takes to fill up, so you know how often to collect.
+
+WHAT THE LINES MEAN
+
+  Cyan dashes are the physical links, and they flow in the
+  direction goods travel. Hover a structure and its ROUTES
+  light up too, one colour per commodity, so you can follow
+  where a material actually goes.
+
+MOVING A BUILDING
+
+  Drag any structure to move it. The CPU and power figures
+  at the top change while you drag, not after, so you can
+  see what a longer link costs before you let go. Press
+  Escape mid-drag to abandon it; a click that never moves
+  just selects.
+
+  If two buildings end up too close, both get a dashed red
+  ring. That is a warning, not a refusal — the same way the
+  tool lets you go over budget and shows it in red. The ring
+  stays until you move them apart.
+
+  Every move is recorded in HISTORY (see below), so closing
+  the window no longer throws the work away.
 
 -----------------------------------------------------------
 HOW THE ROUTES ARE ORDERED
@@ -301,6 +328,23 @@ The blocks below it describe the WHOLE colony, per hour:
     Pad each hour to keep the factories fed
   - "COLLECT" (accent) — what piles up for you to pick up
 
+Under HAUL IN, a note may say something like:
+
+  6 of 7 factories are fed by extraction.
+  The rest need 2,000/h of Planktic Colonies hauled in.
+
+That is the tool telling you the difference between an
+import you MEANT and extractors quietly falling behind the
+factory count you typed. The quantity above it reads the
+same either way, which is exactly why it is spelled out.
+It is advice about hauling, not a refusal — the colony is
+what you asked for, and this is what running it costs. Add
+an extractor head, drop a factory, or haul it in.
+
+Only raw P0 counts here. A P0 -> P2 colony on a planet
+missing one of its P0s imports that P1 by design, and
+nagging about it would be wrong.
+
 Under COLLECT, a "surplus" sub-list means raw material your
 factories cannot keep up with. It fills storage exactly like
 finished goods and is then lost, so either add a factory or
@@ -341,6 +385,20 @@ Each planet card shows the planet's CCP icon, its name, its
 type, and its radius in km — bigger radius means extractor
 heads spread further apart and better yield.
 
+CLICK A PLANET TO BUILD ON IT
+
+  Hover a card and it offers "BUILD HERE". Clicking carries
+  BOTH the planet type and its exact radius into the
+  generator and builds the template straight away. That
+  matters: the radius sets link length, and link cost scales
+  with length, so a radius retyped by hand quietly reprices
+  the whole colony.
+
+  If the chain you have selected cannot run there — an
+  extraction chain on a planet without the raw material, or
+  P4 anywhere but Barren/Temperate — it says so and changes
+  nothing.
+
 The SHOW row filters by planet type. Click a type to toggle
 it, or ALL to bring everything back. Filtering redraws
 instantly from the scan you already ran and automatically
@@ -348,24 +406,39 @@ expands the systems that still have matches, so you can hunt
 for, say, every Lava planet within 5 jumps in one glance.
 Your selection is remembered for next time.
 
-The first scan of an area takes a while — a few jumps means
-hundreds of ESI requests. Results are cached locally, so
-re-running the same system and jump count is instant. The
-cache is kept for 7 days.
+Scanning is instant and works offline. The tool ships with
+a snapshot of the map — 8,490 systems and 67,693 PI planets
+— so resolving a name, walking the stargates and listing
+planets all happen in memory. There is nothing to wait for
+and nothing to break when EVE's servers are down.
+
+One honest limit: wormhole systems have no fixed stargates,
+so scanning from inside J-space returns that system alone.
+Nothing can precompute a wormhole route.
+
+If the snapshot file is ever missing, the tool falls back to
+the old live-ESI scan, which is slow and needs a connection.
 
 -----------------------------------------------------------
 TEMPLATE LIBRARY
 -----------------------------------------------------------
 
-"TEMPLATE LIBRARY" opens 83 bundled DalShooth templates,
-grouped into Miner (0.0), Miner (Low-Sec) and Factory.
-Double-click one to open it in the same preview window used
-for generated templates, then copy it as usual.
+"TEMPLATE LIBRARY" holds the colonies YOU keep. It starts
+empty; nothing is shipped in it. Double-click one to open it
+in the same preview window used for generated templates,
+then copy it as usual.
+
+Two ways in:
+
+  - From HISTORY, select a state and click "Save to library"
+  - From the TEMPLATE EDITOR, click Save to Library
+
+Either way it is stored as "Custom - <your name>.json". The
+editor refuses to overwrite anything that is not a Custom
+file, because there is no undo here.
 
 To change a template instead of just copying it, select it
-and click "✎ Edit" — see TEMPLATE EDITOR below. Templates
-you save from the editor show up here in a Custom group at
-the top of the list.
+and click "✎ Edit" — see TEMPLATE EDITOR below.
 
 -----------------------------------------------------------
 TEMPLATE EDITOR
@@ -416,16 +489,88 @@ counters greyed out and the reason shown; you keep the map
 and the analysis.
 
 -----------------------------------------------------------
+ASSIGN P2 PER FACTORY
+-----------------------------------------------------------
+
+Only shown for the "P1 -> P2 (Factory)" chain, because it is
+the only one where every factory makes a P2 out of P1s.
+
+Normally a colony makes one product on every factory. This
+lets each Advanced Industry Facility make a DIFFERENT P2 on
+the same proven layout — useful when you want one planet to
+cover several P2s instead of dedicating a planet to each.
+
+  1. Set up the colony as usual (product, planet, counts).
+  2. Click "ASSIGN P2 PER FACTORY".
+  3. Pick a P2 for each factory, or "All -> <product>" to
+     reset them.
+  4. Click "GENERATE MIXED".
+
+The panel updates as you choose, showing:
+
+  FACTORY ALLOCATION   how many factories make what
+  P1 SHOPPING LIST     everything to haul in for one full
+                       batch, per hour and per batch
+  P2 OUTPUT            what comes back out
+  RUNS FOR             how long a full launch-pad load keeps
+                       the plan running, in whole hours
+
+Only the schematics and the goods on the routes change. Pin
+positions, links and route paths are exactly what the normal
+generator produced, so the layout is the one already known
+to import cleanly.
+
+Whole cycles only: a part-finished cycle produces nothing,
+so the runtime never rounds up.
+
+-----------------------------------------------------------
+HISTORY
+-----------------------------------------------------------
+
+Always on. There is nothing to switch on and nothing to
+remember to press.
+
+Every template you generate, every mixed plan you build and
+every structure you drag is recorded. That last one is the
+point: a colony you arranged by hand used to live only in
+the window that drew it, so closing it threw the work away.
+
+Click "HISTORY" to see the list, newest first, with the
+time, what you were doing, the planet, and the structure and
+link counts.
+
+  RESUME            reopen that colony on the map
+                    (or double-click the row)
+  Save to library   keep it for good under a name
+  Delete            drop one entry
+  Clear all         forget everything
+
+The newest 60 states are kept, in data/history.json. Going
+back to a state you already had is recorded too, so you can
+step forward again.
+
+Saving to the library is the difference between "I was
+working on this" and "I want to keep this". History is
+automatic and rolls over; the library is yours until you
+delete it.
+
+-----------------------------------------------------------
 SETTINGS
 -----------------------------------------------------------
 
 Click the gear icon in the title bar.
 
-  Opacity — window transparency
-  Theme   — 23 EVE faction colour schemes
+  Opacity   — window transparency
+  Text size — 80% to 200%, for every font in the app
+  Theme     — 23 EVE faction colour schemes
 
-Click APPLY to confirm. Window positions and sizes are saved
-automatically as you move and resize them.
+Click APPLY to confirm. Text size and theme both rebuild the
+window, so it will blink once.
+
+Text size scales the panels as well as the text, so nothing
+overlaps or gets cut off. You can also drag any window edge
+to resize it, and every window position and size is saved
+automatically.
 
 The "?" button opens the About panel.
 

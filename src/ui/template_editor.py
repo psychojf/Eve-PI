@@ -109,11 +109,11 @@ def open_template_editor(app, template, source_name=None):
         cell = ttk.Frame(ctr_frame)
         cell.pack(side=tk.LEFT, padx=(0, 10))
         tk.Label(cell, text=label, bg=EVE["bg_deep"], fg=EVE["fg_dim"],
-                 font=("Segoe UI", 8)).pack(anchor=tk.W)
+                 font=("Segoe UI", PI._fs(8))).pack(anchor=tk.W)
         var = tk.StringVar()
         box = tk.Spinbox(cell, from_=0, to=99, width=5, textvariable=var,
                          bg=EVE["bg_input"], fg=EVE["fg_bright"],
-                         relief=tk.FLAT, font=("Consolas", 10),
+                         relief=tk.FLAT, font=("Consolas", PI._fs(10)),
                          command=lambda k=key: apply_counter(k))
         box.bind("<Return>", lambda _e, k=key: apply_counter(k))
         box.bind("<FocusOut>", lambda _e, k=key: apply_counter(k))
@@ -125,28 +125,28 @@ def open_template_editor(app, template, source_name=None):
     meta.pack(fill=tk.X, padx=10, pady=(4, 2))
 
     tk.Label(meta, text="Radius km", bg=EVE["bg_deep"], fg=EVE["fg_dim"],
-             font=("Segoe UI", 8)).pack(side=tk.LEFT)
+             font=("Segoe UI", PI._fs(8))).pack(side=tk.LEFT)
     radius_var = tk.StringVar()
     radius_entry = tk.Entry(meta, textvariable=radius_var, width=8,
                             bg=EVE["bg_input"], fg=EVE["fg_bright"],
-                            relief=tk.FLAT, font=("Consolas", 10))
+                            relief=tk.FLAT, font=("Consolas", PI._fs(10)))
     radius_entry.pack(side=tk.LEFT, padx=(4, 12))
 
     tk.Label(meta, text="CC", bg=EVE["bg_deep"], fg=EVE["fg_dim"],
-             font=("Segoe UI", 8)).pack(side=tk.LEFT)
+             font=("Segoe UI", PI._fs(8))).pack(side=tk.LEFT)
     cc_var = tk.StringVar()
     cc_box = tk.Spinbox(meta, from_=0, to=5, width=3, textvariable=cc_var,
                         bg=EVE["bg_input"], fg=EVE["fg_bright"],
-                        relief=tk.FLAT, font=("Consolas", 10),
+                        relief=tk.FLAT, font=("Consolas", PI._fs(10)),
                         command=lambda: apply_meta())
     cc_box.pack(side=tk.LEFT, padx=(4, 12))
 
     tk.Label(meta, text="Name", bg=EVE["bg_deep"], fg=EVE["fg_dim"],
-             font=("Segoe UI", 8)).pack(side=tk.LEFT)
+             font=("Segoe UI", PI._fs(8))).pack(side=tk.LEFT)
     name_var = tk.StringVar()
     name_entry = tk.Entry(meta, textvariable=name_var,
                           bg=EVE["bg_input"], fg=EVE["fg_bright"],
-                          relief=tk.FLAT, font=("Segoe UI", 9))
+                          relief=tk.FLAT, font=("Segoe UI", PI._fs(9)))
     name_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
     name_entry.bind("<KeyRelease>", lambda _e: state.update(name_touched=True))
 
@@ -187,9 +187,9 @@ def open_template_editor(app, template, source_name=None):
             colour = (EVE["green"] if pct <= 0.9
                       else EVE["yellow"] if pct <= 1.0 else EVE["red"])
             c.create_text(x0, y, anchor=tk.NW, text=label,
-                          fill=EVE["fg_dim"], font=("Segoe UI", 8))
+                          fill=EVE["fg_dim"], font=("Segoe UI", PI._fs(8)))
             c.create_text(x1, y, anchor=tk.NE, text=f"{used:,} / {cap:,}",
-                          fill=colour, font=("Consolas", 8))
+                          fill=colour, font=("Consolas", PI._fs(8)))
             ty = y + 14
             c.create_rectangle(x0, ty, x1, ty + 3, outline="", fill=EVE["bg_input"])
             c.create_rectangle(x0, ty, x0 + (x1 - x0) * min(pct, 1.0), ty + 3,
@@ -209,7 +209,7 @@ def open_template_editor(app, template, source_name=None):
             runs_txt = f"runs {runs:.0f}h untended"
             runs_col = EVE["green"] if runs >= 24 else EVE["orange"]
         c.create_text(8, y, anchor=tk.NW, text=runs_txt, fill=runs_col,
-                      font=("Segoe UI", 9, "bold"))
+                      font=("Segoe UI", PI._fs(9), "bold"))
         y += 16
 
         if analysis["p0_supply_h"]:
@@ -217,7 +217,7 @@ def open_template_editor(app, template, source_name=None):
             c.create_text(8, y, anchor=tk.NW,
                           text=f"extract {analysis['p0_supply_h']:,.0f}/h   ·   factories use "
                                f"{analysis['p0_demand_h']:,.0f}/h",
-                          fill=EVE["green"] if fed else EVE["red"], font=("Consolas", 8))
+                          fill=EVE["green"] if fed else EVE["red"], font=("Consolas", PI._fs(8)))
             y += 16
 
         # Only real budget overruns get the hard-red ⚠ treatment; storage and
@@ -228,7 +228,7 @@ def open_template_editor(app, template, source_name=None):
                            or w.startswith("Power over budget")]
         for warn in budget_warnings:
             c.create_text(8, y, anchor=tk.NW, text=f"⚠ {warn}",
-                          fill=EVE["red"], font=("Segoe UI", 8), width=right - 16)
+                          fill=EVE["red"], font=("Segoe UI", PI._fs(8)), width=right - 16)
             y += 14 * (1 + len(warn) // 60)
         c.config(height=max(56, y + 2))
 
@@ -238,7 +238,7 @@ def open_template_editor(app, template, source_name=None):
 
     def styled(parent, text, cmd, strong=False):
         return tk.Button(parent, text=text, command=cmd,
-                         font=("Segoe UI", 9, "bold"),
+                         font=("Segoe UI", PI._fs(9), "bold"),
                          bg=EVE["accent_dim"] if strong else EVE["bg_card"],
                          fg=EVE["fg_bright"] if strong else EVE["fg"],
                          activebackground=EVE["accent"] if strong else EVE["border_hi"],
@@ -283,7 +283,7 @@ def open_template_editor(app, template, source_name=None):
     # ── JSON + carte ─────────────────────────────────────────────────────
     json_text = scrolledtext.ScrolledText(win, height=7, wrap=tk.WORD,
                                           bg=EVE["bg_input"], fg=EVE["json_fg"],
-                                          font=("Consolas", 9), relief=tk.FLAT,
+                                          font=("Consolas", PI._fs(9)), relief=tk.FLAT,
                                           insertbackground=EVE["json_fg"])
     json_text.pack(fill=tk.X, padx=10, pady=(2, 4))
 
@@ -360,7 +360,7 @@ def open_template_editor(app, template, source_name=None):
     if parse_reason:
         tk.Label(win, text=f"⚠ Read-only: {parse_reason}",
                  bg=EVE["bg_deep"], fg=EVE["red"],
-                 font=("Segoe UI", 9, "bold")).pack(fill=tk.X, padx=10,
+                 font=("Segoe UI", PI._fs(9), "bold")).pack(fill=tk.X, padx=10,
                                                     before=ctr_frame)
     win.update_idletasks()
     refresh()
@@ -382,7 +382,7 @@ def _write_json(path, template):
 def _save_library(win, state, name_var):
     """data/templates/Custom - <nom>.json — jamais par-dessus un fichier fourni.
 
-    Pas de git ici : écraser un template DalShooth serait définitif, d'où le
+    Pas de git ici : écraser un template livré serait définitif, d'où le
     refus pur et simple hors du préfixe Custom.
     """
     import os

@@ -1,7 +1,8 @@
 # EVE Online - Planetary Interaction Template Generator
 # Based on Planetary_Interaction_PI_Template_Generator_1_0_8.xlsx by Razkin, Pandemic Horde
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, simpledialog
+import colorsys
 import json
 import math
 import os
@@ -31,9 +32,19 @@ from src.pi_data import (
     PLANET_RESOURCES,
     PLANET_TYPES,
     RECIPES_P0_P1,
+    RECIPES_P1_P2,
     STRUCTURE_IDS,
 )
+from src.services.colony_model import (MIN_SEPARATION, EditError, ParseError,
+                                       crowded_pins, move_pin, parse_colony)
+from src.services.history import MAX_ENTRIES, History
+from src.services.mixed_p2 import (MIXED_CHAIN, MixedP2Error,
+                                   generate_mixed_p2_template,
+                                   normalize_assignments,
+                                   summarize_mixed_p2_batch)
+from src.services.scout_universe import PLANET_TYPE_NAMES, load_universe
 from src.services.template_service import (
+    BASE_SPACING,
     CONFIGURABLE_CHAINS,
     MAX_ARM_LEN,
     MAX_ARM_LEN_HARD,
@@ -41,6 +52,8 @@ from src.services.template_service import (
     TemplateService,
     analyze_template,
     factory_clamp_note,
+    factory_coverage,
+    factory_coverage_note,
     PRODUCTION_FACILITIES,
     get_full_supply_chain,
     get_tier,
@@ -272,6 +285,72 @@ def get_planet_icon(planet_type, px):
     _PLANET_ICON_CACHE[key] = icon
     return icon
 
+# ── Artwork de planète pour la carte ─────────────────────────────────────
+# Le même artwork que le webtool : une sphère déjà rendue, éclairée et ombrée.
+# On la présente telle quelle — la replaquer sur une sphère reprojetterait une
+# projection et déformerait précisément ce qui a été validé.
+_PLANET_ART_CACHE = {}
+# Le disque n'a pas besoin d'être au pixel près : on arrondit la taille demandée
+# pour qu'un redimensionnement de fenêtre ne re-décode pas l'image à chaque pixel.
+_ART_SIZE_STEP = 48
+# Diamètre du disque, en fraction du petit côté du canvas. Supérieur à 1 : le
+# disque déborde du cadre, on regarde une planète depuis l'orbite et non une
+# bille posée au milieu d'une fenêtre.
+PLANET_SPAN = 1.35
+# Un espacement de colonie, en fraction du disque. C'est une échelle FIXE, et
+# c'est tout l'intérêt : l'auto-ajustement tirait la taille du template, si bien
+# que six bâtiments devenaient énormes et quatorze minuscules — et qu'une seule
+# structure déplacée redimensionnait toute la colonie. Ici un pas vaut toujours
+# la même distance, donc une grande colonie couvre simplement plus de sol.
+SPACING_SPAN = 0.053
+# Rayon d'un bâtiment, en fraction de l'espacement. Nettement sous la moitié :
+# à 0,44 les plaques ne laissaient que ~4 px entre elles, moins qu'une période
+# de tirets, et le lien disparaissait entièrement sous les bâtiments.
+PLATE_RATIO = 0.38
+# Les liens ne suivent PAS l'accent du thème. Ils sont posés sur l'artwork d'une
+# planète, pas sur le châssis de l'appli : l'accent doré devenait invisible sur
+# un monde Barren ou Lava. Ce cyan est choisi pour contraster avec les huit.
+LINK_CYAN = "#5ad1e6"
+
+
+def get_planet_art(planet_type_id, px):
+    """Disque de planète à px pixels pour le fond de carte, None si indisponible."""
+    name = PLANET_TYPE_NAMES.get(planet_type_id)
+    if not name or px < 16:
+        return None
+    px = max(_ART_SIZE_STEP, int(round(px / _ART_SIZE_STEP)) * _ART_SIZE_STEP)
+    key = (name, px)
+    if key in _PLANET_ART_CACHE:
+        return _PLANET_ART_CACHE[key]
+    art = None
+    try:
+        from PIL import Image as _Img, ImageTk as _ImgTk
+        path = os.path.join(get_base_path(), "data", "planets", f"{name.lower()}.webp")
+        with _Img.open(path) as src:
+            im = src.convert("RGBA").resize((px, px), _Img.LANCZOS)
+        art = _ImgTk.PhotoImage(im)
+    except Exception as e:
+        _debug(f"get_planet_art - {name} @{px}px failed: {e}")
+    _PLANET_ART_CACHE[key] = art
+    return art
+
+
+def commodity_color(type_id, lightness=0.68, saturation=0.92):
+    """Couleur stable d'une marchandise, sans consulter le catalogue.
+
+    La même marchandise voyage toujours de la même couleur. Le pas de 47 est
+    premier avec 300, donc des type ids voisins ne se ressemblent pas ; la plage
+    évite le rouge le plus sombre tout en couvrant l'essentiel du cercle.
+    """
+    try:
+        normalized = abs(int(type_id))
+    except (TypeError, ValueError):
+        normalized = 0
+    hue = ((normalized * 47) % 300 + 20) / 360.0
+    r, g, b = colorsys.hls_to_rgb(hue, lightness, saturation)
+    return f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
+
+
 def get_base_path():
     """Retourne le dossier racine de l'application (exe compilé ou script)."""
     if getattr(sys, 'frozen', False):
@@ -283,6 +362,47 @@ def get_base_path():
 # =============================================================================
 # REGION SCANNER - ESI Integration
 # =============================================================================
+# ── Taille du texte ──────────────────────────────────────────────────────
+# Facteur unique appliqué à toutes les polices et aux hauteurs de ligne
+# dessinées à la main. Lu au démarrage depuis pi_config.json et modifiable
+# dans les Paramètres.
+UI_SCALE = 1.0
+
+
+def _fs(size):
+    """Taille de police mise à l'échelle. Plancher à 7 : en dessous, plus rien
+    n'est lisible, ce qui est l'inverse du but."""
+    return max(7, int(round(size * UI_SCALE)))
+
+
+def _px(value):
+    """Idem pour une distance dessinée : une police plus grande dans une ligne
+    restée haute de 18 px se chevauche."""
+    return max(1, int(round(value * UI_SCALE)))
+
+
+def _load_ui_scale():
+    global UI_SCALE
+    try:
+        UI_SCALE = max(0.8, min(2.0, float(_load_window_config().get("ui_scale", 1.0))))
+    except (TypeError, ValueError):
+        UI_SCALE = 1.0
+    return UI_SCALE
+
+
+def _offline_universe():
+    """L'instantané SDE livré avec l'outil, ou None s'il manque.
+
+    Rendre l'absence non fatale garde le chemin ESI utilisable sur une install
+    dépouillée du fichier de données ; le Scout n'est alors que plus lent.
+    """
+    try:
+        return load_universe()
+    except Exception as exc:
+        _debug(f"_offline_universe - snapshot unavailable, falling back to ESI: {exc}")
+        return None
+
+
 def _esi_fetch(path):
     """Récupère du JSON depuis l'ESI EVE pour un chemin donné."""
     url = f"{ESI_BASE}{path}?datasource=tranquility"
@@ -627,9 +747,9 @@ class SettingsWindow:
         cfg = _load_window_config()
         saved_pos = cfg.get("settings_pos")
         if saved_pos:
-            self.w.geometry(f"340x280{saved_pos}")
+            self.w.geometry(f"{_px(340)}x{_px(300)}{saved_pos}")
         else:
-            self.w.geometry(f"340x280+{parent.winfo_x() + 30}+{parent.winfo_y() + 40}")
+            self.w.geometry(f"{_px(340)}x{_px(300)}+{parent.winfo_x() + 30}+{parent.winfo_y() + 40}")
         
         self._dx = self._dy = 0
         
@@ -642,14 +762,14 @@ class SettingsWindow:
         hdr.bind("<ButtonRelease-1>", lambda e: self._save_geo())
         
         tk.Frame(hdr, bg=EVE["orange"], width=3).pack(side="left", fill="y")
-        lbl = tk.Label(hdr, text="  ⚙ SETTINGS", font=("Segoe UI", 10, "bold"),
+        lbl = tk.Label(hdr, text="  ⚙ SETTINGS", font=("Segoe UI", _fs(10), "bold"),
                        bg=EVE["bg_panel"], fg=EVE["orange"])
         lbl.pack(side="left")
         lbl.bind("<Button-1>", lambda e: (setattr(self, '_dx', e.x), setattr(self, '_dy', e.y)))
         lbl.bind("<B1-Motion>", lambda e: self.w.geometry(
             f"+{self.w.winfo_x() + e.x - self._dx}+{self.w.winfo_y() + e.y - self._dy}"))
         
-        xb = tk.Label(hdr, text="✕", font=("Segoe UI", 12, "bold"),
+        xb = tk.Label(hdr, text="✕", font=("Segoe UI", _fs(12), "bold"),
                       bg=EVE["bg_panel"], fg=EVE["fg_dim"], padx=8, cursor="hand2")
         xb.pack(side="right", fill="y")
         xb.bind("<Button-1>", lambda e: self._close())
@@ -680,10 +800,33 @@ class SettingsWindow:
         self.opacity_slider.pack(side="left", fill="x", expand=True)
         
         self.opacity_lbl = tk.Label(opacity_frame, text=f"{int(app.alpha * 100)}%",
-                                     font=("Segoe UI", 10, "bold"), bg=EVE["bg_deep"],
+                                     font=("Segoe UI", _fs(10), "bold"), bg=EVE["bg_deep"],
                                      fg=EVE["accent"], width=5)
         self.opacity_lbl.pack(side="right", padx=(8, 0))
         
+        tk.Label(body, text="TEXT SIZE %", font=lf, bg=EVE["bg_deep"],
+                 fg=EVE["fg_dim"]).pack(anchor="w", pady=(0, 2))
+
+        scale_frame = tk.Frame(body, bg=EVE["bg_deep"])
+        scale_frame.pack(fill="x", pady=(0, 10))
+
+        # Scales every font in the app and the hand-drawn row heights with them.
+        # Applied by rebuilding the UI, the same path a theme change takes.
+        self.scale_var = tk.IntVar(value=int(round(UI_SCALE * 100)))
+        self.scale_slider = tk.Scale(
+            scale_frame, from_=80, to=200, resolution=5, orient="horizontal",
+            variable=self.scale_var, bg=EVE["bg_input"], fg=EVE["fg_bright"],
+            troughcolor=EVE["bg_panel"], highlightthickness=0, sliderrelief="flat",
+            activebackground=EVE["accent"], length=200,
+            command=self._on_scale_change
+        )
+        self.scale_slider.pack(side="left", fill="x", expand=True)
+
+        self.scale_lbl = tk.Label(scale_frame, text=f"{int(round(UI_SCALE * 100))}%",
+                                  font=("Segoe UI", _fs(10), "bold"),
+                                  bg=EVE["bg_deep"], fg=EVE["accent"], width=5)
+        self.scale_lbl.pack(side="right", padx=(8, 0))
+
         tk.Label(body, text="THEME", font=lf, bg=EVE["bg_deep"],
                  fg=EVE["fg_dim"]).pack(anchor="w", pady=(0, 2))
         
@@ -692,14 +835,14 @@ class SettingsWindow:
         
         self._theme_var = tk.StringVar(value=app._current_theme)
         self._theme_cb = ttk.Combobox(cb_frame, textvariable=self._theme_var,
-                                       state="readonly", font=("Segoe UI", 10),
+                                       state="readonly", font=("Segoe UI", _fs(10)),
                                        values=THEME_NAMES, style="PI.TCombobox")
         self._theme_cb.pack(fill="x", padx=1, pady=1)
         
         btn_frame = tk.Frame(body, bg=EVE["bg_deep"])
         btn_frame.pack(fill="x", pady=(10, 0))
         
-        apply_btn = tk.Label(btn_frame, text="✔ APPLY", font=("Segoe UI", 10, "bold"),
+        apply_btn = tk.Label(btn_frame, text="✔ APPLY", font=("Segoe UI", _fs(10), "bold"),
                              bg=EVE["bg_deep"], fg=EVE["green"], cursor="hand2", padx=12)
         apply_btn.pack(side="right")
         apply_btn.bind("<Button-1>", lambda e: self._apply())
@@ -721,6 +864,14 @@ class SettingsWindow:
         except Exception as e:
             _debug(f"[{datetime.datetime.now().isoformat()}] SettingsWindow._on_opacity_change - Failed to sync opacity: {e}")
 
+    def _on_scale_change(self, val):
+        """Met à jour l'étiquette pendant le glissement ; rien n'est appliqué
+        avant APPLY, une reconstruction par cran serait insupportable."""
+        try:
+            self.scale_lbl.config(text=f"{int(float(val))}%")
+        except Exception:
+            pass
+
     def _save_geo(self):
         """Sauvegarde la position courante de la fenêtre Paramètres dans la config."""
         try:
@@ -741,10 +892,19 @@ class SettingsWindow:
             if hasattr(app, '_scanner_popup') and app._scanner_popup and app._scanner_popup.winfo_exists():
                 app._scanner_popup.attributes("-alpha", app.alpha)
             
+            global UI_SCALE
+            new_scale = max(0.8, min(2.0, self.scale_var.get() / 100.0))
+            scale_changed = abs(new_scale - UI_SCALE) > 1e-6
+            if scale_changed:
+                UI_SCALE = new_scale
+                _update_window_config("ui_scale", new_scale)
+
             new_theme = self._theme_var.get()
             theme_changed = (new_theme != app._current_theme)
-            
-            if theme_changed:
+
+            # Both settings are baked into widgets at build time, so both need
+            # the same rebuild — there is no restyling a font tuple in place.
+            if theme_changed or scale_changed:
                 app._current_theme = new_theme
                 _update_window_config("theme", new_theme)
                 apply_theme_colors(new_theme)
@@ -783,6 +943,7 @@ class PIGeneratorApp:
         self.current_template = None
         self.current_preview = None   # colony the ⑥ LAYOUT panel is measuring
         self.current_analysis = None  # its measurements, shared by ⑥ and the BOM
+        self._preview_error = None    # why it is None, when the counts do not fit
         self._main_hidden = False
         self._tray_icon = None
         self._sw = None
@@ -790,6 +951,10 @@ class PIGeneratorApp:
         self._full_height = 0
         self._main_frame = None
         self._template_service = TemplateService()
+        # Always on. Work you did not deliberately name is exactly the work
+        # that used to be lost when a window closed.
+        self._history = History(os.path.join(get_base_path(), "data",
+                                             "history.json"))
 
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
@@ -800,16 +965,16 @@ class PIGeneratorApp:
         apply_theme_colors(self._current_theme)
         
         # Restore position from config; height auto-fits after content loads
-        saved_geom = cfg.get("main_geometry", "420x600")
+        saved_geom = cfg.get("main_geometry", f"{_px(420)}x{_px(600)}")
         try:
             parts = saved_geom.split('+')
             if len(parts) == 3:
                 # Keep saved position, start with neutral height (will be fitted)
-                saved_geom = f"420x600+{parts[1]}+{parts[2]}"
+                saved_geom = f"{_px(420)}x{_px(600)}+{parts[1]}+{parts[2]}"
             else:
-                saved_geom = "420x600"
+                saved_geom = f"{_px(420)}x{_px(600)}"
         except Exception:
-            saved_geom = "420x600"
+            saved_geom = f"{_px(420)}x{_px(600)}"
         
         self.root.geometry(saved_geom)
 
@@ -865,16 +1030,16 @@ class PIGeneratorApp:
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("TFrame",           background=EVE["bg_deep"])
-        style.configure("TLabel",           background=EVE["bg_deep"],  foreground=EVE["fg"],       font=("Segoe UI", 10))
-        style.configure("TLabelframe",      background=EVE["bg_deep"],  foreground=EVE["accent"],   font=("Segoe UI", 10, "bold"))
-        style.configure("TLabelframe.Label",background=EVE["bg_deep"],  foreground=EVE["accent"],   font=("Segoe UI", 10, "bold"))
-        style.configure("Header.TLabel",    background=EVE["bg_deep"],  foreground=EVE["accent"],   font=("Segoe UI", 14, "bold"))
-        style.configure("Sub.TLabel",       background=EVE["bg_deep"],  foreground=EVE["fg_dim"],   font=("Segoe UI", 9))
-        style.configure("TButton",          font=("Segoe UI", 10, "bold"))
-        style.configure("Accent.TButton",   font=("Segoe UI", 11, "bold"))
+        style.configure("TLabel",           background=EVE["bg_deep"],  foreground=EVE["fg"],       font=("Segoe UI", _fs(10)))
+        style.configure("TLabelframe",      background=EVE["bg_deep"],  foreground=EVE["accent"],   font=("Segoe UI", _fs(10), "bold"))
+        style.configure("TLabelframe.Label",background=EVE["bg_deep"],  foreground=EVE["accent"],   font=("Segoe UI", _fs(10), "bold"))
+        style.configure("Header.TLabel",    background=EVE["bg_deep"],  foreground=EVE["accent"],   font=("Segoe UI", _fs(14), "bold"))
+        style.configure("Sub.TLabel",       background=EVE["bg_deep"],  foreground=EVE["fg_dim"],   font=("Segoe UI", _fs(9)))
+        style.configure("TButton",          font=("Segoe UI", _fs(10), "bold"))
+        style.configure("Accent.TButton",   font=("Segoe UI", _fs(11), "bold"))
         
         for cb_style in ("TCombobox", "PI.TCombobox"):
-            style.configure(cb_style,       font=("Segoe UI", 10), fieldbackground=EVE["bg_input"],
+            style.configure(cb_style,       font=("Segoe UI", _fs(10)), fieldbackground=EVE["bg_input"],
                              background=EVE["bg_card"], foreground=EVE["fg_bright"],
                              selectbackground=EVE["accent_dim"], selectforeground="white",
                              arrowcolor=EVE["accent"], bordercolor=EVE["border"])
@@ -885,9 +1050,9 @@ class PIGeneratorApp:
                       selectforeground=[("readonly", "white")],
                       bordercolor=[("focus", EVE["border_hi"])])
 
-        style.configure("TRadiobutton",     background=EVE["bg_deep"], foreground=EVE["fg"], font=("Segoe UI", 10))
+        style.configure("TRadiobutton",     background=EVE["bg_deep"], foreground=EVE["fg"], font=("Segoe UI", _fs(10)))
         style.map("TRadiobutton", background=[("active", EVE["bg_card"])])
-        style.configure("TCheckbutton",    background=EVE["bg_deep"], foreground=EVE["fg"], font=("Segoe UI", 10))
+        style.configure("TCheckbutton",    background=EVE["bg_deep"], foreground=EVE["fg"], font=("Segoe UI", _fs(10)))
         style.map("TCheckbutton", background=[("active", EVE["bg_card"])])
 
     def _build_ui(self):
@@ -903,6 +1068,9 @@ class PIGeneratorApp:
         
         self._main_frame = main_frame
         self._build_config_panel(main_frame)
+        # Every other window in the app could be dragged out; this one could
+        # not, because it is overrideredirect and had no handles of its own.
+        self._add_resize_handles(self.root)
 
     def _rebuild_ui(self):
         """Détruit et reconstruit toute l'UI (utilisé lors d'un changement de thème)."""
@@ -921,11 +1089,11 @@ class PIGeneratorApp:
         tk.Frame(title_bar, height=1, bg=TITLE_BAR_BORDER).pack(side=tk.BOTTOM, fill=tk.X)
 
         title_label = tk.Label(title_bar, text=f"  {title_text}",
-                               bg=EVE["bg_panel"], fg=EVE["fg_dim"], font=("Segoe UI", 9))
+                               bg=EVE["bg_panel"], fg=EVE["fg_dim"], font=("Segoe UI", _fs(9)))
         title_label.pack(side=tk.LEFT, padx=(6, 0))
 
         close_btn = tk.Label(title_bar, text=" ✕ ", bg=EVE["bg_panel"], fg=EVE["fg_dim"],
-                             font=("Segoe UI", 11), cursor="hand2")
+                             font=("Segoe UI", _fs(11)), cursor="hand2")
         close_btn.pack(side=tk.RIGHT, padx=(0, 4))
         close_btn.bind("<Enter>", lambda e: close_btn.config(bg=EVE["red"], fg="white"))
         close_btn.bind("<Leave>", lambda e: close_btn.config(bg=EVE["bg_panel"], fg=EVE["fg_dim"]))
@@ -933,7 +1101,7 @@ class PIGeneratorApp:
 
         if show_minimize:
             mb = tk.Label(title_bar, text=" — ", bg=EVE["bg_panel"], fg=EVE["fg_dim"],
-                          font=("Segoe UI", 11, "bold"), cursor="hand2")
+                          font=("Segoe UI", _fs(11), "bold"), cursor="hand2")
             mb.pack(side=tk.RIGHT, padx=(0, 4))
             mb.bind("<Enter>", lambda e: mb.config(fg=EVE["accent"]))
             mb.bind("<Leave>", lambda e: mb.config(fg=EVE["fg_dim"]))
@@ -941,7 +1109,7 @@ class PIGeneratorApp:
 
         if show_settings:
             gear = tk.Label(title_bar, text=" ⚙ ", bg=EVE["bg_panel"], fg=EVE["fg_dim"],
-                            font=("Segoe UI", 11), cursor="hand2")
+                            font=("Segoe UI", _fs(11)), cursor="hand2")
             gear.pack(side=tk.RIGHT, padx=(0, 4))
             gear.bind("<Enter>", lambda e: gear.config(fg=EVE["orange"]))
             gear.bind("<Leave>", lambda e: gear.config(fg=EVE["fg_dim"]))
@@ -949,7 +1117,7 @@ class PIGeneratorApp:
 
         if show_about:
             about_btn = tk.Label(title_bar, text=" ? ", bg=EVE["bg_panel"], fg=EVE["fg_dim"],
-                                 font=("Segoe UI", 11, "bold"), cursor="hand2")
+                                 font=("Segoe UI", _fs(11), "bold"), cursor="hand2")
             about_btn.pack(side=tk.RIGHT, padx=(0, 4))
             about_btn.bind("<Enter>", lambda e: about_btn.config(bg=EVE["accent_dim"], fg="white"))
             about_btn.bind("<Leave>", lambda e: about_btn.config(bg=EVE["bg_panel"], fg=EVE["fg_dim"]))
@@ -1067,7 +1235,7 @@ class PIGeneratorApp:
         self._sw = SettingsWindow(self.root, self)
 
     def _open_template_library(self):
-        """Browse bundled DalShooth PI templates; click one to preview, copy, or save."""
+        """Parcourt la bibliothèque : les colonies que l'utilisateur a lui-même sauvegardées."""
         lib_dir = os.path.join(get_base_path(), "data", "templates")
         if not os.path.isdir(lib_dir):
             messagebox.showerror("Library Missing",
@@ -1110,11 +1278,11 @@ class PIGeneratorApp:
             _update_window_config("library_geometry", win.geometry())
             win.destroy()
 
-        self._build_title_bar(win, "Template Library (DalShooth)", close_lib)
+        self._build_title_bar(win, "Template Library", close_lib)
         self._add_resize_handles(win)
 
         header = tk.Label(win, text="Click a template to preview, copy, or save to EVE folder.",
-                          bg=EVE["bg_deep"], fg=EVE["fg_dim"], font=("Segoe UI", 9))
+                          bg=EVE["bg_deep"], fg=EVE["fg_dim"], font=("Segoe UI", _fs(9)))
         header.pack(fill=tk.X, padx=10, pady=(8, 4))
 
         tree_frame = ttk.Frame(win)
@@ -1200,18 +1368,18 @@ class PIGeneratorApp:
         btn_bar = ttk.Frame(win)
         btn_bar.pack(fill=tk.X, padx=10, pady=(0, 10))
 
-        tk.Button(btn_bar, text="▶  Preview / Copy", font=("Segoe UI", 10, "bold"),
+        tk.Button(btn_bar, text="▶  Preview / Copy", font=("Segoe UI", _fs(10), "bold"),
                   bg=EVE["accent_dim"], fg=EVE["fg_bright"],
                   activebackground=EVE["accent"], activeforeground="white",
                   relief=tk.FLAT, cursor="hand2", command=open_selected).pack(side=tk.LEFT, ipady=4, ipadx=10)
 
-        tk.Button(btn_bar, text="✎  Edit", font=("Segoe UI", 10, "bold"),
+        tk.Button(btn_bar, text="✎  Edit", font=("Segoe UI", _fs(10), "bold"),
                   bg=EVE["bg_card"], fg=EVE["fg"],
                   activebackground=EVE["border_hi"], activeforeground=EVE["fg_bright"],
                   relief=tk.FLAT, cursor="hand2",
                   command=edit_selected).pack(side=tk.LEFT, padx=(8, 0),
                                               ipady=4, ipadx=10)
-        tk.Button(btn_bar, text="📋 Paste JSON", font=("Segoe UI", 9, "bold"),
+        tk.Button(btn_bar, text="📋 Paste JSON", font=("Segoe UI", _fs(9), "bold"),
                   bg=EVE["bg_card"], fg=EVE["fg"],
                   activebackground=EVE["border_hi"], activeforeground=EVE["fg_bright"],
                   relief=tk.FLAT, cursor="hand2",
@@ -1241,31 +1409,18 @@ class PIGeneratorApp:
                 "Restart the EVE client (or relog) to see them in PI import.",
                 parent=win)
 
-        tk.Button(btn_bar, text="⬇  Install All to EVE Folder", font=("Segoe UI", 9, "bold"),
+        tk.Button(btn_bar, text="⬇  Install All to EVE Folder", font=("Segoe UI", _fs(9), "bold"),
                   bg=EVE["bg_card"], fg=EVE["fg"],
                   activebackground=EVE["border_hi"], activeforeground=EVE["fg_bright"],
                   relief=tk.FLAT, cursor="hand2", command=install_all).pack(side=tk.RIGHT, ipady=4, ipadx=8)
 
-        credit = tk.Label(win, text="Templates © DalShooth — github.com/DalShooth/EVE_PI_Templates",
-                          bg=EVE["bg_deep"], fg=EVE["fg_dim"], font=("Segoe UI", 8))
-        credit.pack(fill=tk.X, padx=10, pady=(0, 6))
+        hint = tk.Label(win, text="Your own colonies. Save one from History, "
+                                  "or from the editor.",
+                        bg=EVE["bg_deep"], fg=EVE["fg_dim"], font=("Segoe UI", _fs(8)))
+        hint.pack(fill=tk.X, padx=10, pady=(0, 6))
 
         win.lift()
         win.focus_force()
-
-    @staticmethod
-    def _at_least(geometry, min_w, min_h):
-        """Impose une taille minimale à une géométrie Tk, position conservée.
-
-        « 375x325+1122+393 » → « 420x460+1122+393 ». Une géométrie illisible est
-        renvoyée telle quelle : mieux vaut une fenêtre mal dimensionnée qu'une
-        fenêtre qui ne s'ouvre pas.
-        """
-        match = re.match(r"^(\d+)x(\d+)([+-]\d+[+-]\d+)?$", (geometry or "").strip())
-        if not match:
-            return f"{min_w}x{min_h}"
-        width, height, position = match.groups()
-        return f"{max(int(width), min_w)}x{max(int(height), min_h)}{position or ''}"
 
     def _show_about(self):
         """Affiche la fenêtre À propos avec version et crédits."""
@@ -1282,13 +1437,20 @@ class PIGeneratorApp:
         apply_window_border(about)
 
         cfg = _load_window_config()
-        # A size saved by an older build can be shorter than the credits now
-        # need, which would silently clip them. Keep the remembered position,
-        # raise the size to fit.
-        about.geometry(self._at_least(cfg.get("about_geometry", "420x460"), 420, 460))
+        # Position is remembered; size is not. It used to be, through a rule
+        # that only ever *raised* it to a floor — so when the bundled-library
+        # credit came out, the window kept the height its old contents needed
+        # and showed a slab of empty space. Sizing to the content instead means
+        # it is right whatever the credits say and whatever the text size is.
+        saved_pos = ""
+        remembered = cfg.get("about_geometry", "")
+        if "+" in remembered:
+            saved_pos = remembered[remembered.index("+"):]
 
         def close_about():
-            _update_window_config("about_geometry", about.geometry())
+            # Only the position: a stored size is what caused the problem.
+            _update_window_config(
+                "about_geometry", f"+{about.winfo_x()}+{about.winfo_y()}")
             about.destroy()
 
         self._build_title_bar(about, "About", close_about)
@@ -1299,14 +1461,9 @@ class PIGeneratorApp:
         ttk.Label(content, text="EVE Online — PI Template Generator", style="Header.TLabel").pack(anchor=tk.W, pady=(0,5))
         ttk.Label(content, text="Version 2.7", style="Sub.TLabel").pack(anchor=tk.W)
         ttk.Label(content, text="\nBased on the Planetary Interaction Template\nGenerator spreadsheet by Razkin\n(Pandemic Horde).").pack(anchor=tk.W)
-        ttk.Label(content, text="\nBundled Template Library:", style="Sub.TLabel").pack(anchor=tk.W)
-        ttk.Label(content, text="Templates by DalShooth").pack(anchor=tk.W)
-        link = tk.Label(content, text="github.com/DalShooth/EVE_PI_Templates",
-                        bg=EVE["bg_deep"], fg=EVE["accent"],
-                        font=("Segoe UI", 9, "underline"), cursor="hand2")
-        link.pack(anchor=tk.W)
-        link.bind("<Button-1>", lambda e: __import__("webbrowser").open(
-            "https://github.com/DalShooth/EVE_PI_Templates"))
+        # The bundled-library credit was removed on 2026-08-12: the library now
+        # holds only colonies the user builds, so crediting templates that are
+        # no longer shipped would be stating something untrue.
 
         # This tool stops at the template; Planets in Space picks up from there
         # and tracks the colonies you actually run, across every character.
@@ -1317,13 +1474,18 @@ class PIGeneratorApp:
                        "your PI across all your characters").pack(anchor=tk.W)
         pis_link = tk.Label(content, text="planetsin.space",
                             bg=EVE["bg_deep"], fg=EVE["accent"],
-                            font=("Segoe UI", 9, "underline"), cursor="hand2")
+                            font=("Segoe UI", _fs(9), "underline"), cursor="hand2")
         pis_link.pack(anchor=tk.W)
         pis_link.bind("<Button-1>", lambda e: __import__("webbrowser").open(
             "https://planetsin.space/"))
 
         ttk.Label(content, text="\nFly Safe o7", foreground=EVE["accent"]).pack(anchor=tk.W)
-        
+
+        # Sized once everything is packed, so the window is exactly its content
+        # plus the padding around it.
+        about.update_idletasks()
+        about.geometry(f"{about.winfo_reqwidth()}x{about.winfo_reqheight()}{saved_pos}")
+
         about.lift()
         about.focus_force()
 
@@ -1377,7 +1539,7 @@ class PIGeneratorApp:
         grp1.pack(fill=tk.X, padx=8, pady=(8, 3))
 
         tk.Label(grp1, text="① PRODUCT", bg=EVE["bg_card"], fg=EVE["accent"],
-                 font=("Segoe UI", 8, "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
+                 font=("Segoe UI", _fs(8), "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
 
         self.product_var = tk.StringVar()      # raw name, no bracket
         self._product_display_var = tk.StringVar()   # display string with [Px]
@@ -1393,7 +1555,7 @@ class PIGeneratorApp:
         grp2.pack(fill=tk.X, padx=8, pady=3)
 
         tk.Label(grp2, text="② CHAIN", bg=EVE["bg_card"], fg=EVE["accent"],
-                 font=("Segoe UI", 8, "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
+                 font=("Segoe UI", _fs(8), "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
 
         self.chain_var = tk.StringVar()
         self.chain_combo = ttk.Combobox(grp2, textvariable=self.chain_var,
@@ -1407,7 +1569,7 @@ class PIGeneratorApp:
         grp3.pack(fill=tk.X, padx=8, pady=3)
 
         tk.Label(grp3, text="③ PLANET TYPE", bg=EVE["bg_card"], fg=EVE["accent"],
-                 font=("Segoe UI", 8, "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
+                 font=("Segoe UI", _fs(8), "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
 
         self.planet_var = tk.StringVar(value="Barren")
         self.planet_combo = ttk.Combobox(grp3, textvariable=self.planet_var,
@@ -1422,7 +1584,7 @@ class PIGeneratorApp:
         grp4.pack(fill=tk.X, padx=8, pady=3)
 
         tk.Label(grp4, text="④ PLANET RADIUS (km)", bg=EVE["bg_card"], fg=EVE["accent"],
-                 font=("Segoe UI", 8, "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
+                 font=("Segoe UI", _fs(8), "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
 
         radius_row = tk.Frame(grp4, bg=EVE["bg_card"])
         radius_row.pack(fill=tk.X, padx=8, pady=(2, 4))
@@ -1430,14 +1592,14 @@ class PIGeneratorApp:
         diam_entry = tk.Entry(radius_row, textvariable=self.diameter_var, width=12,
                               bg=EVE["bg_input"], fg=EVE["fg_bright"],
                               insertbackground=EVE["accent"], relief=tk.FLAT,
-                              font=("Consolas", 11), justify=tk.RIGHT)
+                              font=("Consolas", _fs(11)), justify=tk.RIGHT)
         diam_entry.pack(side=tk.LEFT)
         # Radius sets link length, which sets link cost, which sets how many
         # factories fit — so it has to redraw the panels like any other input.
         diam_entry.bind("<KeyRelease>", lambda e: self._update_bom())
         tk.Label(radius_row, text=" km  (planet info → Attributes → Radius)",
                  bg=EVE["bg_card"], fg=EVE["fg_dim"],
-                 font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(4, 0))
+                 font=("Segoe UI", _fs(8))).pack(side=tk.LEFT, padx=(4, 0))
 
         # Storage Facility toggle (extraction only, hidden by default)
         self.sf_frame = tk.Frame(grp4, bg=EVE["bg_card"])
@@ -1453,7 +1615,7 @@ class PIGeneratorApp:
         grp5.pack(fill=tk.X, padx=8, pady=3)
 
         tk.Label(grp5, text="⑤ COMMAND CENTER LEVEL", bg=EVE["bg_card"], fg=EVE["accent"],
-                 font=("Segoe UI", 8, "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
+                 font=("Segoe UI", _fs(8), "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
 
         self.cc_var = tk.IntVar(value=5)
         cc_frame = tk.Frame(grp5, bg=EVE["bg_card"])
@@ -1461,7 +1623,7 @@ class PIGeneratorApp:
         for lvl in range(6):
             btn = tk.Label(cc_frame, text=str(lvl), width=3,
                            bg=EVE["bg_input"], fg=EVE["fg_dim"],
-                           font=("Segoe UI", 10, "bold"), relief=tk.FLAT, cursor="hand2")
+                           font=("Segoe UI", _fs(10), "bold"), relief=tk.FLAT, cursor="hand2")
             btn.pack(side=tk.LEFT, padx=2)
             def _make_cc_click(l=lvl):
                 def _click(e=None):
@@ -1482,19 +1644,19 @@ class PIGeneratorApp:
         self.grp_layout.pack(fill=tk.X, padx=8, pady=3)
 
         tk.Label(self.grp_layout, text="⑥ LAYOUT", bg=EVE["bg_card"], fg=EVE["accent"],
-                 font=("Segoe UI", 8, "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
+                 font=("Segoe UI", _fs(8), "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
 
         # Collection interval — the "I hate collecting" dial
         int_row = tk.Frame(self.grp_layout, bg=EVE["bg_card"])
         int_row.pack(fill=tk.X, padx=8, pady=(2, 0))
         tk.Label(int_row, text="Collect every", bg=EVE["bg_card"], fg=EVE["fg_dim"],
-                 font=("Segoe UI", 9)).pack(side=tk.LEFT)
+                 font=("Segoe UI", _fs(9))).pack(side=tk.LEFT)
         self.interval_var = tk.IntVar(
             value=cfg_layout.get("layout_collection_hours", DEFAULT_COLLECTION_HOURS))
         self._interval_buttons = {}
         for hrs in COLLECTION_INTERVALS:
             b = tk.Label(int_row, text=f"{hrs}h", width=4, bg=EVE["bg_input"],
-                         fg=EVE["fg_dim"], font=("Segoe UI", 9, "bold"), cursor="hand2")
+                         fg=EVE["fg_dim"], font=("Segoe UI", _fs(9), "bold"), cursor="hand2")
             b.pack(side=tk.LEFT, padx=2)
             b.bind("<Button-1>", lambda e, h=hrs: self._set_interval(h))
             self._interval_buttons[hrs] = b
@@ -1502,16 +1664,16 @@ class PIGeneratorApp:
         # Extractor yield — the assumption the whole extraction chain rests on
         self.yield_row = tk.Frame(self.grp_layout, bg=EVE["bg_card"])
         tk.Label(self.yield_row, text="Extractor yield", bg=EVE["bg_card"],
-                 fg=EVE["fg_dim"], font=("Segoe UI", 9)).pack(side=tk.LEFT)
+                 fg=EVE["fg_dim"], font=("Segoe UI", _fs(9))).pack(side=tk.LEFT)
         self.yield_var = tk.StringVar(
             value=str(cfg_layout.get("layout_yield_per_head", DEFAULT_YIELD_PER_HEAD)))
         yield_entry = tk.Entry(self.yield_row, textvariable=self.yield_var, width=6,
                                bg=EVE["bg_input"], fg=EVE["fg_bright"], relief=tk.FLAT,
-                               insertbackground=EVE["accent"], font=("Consolas", 9),
+                               insertbackground=EVE["accent"], font=("Consolas", _fs(9)),
                                justify=tk.RIGHT)
         yield_entry.pack(side=tk.LEFT, padx=4)
         tk.Label(self.yield_row, text="units / head / hour", bg=EVE["bg_card"],
-                 fg=EVE["fg_dim"], font=("Segoe UI", 8)).pack(side=tk.LEFT)
+                 fg=EVE["fg_dim"], font=("Segoe UI", _fs(8))).pack(side=tk.LEFT)
         yield_entry.bind("<KeyRelease>", lambda e: self._on_layout_change())
 
         # Manual counts — "validate me, don't decide for me"
@@ -1531,7 +1693,10 @@ class PIGeneratorApp:
         # validation strip reports anything over CPU budget. Arm len 0 = auto
         # (two arms of MAX_ARM_LEN per pad, the compact Razkin default).
         manual_rows = (
-            (("extractors", "Extractors", 4), ("heads", "Heads", MAX_EXTRACTOR_HEADS)),
+            # "Heads" alone reads as a colony total; it is per extractor, and
+            # the whole layout doubles when you leave two extractors standing.
+            (("extractors", "Extractors", 4),
+             ("heads", "Heads/ext", MAX_EXTRACTOR_HEADS)),
             (("factories", "Factories", MAX_LAUNCH_PADS * MAX_ARM_LEN_HARD * 2),
              ("launch_pads", "Pads", MAX_LAUNCH_PADS)),
             (("arm_length", "Arm len", MAX_ARM_LEN_HARD),),
@@ -1541,10 +1706,10 @@ class PIGeneratorApp:
             line.pack(fill=tk.X, pady=1)
             for key, label, hi in pair:
                 tk.Label(line, text=label, bg=EVE["bg_card"], fg=EVE["fg_dim"],
-                         font=("Segoe UI", 8), width=9, anchor=tk.W).pack(side=tk.LEFT)
+                         font=("Segoe UI", _fs(8)), width=9, anchor=tk.W).pack(side=tk.LEFT)
                 var = tk.StringVar(value="0")
                 sp_box = ttk.Spinbox(line, from_=0, to=hi, textvariable=var, width=4,
-                                     font=("Segoe UI", 9), command=self._on_layout_change)
+                                     font=("Segoe UI", _fs(9)), command=self._on_layout_change)
                 sp_box.pack(side=tk.LEFT, padx=(0, 10))
                 sp_box.bind("<KeyRelease>", lambda e: self._on_layout_change())
                 self.manual_vars[key] = var
@@ -1567,35 +1732,74 @@ class PIGeneratorApp:
         bom_header = tk.Frame(self.grp_bom, bg=EVE["bg_card"])
         bom_header.pack(fill=tk.X, padx=8, pady=(6, 0))
         tk.Label(bom_header, text="⬡  BILL OF MATERIALS", bg=EVE["bg_card"],
-                 fg=EVE["accent"], font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT)
+                 fg=EVE["accent"], font=("Segoe UI", _fs(8), "bold")).pack(side=tk.LEFT)
         self.bom_product_lbl = tk.Label(bom_header, text="", bg=EVE["bg_card"],
-                                        fg=EVE["fg_bright"], font=("Segoe UI", 8, "bold"))
+                                        fg=EVE["fg_bright"], font=("Segoe UI", _fs(8), "bold"))
         self.bom_product_lbl.pack(side=tk.RIGHT)
 
         self.bom_canvas = tk.Canvas(self.grp_bom, bg=EVE["bg_card"],
-                                    highlightthickness=0, height=130)
+                                    highlightthickness=0, height=_px(130))
         self.bom_canvas.pack(fill=tk.X, padx=4, pady=(4, 8))
+
+        # The BOM anchors its values to the canvas's right edge, measured at
+        # draw time. Nothing redrew it when that edge moved, so after a resize
+        # — or a text-size change that left the window narrower than the new
+        # text — every value stayed positioned for the old width and ran off
+        # the panel. Only a real width change redraws: _update_bom asks for a
+        # window fit, which fires <Configure> again, and reacting to the height
+        # of that would loop forever.
+        self._bom_width = 0
+        self._bom_redraw_job = None
+
+        def _on_bom_resize(event):
+            if event.width == self._bom_width:
+                return
+            self._bom_width = event.width
+            if self._bom_redraw_job:
+                self.root.after_cancel(self._bom_redraw_job)
+            self._bom_redraw_job = self.root.after(60, self._redraw_bom)
+
+        self.bom_canvas.bind("<Configure>", _on_bom_resize)
 
         # ── ACTION BUTTONS ────────────────────────────────────────────
         btn_frame = ttk.Frame(scroll_frame)
         btn_frame.pack(fill=tk.X, padx=8, pady=(6, 10))
 
         self.gen_btn = tk.Button(btn_frame, text="▶  GENERATE TEMPLATE",
-                                 font=("Segoe UI", 11, "bold"),
+                                 font=("Segoe UI", _fs(11), "bold"),
                                  bg=EVE["accent_dim"], fg=EVE["fg_bright"],
                                  activebackground=EVE["accent"], activeforeground="white",
                                  relief=tk.FLAT, cursor="hand2", command=self._generate)
         self.gen_btn.pack(fill=tk.X, ipady=8)
 
+        # Only ever offered for P1 → P2 (Factory); _on_chain_changed shows and
+        # hides it. Normal Build previews and generation keep the original path.
+        self.mixed_btn = tk.Button(btn_frame, text="⚗  ASSIGN P2 PER FACTORY",
+                                   font=("Segoe UI", _fs(10), "bold"),
+                                   bg=EVE["bg_card"], fg=EVE["fg"],
+                                   activebackground=EVE["border_hi"],
+                                   activeforeground=EVE["fg_bright"],
+                                   relief=tk.FLAT, cursor="hand2",
+                                   command=self._open_mixed_p2_planner)
+
         scout_btn = tk.Button(btn_frame, text="◈  PROXIMITY SCOUT",
-                              font=("Segoe UI", 10, "bold"),
+                              font=("Segoe UI", _fs(10), "bold"),
                               bg=EVE["bg_card"], fg=EVE["fg"],
                               activebackground=EVE["border_hi"], activeforeground=EVE["fg_bright"],
                               relief=tk.FLAT, cursor="hand2", command=self._open_region_scanner)
         scout_btn.pack(fill=tk.X, ipady=5, pady=(5, 0))
 
+        hist_btn = tk.Button(btn_frame, text="🕘  HISTORY",
+                             font=("Segoe UI", _fs(10), "bold"),
+                             bg=EVE["bg_card"], fg=EVE["fg"],
+                             activebackground=EVE["border_hi"],
+                             activeforeground=EVE["fg_bright"],
+                             relief=tk.FLAT, cursor="hand2",
+                             command=self._open_history)
+        hist_btn.pack(fill=tk.X, ipady=5, pady=(5, 0))
+
         lib_btn = tk.Button(btn_frame, text="📚  TEMPLATE LIBRARY",
-                            font=("Segoe UI", 10, "bold"),
+                            font=("Segoe UI", _fs(10), "bold"),
                             bg=EVE["bg_card"], fg=EVE["fg"],
                             activebackground=EVE["border_hi"], activeforeground=EVE["fg_bright"],
                             relief=tk.FLAT, cursor="hand2", command=self._open_template_library)
@@ -1613,17 +1817,24 @@ class PIGeneratorApp:
         """Redimensionne la fenêtre principale en hauteur pour contenir tout le contenu."""
         try:
             self.root.update_idletasks()
-            # Required width is fixed at 420; height = content + title bar + padding
+            # Width follows the text size. It used to be pinned at 420, and
+            # since this runs on every BOM redraw it silently undid any wider
+            # geometry — at 150% every label on the panel clipped.
+            # Whatever width the window currently has, so dragging the edge
+            # sticks. Only the scaled default applies before it is first laid
+            # out; the floor stops a stray drag collapsing the panel.
+            current = self.root.winfo_width()
+            width = max(_px(300), current if current > 1 else _px(420))
             req_h = self.root.winfo_reqheight()
             # Add a small bottom margin (approx 3 text lines = 48px)
-            new_h = req_h + 48
+            new_h = req_h + _px(48)
             # Enforce minimum so the window never gets tiny, and never grow
             # past the screen — there is no scrollbar to recover the overflow.
-            new_h = max(new_h, 520)
-            new_h = min(new_h, max(520, self.root.winfo_screenheight() - 80))
+            new_h = max(new_h, _px(520))
+            new_h = min(new_h, max(_px(520), self.root.winfo_screenheight() - 80))
             x = self.root.winfo_x()
             y = self.root.winfo_y()
-            self.root.geometry(f"420x{new_h}+{x}+{y}")
+            self.root.geometry(f"{width}x{new_h}+{x}+{y}")
         except Exception:
             pass
 
@@ -1794,9 +2005,15 @@ class PIGeneratorApp:
         c.delete("all")
         tpl = self.current_preview
         if tpl is None:
-            c.create_text(8, 10, anchor=tk.NW, text="Select a product and chain",
-                          fill=EVE["fg_dim"], font=("Segoe UI", 9))
-            c.config(height=26)
+            # Nothing to measure is either "nothing picked yet" or "what you
+            # picked does not fit" — the second one has to say so.
+            reason = getattr(self, "_preview_error", None)
+            c.create_text(8, 10, anchor=tk.NW, width=max(120, c.winfo_width() - 16),
+                          text=f"⚠ {reason}" if reason
+                               else "Select a product and chain",
+                          fill=EVE["orange"] if reason else EVE["fg_dim"],
+                          font=("Segoe UI", _fs(9)))
+            c.config(height=(_px(26) + _px(14) * (1 + len(reason) // 46)) if reason else _px(26))
             return
 
         # Always set alongside current_preview in _update_bom; the only other
@@ -1816,18 +2033,18 @@ class PIGeneratorApp:
             pct = used / cap if cap else 0
             colour = EVE["green"] if pct <= 0.9 else (EVE["yellow"] if pct <= 1.0 else EVE["red"])
             c.create_text(x0, y, anchor=tk.NW, text=label, fill=EVE["fg_dim"],
-                          font=("Segoe UI", 8))
+                          font=("Segoe UI", _fs(8)))
             c.create_text(x1, y, anchor=tk.NE, text=f"{used:,} / {cap:,}",
-                          fill=colour, font=("Consolas", 8))
-            track_y = y + 14
-            c.create_rectangle(x0, track_y, x1, track_y + 3, outline="", fill=EVE["bg_input"])
-            c.create_rectangle(x0, track_y, x0 + (x1 - x0) * min(pct, 1.0), track_y + 3,
+                          fill=colour, font=("Consolas", _fs(8)))
+            track_y = y + _px(14)
+            c.create_rectangle(x0, track_y, x1, track_y + _px(3), outline="", fill=EVE["bg_input"])
+            c.create_rectangle(x0, track_y, x0 + (x1 - x0) * min(pct, 1.0), track_y + _px(3),
                                outline="", fill=colour)
 
         mid = 8 + (right_x - 8) // 2
         bar("CPU", a["cpu_used"], a["cpu_max"], 8, mid - 10)
         bar("PWR", a["power_used"], a["power_max"], mid + 10, right_x)
-        y += 26
+        y += _px(26)
 
         # One fact per line — at 420px wide anything else collides.
         # Always name the target: without it, a colony that already outlasts
@@ -1843,16 +2060,16 @@ class PIGeneratorApp:
             runs_txt = f"runs {runs:.0f}h untended  ({target}h asked)"
         c.create_text(8, y, anchor=tk.NW, text=runs_txt,
                       fill=EVE["green"] if ok else EVE["orange"],
-                      font=("Segoe UI", 9, "bold"))
-        y += 16
+                      font=("Segoe UI", _fs(9), "bold"))
+        y += _px(16)
 
         if a["p0_supply_h"]:
             fed = a["p0_supply_h"] >= a["p0_demand_h"]
             c.create_text(8, y, anchor=tk.NW,
                           text=f"extract {a['p0_supply_h']:,.0f}/h   ·   factories use "
                                f"{a['p0_demand_h']:,.0f}/h",
-                          fill=EVE["green"] if fed else EVE["red"], font=("Consolas", 8))
-            y += 16
+                          fill=EVE["green"] if fed else EVE["red"], font=("Consolas", _fs(8)))
+            y += _px(16)
 
         # A manual factory count above what the pads can seat is clamped by the
         # generator, which freezes every number above. Say so, or it reads as a
@@ -1866,15 +2083,15 @@ class PIGeneratorApp:
             arm_len=layout_opts.get("arm_length") or MAX_ARM_LEN)
         if clamp_note:
             c.create_text(8, y, anchor=tk.NW, text=f"⚠ {clamp_note}",
-                          fill=EVE["orange"], font=("Segoe UI", 8),
+                          fill=EVE["orange"], font=("Segoe UI", _fs(8)),
                           width=right_x - 16)
-            y += 14 * (1 + len(clamp_note) // 52)
+            y += _px(14) * (1 + len(clamp_note) // 52)
 
         for warn in a["warnings"]:
             c.create_text(8, y, anchor=tk.NW, text=f"⚠ {warn}", fill=EVE["red"],
-                          font=("Segoe UI", 8), width=right_x - 16)
-            y += 14 * (1 + len(warn) // 52)
-        c.config(height=max(56, y + 2))
+                          font=("Segoe UI", _fs(8)), width=right_x - 16)
+            y += _px(14) * (1 + len(warn) // 52)
+        c.config(height=max(_px(56), y + 2))
 
     def _required_p0(self, product, chain_name):
         """Retourne les ressources P0 nécessaires au produit pour une chaîne d'extraction."""
@@ -1911,6 +2128,15 @@ class PIGeneratorApp:
         else:
             self.sf_frame.pack_forget()
 
+        # Per-factory P2 only means anything where every factory makes a P2
+        # from P1s. Any other chain and the button would offer an impossible
+        # edit, so it is not there to be pressed.
+        if chain_name == MIXED_CHAIN:
+            self.mixed_btn.pack(fill=tk.X, ipady=5, pady=(5, 0),
+                                after=self.gen_btn)
+        else:
+            self.mixed_btn.pack_forget()
+
         # Planet type: P4 needs a High-Tech Industry Facility, which only exists
         # on Barren/Temperate; chains that extract need the right resources.
         if chain_info.get("target_tier") == "P4":
@@ -1928,6 +2154,14 @@ class PIGeneratorApp:
 
         self._update_bom()
 
+    def _redraw_bom(self):
+        """Redessine la BOM après un changement de largeur du canvas."""
+        self._bom_redraw_job = None
+        try:
+            self._update_bom()
+        except Exception as exc:
+            _debug(f"_redraw_bom failed: {exc}")
+
     def _update_bom(self):
         """Affiche la nomenclature sur le canvas BOM avec des couleurs par palier (P0–P4)."""
         c = self.bom_canvas
@@ -1938,7 +2172,7 @@ class PIGeneratorApp:
         if not product or not chain:
             self.bom_product_lbl.config(text="")
             c.create_text(8, 12, anchor=tk.W, text="Select a product and chain",
-                          fill=EVE["fg_dim"], font=("Segoe UI", 9))
+                          fill=EVE["fg_dim"], font=("Segoe UI", _fs(9)))
             return
 
         chain_info = CHAINS.get(chain)
@@ -1951,17 +2185,23 @@ class PIGeneratorApp:
 
         # Build the colony the current settings describe so the layout panel can
         # measure it. Cheap enough to redo on every keystroke.
+        config = {
+            "product_name": product,
+            "chain_name": chain,
+            "planet_type": self.planet_var.get(),
+            "cc_level": self.cc_var.get(),
+            # Link cost scales with radius, so the preview has to measure
+            # the planet you actually picked or the CPU bar lies.
+            "planet_diameter": self._planet_diameter(),
+            "layout": self._layout_options(),
+        }
+        self._preview_error = None
         try:
-            self.current_preview = self._template_service.generate({
-                "product_name": product,
-                "chain_name": chain,
-                "planet_type": self.planet_var.get(),
-                "cc_level": self.cc_var.get(),
-                # Link cost scales with radius, so the preview has to measure
-                # the planet you actually picked or the CPU bar lies.
-                "planet_diameter": self._planet_diameter(),
-                "layout": self._layout_options(),
-            })
+            self.current_preview = self._template_service.generate(config)
+            # A colony that does not fit leaves the panel with nothing to draw;
+            # say which count blew the budget instead of going blank.
+            if self.current_preview is None:
+                self._preview_error = self._template_service.why_not(config)
         except Exception as exc:
             _debug(f"_update_bom - preview failed: {exc}")
             self.current_preview = None
@@ -1979,22 +2219,22 @@ class PIGeneratorApp:
             "P3": "#ebcb8b", "P4": EVE["accent"],
         }
         y = 6
-        lh = 18
+        lh = _px(18)
 
         # Right edge for values/dividers — track the real canvas width so the
         # quantity + tier badge (e.g. "6×  [P2]") never clips off the edge.
         c.update_idletasks()
         right_x = c.winfo_width() - 10
         if right_x < 200:          # not laid out yet (first build) → 420px-window fallback
-            right_x = 372
+            right_x = _px(372)
 
         def draw_row(label, value, color, indent=0):
             nonlocal y
             c.create_text(8 + indent, y, anchor=tk.W, text=label,
-                          fill=color, font=("Segoe UI", 9))
+                          fill=color, font=("Segoe UI", _fs(9)))
             if value:
                 c.create_text(right_x, y, anchor=tk.E, text=value,
-                              fill=color, font=("Consolas", 9))
+                              fill=color, font=("Consolas", _fs(9)))
             y += lh
 
         rows = (throughput_rows(self.current_analysis, product,
@@ -2038,6 +2278,14 @@ class PIGeneratorApp:
             def draw_subtotal(m3):
                 draw_row("", f"{m3:,.0f} m³/h", EVE["fg_dim"])
 
+            def draw_note(text, color, indent=4):
+                """Prose, so it wraps to the panel and advances y by its real height."""
+                nonlocal y
+                item = c.create_text(8 + indent, y, anchor=tk.NW, text=text,
+                                     fill=color, font=("Segoe UI", _fs(8)),
+                                     width=max(120, right_x - 8 - indent))
+                y += (c.bbox(item)[3] - c.bbox(item)[1]) + 2
+
             if rows["extracted"]:
                 draw_row("⛏ EXTRACTED ON-PLANET", "", EVE["green"])
                 draw_flows(rows["extracted"])
@@ -2046,6 +2294,12 @@ class PIGeneratorApp:
                 draw_row("⬆ HAUL IN · whole colony, per hour", "", EVE["orange"])
                 draw_flows(rows["haul_in"])
                 draw_subtotal(rows["haul_in_m3_h"])
+                # A haul-in quantity reads the same whether it is a deliberate
+                # import or the extractors failing to keep up. Say which.
+                note = factory_coverage_note(factory_coverage(self.current_analysis))
+                if note:
+                    draw_note(note[0], EVE["orange"])
+                    draw_note(note[1], EVE["fg_dim"])
 
             if rows["collect"] or rows["surplus"]:
                 draw_row("⬇ COLLECT · whole colony, per hour", "", EVE["accent"])
@@ -2086,7 +2340,7 @@ class PIGeneratorApp:
         except ValueError:
             diameter = 10000.0
 
-        template = self._template_service.generate({
+        config = {
             "product_name": product,
             "chain_name": chain,
             "planet_type": planet,
@@ -2094,15 +2348,416 @@ class PIGeneratorApp:
             "planet_diameter": diameter,
             "use_sf": self.sf_var.get(),
             "layout": self._layout_options(),
-        })
+        }
+        template = self._template_service.generate(config)
         if template is None:
-            messagebox.showerror("Error",
-                                 "Could not generate template. CC level may be too low.")
+            # A manual count over budget fails exactly like a too-small CC, so
+            # ask the service which one it actually was rather than guessing.
+            reason = self._template_service.why_not(config)
+            messagebox.showerror(
+                "Error", f"Could not generate template.\n\n{reason}."
+                if reason else "Could not generate template.")
             return
 
         self.current_template = template
+        self._history.record(template, f"{product} · {planet} · CC{cc_level}",
+                             kind="generate")
         self._show_popup(template)
 
+
+    def _open_history(self):
+        """Liste ce sur quoi on travaillait, pour y revenir.
+
+        La bibliothèque garde ce qu'on a délibérément nommé ; l'historique
+        garde le reste — c'est-à-dire précisément ce qui se perdait.
+        """
+        popup = tk.Toplevel(self.root)
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        try:
+            popup.attributes("-alpha", self.alpha)
+        except Exception:
+            pass
+        popup.configure(bg=EVE["bg_deep"])
+        popup.geometry(_load_window_config().get("history_geometry", "520x560"))
+        popup.minsize(420, 320)
+        apply_window_border(popup)
+
+        def close_popup():
+            _update_window_config("history_geometry", popup.geometry())
+            popup.destroy()
+
+        self._build_title_bar(popup, "History", close_popup)
+        self._add_resize_handles(popup)
+
+        body = ttk.Frame(popup)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        head = tk.Frame(body, bg=EVE["bg_deep"])
+        head.pack(fill=tk.X)
+        count_var = tk.StringVar()
+        tk.Label(head, textvariable=count_var, bg=EVE["bg_deep"],
+                 fg=EVE["fg_dim"], font=("Segoe UI", _fs(8))).pack(side=tk.LEFT)
+
+        list_wrap = tk.Frame(body, bg=EVE["bg_card"])
+        list_wrap.pack(fill=tk.BOTH, expand=True, pady=(6, 8))
+        scroll = tk.Scrollbar(list_wrap, orient=tk.VERTICAL)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        listbox = tk.Listbox(list_wrap, bg=EVE["bg_input"], fg=EVE["fg_bright"],
+                             selectbackground=EVE["accent_dim"],
+                             selectforeground="white", font=("Consolas", _fs(9)),
+                             relief=tk.FLAT, activestyle="none", borderwidth=0,
+                             yscrollcommand=scroll.set)
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.config(command=listbox.yview)
+
+        rows = []
+
+        def _refresh():
+            rows[:] = self._history.entries()
+            listbox.delete(0, tk.END)
+            for entry in rows:
+                listbox.insert(
+                    tk.END,
+                    f" {entry.when():>12}   {entry.label[:34]:<34} "
+                    f"{entry.planet:<9} {entry.pins:>2}p {entry.links:>2}l")
+            count_var.set(f"{len(rows)} recorded · newest first · "
+                          f"the {MAX_ENTRIES} most recent are kept"
+                          if rows else "Nothing recorded yet.")
+            if rows:
+                listbox.selection_set(0)
+
+        def _restore(_event=None):
+            sel = listbox.curselection()
+            if not sel:
+                return
+            template = self._history.get(rows[sel[0]].id)
+            if template is None:
+                return
+            self.current_template = template
+            close_popup()
+            self._show_popup(template)
+
+        def _save_to_library(_event=None):
+            """Promeut un état enregistré en template nommé de la bibliothèque.
+
+            Même convention que l'éditeur : préfixe « Custom - », et jamais
+            par-dessus un fichier fourni — sans git ici, écraser un template
+            livré serait définitif.
+            """
+            sel = listbox.curselection()
+            if not sel:
+                return
+            entry = rows[sel[0]]
+            template = self._history.get(entry.id)
+            if template is None:
+                return
+            suggested = (template.get("Cmt") or entry.label or "Unnamed")
+            name = simpledialog.askstring(
+                "Save to library", "Name this template:",
+                initialvalue=suggested[:60], parent=popup)
+            if not name:
+                return
+            name = "".join(ch for ch in name.strip() if ch not in '\\/:*?"<>|')
+            if not name:
+                return
+            fname = f"Custom - {name}.json"
+            path = os.path.join(get_base_path(), "data", "templates", fname)
+            if os.path.exists(path) and not messagebox.askyesno(
+                    "Overwrite?",
+                    f"{fname} already exists in the library. Replace it?",
+                    parent=popup):
+                return
+            # The name is what the library lists, so it becomes the comment too.
+            template["Cmt"] = name
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(template, handle, default=str)
+            except OSError as exc:
+                messagebox.showerror("Save failed", str(exc), parent=popup)
+                return
+            messagebox.showinfo("Saved",
+                                f"Saved to the library as:\n{fname}",
+                                parent=popup)
+
+        def _delete():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            self._history.delete(rows[sel[0]].id)
+            _refresh()
+
+        def _clear():
+            if messagebox.askyesno("Clear history",
+                                   "Forget every recorded state?\n\n"
+                                   "Templates saved in the library are not "
+                                   "affected.", parent=popup):
+                self._history.clear()
+                _refresh()
+
+        listbox.bind("<Double-Button-1>", _restore)
+        listbox.bind("<Return>", _restore)
+
+        btns = ttk.Frame(body)
+        btns.pack(fill=tk.X)
+        tk.Button(btns, text="↩  RESUME", font=("Segoe UI", _fs(10), "bold"),
+                  bg=EVE["accent_dim"], fg=EVE["fg_bright"],
+                  activebackground=EVE["accent"], activeforeground="white",
+                  relief=tk.FLAT, cursor="hand2",
+                  command=_restore).pack(side=tk.LEFT, ipadx=10)
+        tk.Button(btns, text="💾  Save to library", font=("Segoe UI", _fs(9), "bold"),
+                  bg=EVE["bg_card"], fg=EVE["fg"],
+                  activebackground=EVE["border_hi"],
+                  activeforeground=EVE["fg_bright"], relief=tk.FLAT,
+                  cursor="hand2",
+                  command=_save_to_library).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Button(btns, text="Delete", font=("Segoe UI", _fs(9)),
+                  bg=EVE["bg_card"], fg=EVE["fg"],
+                  activebackground=EVE["border_hi"],
+                  activeforeground=EVE["fg_bright"], relief=tk.FLAT,
+                  cursor="hand2", command=_delete).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Button(btns, text="Clear all", font=("Segoe UI", _fs(9)),
+                  bg=EVE["bg_card"], fg=EVE["fg_dim"],
+                  activebackground=EVE["border_hi"],
+                  activeforeground=EVE["fg_bright"], relief=tk.FLAT,
+                  cursor="hand2", command=_clear).pack(side=tk.RIGHT)
+
+        _refresh()
+        popup.lift()
+        popup.focus_force()
+        listbox.focus_set()
+
+    def _build_on_scouted_planet(self, planet_type, radius_km, planet_name,
+                                 scanner_popup=None):
+        """Génère un template pour la planète scannée qu'on vient de cliquer.
+
+        Le Scout dit *où* construire ; jusqu'ici il fallait ensuite recopier le
+        type et le rayon à la main dans le générateur, et un rayon recopié de
+        travers reprice tous les liens en silence. Ici les deux valeurs
+        traversent ensemble, telles que le SDE les donne.
+        """
+        chain = self.chain_var.get()
+        chain_info = CHAINS.get(chain, {})
+
+        # Une chaîne d'extraction n'a de sens que si la planète porte bien les
+        # P0 de la recette : le dire vaut mieux que produire une colonie qui ne
+        # peut rien miner.
+        if chain_info.get("extracts"):
+            usable = self._planets_for_extraction(self.product_var.get(), chain)
+            if planet_type not in usable:
+                messagebox.showwarning(
+                    "Wrong planet for this chain",
+                    f"{planet_name} is {planet_type}, which does not carry the raw "
+                    f"materials for {self.product_var.get()}.\n\n"
+                    f"{chain} needs: {', '.join(usable) if usable else 'no planet type'}.",
+                    parent=scanner_popup or self.root)
+                return
+        elif chain_info.get("target_tier") == "P4" \
+                and planet_type not in HTIF_PLANET_TYPES:
+            messagebox.showwarning(
+                "Wrong planet for this chain",
+                f"{planet_name} is {planet_type}. P4 production needs a "
+                f"High-Tech Industry Facility, which only exists on "
+                f"{' or '.join(HTIF_PLANET_TYPES)}.",
+                parent=scanner_popup or self.root)
+            return
+
+        self.planet_var.set(planet_type)
+        # diameter_var holds the RADIUS — _generate doubles it. The scan value
+        # is a radius too, so it goes across untouched.
+        if radius_km:
+            self.diameter_var.set(str(int(radius_km)))
+        self._update_bom()
+        self._generate()
+
+    def _current_config(self, product=None):
+        """La config que les générateurs attendent, depuis l'état de l'UI."""
+        try:
+            diameter = float(self.diameter_var.get()) * 2.0
+        except ValueError:
+            diameter = 10000.0
+        return {
+            "product_name": product or self.product_var.get(),
+            "chain_name": self.chain_var.get(),
+            "planet_type": self.planet_var.get(),
+            "cc_level": self.cc_var.get(),
+            "planet_diameter": diameter,
+            "use_sf": self.sf_var.get(),
+            "layout": self._layout_options(),
+        }
+
+    def _open_mixed_p2_planner(self):
+        """Un P2 par usine, sur la disposition que le générateur ordinaire produit.
+
+        La disposition est celle qui a été éprouvée : on ne réécrit que le
+        schéma de chaque usine et la marchandise de ses routes. Le nombre
+        d'usines vient donc du template ordinaire, pas d'un compteur à part.
+        """
+        config = self._current_config()
+        if config["chain_name"] != MIXED_CHAIN:
+            return
+        base = self._template_service.generate(config)
+        if base is None:
+            reason = self._template_service.why_not(config)
+            messagebox.showerror("Error", f"Could not generate template.\n\n{reason}."
+                                 if reason else "Could not generate template.")
+            return
+        factory_count = sum(1 for p in base["P"]
+                            if STRUCT_TYPE_TO_NAME.get(p.get("T"))
+                            == "Advanced Industry Facility")
+        if factory_count == 0:
+            messagebox.showwarning("Nothing to assign",
+                                   "This colony has no Advanced Industry Facility.")
+            return
+
+        popup = tk.Toplevel(self.root)
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        try:
+            popup.attributes("-alpha", self.alpha)
+        except Exception:
+            pass
+        popup.configure(bg=EVE["bg_deep"])
+        popup.geometry(_load_window_config().get("mixed_geometry", "560x680"))
+        popup.minsize(440, 420)
+        apply_window_border(popup)
+
+        def close_popup():
+            _update_window_config("mixed_geometry", popup.geometry())
+            popup.destroy()
+
+        self._build_title_bar(popup, "Assign P2 per factory", close_popup)
+        self._add_resize_handles(popup)
+
+        products = sorted(RECIPES_P1_P2)
+        default = config["product_name"] if config["product_name"] in products \
+            else products[0]
+        assignments = normalize_assignments([], factory_count, default)
+        chosen = []
+
+        body = ttk.Frame(popup)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        head = tk.Label(body, text=f"{factory_count} Advanced Industry Facilities",
+                        font=("Segoe UI", _fs(10), "bold"),
+                        bg=EVE["bg_deep"], fg=EVE["accent"], anchor=tk.W)
+        head.pack(fill=tk.X)
+
+        sel_frame = tk.Frame(body, bg=EVE["bg_card"])
+        sel_frame.pack(fill=tk.X, pady=(6, 8))
+
+        summary = tk.Canvas(body, bg=EVE["bg_card"], highlightthickness=0)
+        summary.pack(fill=tk.BOTH, expand=True)
+
+        def _draw_summary():
+            summary.delete("all")
+            for i, var in enumerate(chosen):
+                assignments[i] = var.get()
+            try:
+                mixed = generate_mixed_p2_template(config, assignments)
+                batch = summarize_mixed_p2_batch(mixed, config["layout"])
+            except Exception as exc:
+                # The panel must survive any refusal — an unplannable mix is
+                # something to read, not a traceback into a dead window.
+                summary.create_text(10, 12, anchor=tk.NW, width=460,
+                                    text=f"Cannot plan this mix: {exc}",
+                                    fill=EVE["red"], font=("Segoe UI", _fs(9)))
+                return
+
+            y = [10]
+            right = max(240, summary.winfo_width() - 12)
+
+            def row(label, value="", color=None, indent=0, bold=False):
+                summary.create_text(10 + indent, y[0], anchor=tk.NW, text=label,
+                                    fill=color or EVE["fg"],
+                                    font=("Segoe UI", _fs(9), "bold") if bold
+                                    else ("Segoe UI", 9))
+                if value:
+                    summary.create_text(right, y[0], anchor=tk.NE, text=value,
+                                        fill=color or EVE["fg"], font=("Consolas", _fs(9)))
+                y[0] += 17
+
+            row("FACTORY ALLOCATION", "", EVE["accent"], bold=True)
+            for name, count in sorted(batch.assignments):
+                row(f"  {name}", f"×{count}", EVE["fg_dim"], indent=4)
+            y[0] += 4
+
+            row("P1 SHOPPING LIST · one full batch", "", EVE["orange"], bold=True)
+            for flow in batch.inputs:
+                row(f"  {flow.name}", f"{flow.per_batch:,.0f}   ({flow.per_hour:,.0f}/h)",
+                    EVE["fg_dim"], indent=4)
+            row("", f"{batch.initial_p1_m3:,.1f} m³ of {batch.capacity_m3:,.0f}",
+                EVE["fg_dim"])
+            y[0] += 4
+
+            row("P2 OUTPUT · one full batch", "", EVE["green"], bold=True)
+            for flow in batch.outputs:
+                row(f"  {flow.name}", f"{flow.per_batch:,.0f}   ({flow.per_hour:,.0f}/h)",
+                    EVE["fg_dim"], indent=4)
+            y[0] += 4
+
+            # Whole cycles only: a part-cycle at the end produces nothing, so
+            # rounding up would promise output the pad cannot feed.
+            row("RUNS FOR", f"{batch.cycles:,} h   ({batch.days:,.1f} d)",
+                EVE["accent"], bold=True)
+            summary.config(height=max(120, y[0] + 10))
+
+        for i in range(factory_count):
+            line = tk.Frame(sel_frame, bg=EVE["bg_card"])
+            line.pack(fill=tk.X, padx=6, pady=2)
+            tk.Label(line, text=f"Factory {i + 1}", width=10, anchor=tk.W,
+                     bg=EVE["bg_card"], fg=EVE["fg_dim"],
+                     font=("Segoe UI", _fs(9))).pack(side=tk.LEFT)
+            var = tk.StringVar(value=assignments[i])
+            combo = ttk.Combobox(line, textvariable=var, values=products,
+                                 state="readonly", font=("Segoe UI", _fs(9)))
+            combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            combo.bind("<<ComboboxSelected>>", lambda _e: _draw_summary())
+            chosen.append(var)
+
+        btns = ttk.Frame(body)
+        btns.pack(fill=tk.X, pady=(8, 0))
+
+        def use_default_for_all():
+            for var in chosen:
+                var.set(default)
+            _draw_summary()
+
+        tk.Button(btns, text=f"All → {default}", font=("Segoe UI", _fs(9)),
+                  bg=EVE["bg_card"], fg=EVE["fg"], activebackground=EVE["border_hi"],
+                  activeforeground=EVE["fg_bright"], relief=tk.FLAT, cursor="hand2",
+                  command=use_default_for_all).pack(side=tk.LEFT)
+
+        def generate_mixed():
+            for i, var in enumerate(chosen):
+                assignments[i] = var.get()
+            try:
+                mixed = generate_mixed_p2_template(config, assignments)
+            except MixedP2Error as exc:
+                messagebox.showerror("Cannot assign", str(exc), parent=popup)
+                return
+            if mixed is None:
+                messagebox.showerror("Error", "Could not generate template.",
+                                     parent=popup)
+                return
+            self.current_template = mixed
+            self._history.record(
+                mixed, "Mixed P2 · " + ", ".join(dict.fromkeys(assignments)),
+                kind="mixed")
+            close_popup()
+            self._show_popup(mixed)
+
+        tk.Button(btns, text="▶  GENERATE MIXED", font=("Segoe UI", _fs(10), "bold"),
+                  bg=EVE["accent_dim"], fg=EVE["fg_bright"],
+                  activebackground=EVE["accent"], activeforeground="white",
+                  relief=tk.FLAT, cursor="hand2",
+                  command=generate_mixed).pack(side=tk.RIGHT, ipadx=10)
+
+        popup.update_idletasks()
+        _draw_summary()
+        popup.lift()
+        popup.focus_force()
 
     def _show_popup(self, template):
         """Ouvre la fenêtre de résultat avec le JSON, le bouton copier et la carte visuelle du template."""
@@ -2124,6 +2779,14 @@ class PIGeneratorApp:
 
         def close_popup():
             _update_window_config("popup_geometry", popup.geometry())
+            # Stop the flow loop before the window goes, or `after` fires once
+            # more against a destroyed canvas.
+            job = view_state.get("anim_job")
+            if job:
+                try:
+                    popup.after_cancel(job)
+                except Exception:
+                    pass
             popup.destroy()
 
         self._build_title_bar(popup, "Generated PI Template", close_popup)
@@ -2132,41 +2795,72 @@ class PIGeneratorApp:
         top_frame = ttk.Frame(popup)
         top_frame.pack(fill=tk.X, padx=10, pady=10)
 
-        json_str = json.dumps(template, default=str)
+        # The open document. A drag replaces it, so everything below reads
+        # doc["template"] rather than closing over the original.
+        doc = {"template": template}
 
         btn_bar = ttk.Frame(top_frame)
         btn_bar.pack(fill=tk.X, pady=(0, 5))
 
         def copy_json():
             popup.clipboard_clear()
-            popup.clipboard_append(json_str)
+            popup.clipboard_append(json.dumps(doc["template"], default=str))
             messagebox.showinfo("Copied", "Template JSON copied to clipboard!\n\nPaste into EVE Online PI import.", parent=popup)
 
-        tk.Button(btn_bar, text="📋 Copy JSON", font=("Segoe UI", 9, "bold"),
+        tk.Button(btn_bar, text="📋 Copy JSON", font=("Segoe UI", _fs(9), "bold"),
                   bg=EVE["bg_card"], fg=EVE["fg"], activebackground=EVE["border_hi"],
                   activeforeground=EVE["fg_bright"], relief=tk.FLAT, cursor="hand2", command=copy_json).pack(side=tk.LEFT)
-        
+
         def reset_view():
             view_state["zoom"] = 1.0
             view_state["pan_x"] = 0
             view_state["pan_y"] = 0
-            self._draw_map(map_canvas, template, view_state)
-        
-        tk.Button(btn_bar, text="🔄 Reset View", font=("Segoe UI", 9, "bold"),
+            # Explicit only: this is the one place the fit is allowed to follow
+            # the colony again after structures have been moved.
+            view_state["fit"] = None
+            self._draw_map(map_canvas, doc["template"], view_state)
+
+        tk.Button(btn_bar, text="🔄 Reset View", font=("Segoe UI", _fs(9), "bold"),
                   bg=EVE["bg_card"], fg=EVE["fg"], activebackground=EVE["border_hi"],
-                  activeforeground=EVE["fg_bright"], relief=tk.FLAT, cursor="hand2", 
+                  activeforeground=EVE["fg_bright"], relief=tk.FLAT, cursor="hand2",
                   command=reset_view).pack(side=tk.LEFT, padx=(10, 0))
-        
-        zoom_label = tk.Label(btn_bar, text="Scroll: Zoom | Drag: Pan", font=("Segoe UI", 8),
+
+        # Two figures rather than a verdict. At 0.2 CPU per km even the largest
+        # possible move on a small colony cannot cross the budget line, so a
+        # move would read as though nothing had happened.
+        budget_var = tk.StringVar()
+        budget_lbl = tk.Label(btn_bar, textvariable=budget_var, font=("Consolas", _fs(8)),
+                              bg=EVE["bg_deep"], fg=EVE["fg_dim"])
+        budget_lbl.pack(side=tk.RIGHT, padx=(10, 0))
+
+        def _refresh_budget(tpl=None, moving=False):
+            try:
+                a = analyze_template(tpl if tpl is not None else doc["template"],
+                                     self._layout_options())
+            except Exception:
+                budget_var.set("")
+                return
+            over = a["cpu_used"] > a["cpu_max"] or a["power_used"] > a["power_max"]
+            budget_var.set(f"CPU {a['cpu_used']:,}/{a['cpu_max']:,}   "
+                           f"PWR {a['power_used']:,}/{a['power_max']:,}")
+            budget_lbl.config(fg=EVE["red"] if over
+                              else (EVE["accent"] if moving else EVE["fg_dim"]))
+
+        zoom_label = tk.Label(btn_bar, text="Drag a building to move it · Scroll: Zoom · Drag: Pan",
+                              font=("Segoe UI", _fs(8)),
                               bg=EVE["bg_deep"], fg=EVE["fg_dim"])
         zoom_label.pack(side=tk.RIGHT)
 
         json_text = scrolledtext.ScrolledText(top_frame, height=10, wrap=tk.WORD,
                                               bg=EVE["bg_input"], fg=EVE["json_fg"],
-                                              font=("Consolas", 10), relief=tk.FLAT,
+                                              font=("Consolas", _fs(10)), relief=tk.FLAT,
                                               insertbackground=EVE["json_fg"])
         json_text.pack(fill=tk.X)
-        json_text.insert("1.0", json_str)
+        json_text.insert("1.0", json.dumps(template, default=str))
+
+        def _refresh_json():
+            json_text.delete("1.0", tk.END)
+            json_text.insert("1.0", json.dumps(doc["template"], default=str))
 
         map_frame = ttk.Frame(popup)
         map_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -2175,7 +2869,7 @@ class PIGeneratorApp:
         map_canvas.pack(fill=tk.BOTH, expand=True)
 
         view_state = {"zoom": 1.0, "pan_x": 0, "pan_y": 0, "drag_start_x": 0, "drag_start_y": 0,
-                      "redraw_job": None}
+                      "redraw_job": None, "fit": None}
 
         # Panning moves the already-drawn items ("map" tag) — no redraw, no
         # flicker. Zooming scales them in place for instant feedback, then a
@@ -2186,9 +2880,105 @@ class PIGeneratorApp:
 
             def _do():
                 view_state["redraw_job"] = None
-                self._draw_map(map_canvas, template, view_state)
+                self._draw_map(map_canvas, doc["template"], view_state)
 
             view_state["redraw_job"] = popup.after(delay, _do)
+
+        # ── Moving a structure ────────────────────────────────────────────
+        # Committed once, on release. Every frame would rewrite the document
+        # dozens of times for one drag. Escape abandons the gesture entirely,
+        # and a press that never moved stays an ordinary press.
+        grab = {"pin": None, "moved": False, "model": None}
+
+        def on_structure_grab(event, pin_idx):
+            map_canvas.delete("tooltip")
+            map_canvas.delete("signal")
+            try:
+                grab["model"] = parse_colony(doc["template"])
+            except ParseError:
+                # Not every colony the generators produce is a hub-and-arms
+                # tree. Those render fine but cannot be re-parsed, so they are
+                # not draggable — fall through to panning rather than making
+                # the press do nothing at all.
+                grab["model"] = None
+                grab["pin"] = None
+                return None
+            grab["pin"] = pin_idx
+            grab["moved"] = False
+            return "break"
+
+        def on_structure_drag(event):
+            if grab["pin"] is None:
+                return None
+            grab["moved"] = True
+            la, lo = view_state["untransform"](event.x, event.y)
+            try:
+                moved = move_pin(grab["model"], grab["pin"], la, lo)
+            except EditError:
+                return "break"
+            # The stage, the figures and the crowding marks all read one
+            # provisional colony, so the budget moves *during* the drag rather
+            # than jumping when the pointer comes up.
+            provisional = moved.to_template()
+            self._draw_map(map_canvas, provisional, view_state)
+            _refresh_budget(provisional, moving=True)
+            return "break"
+
+        def on_structure_drop(event):
+            if grab["pin"] is None:
+                return None
+            pin_idx, moved_at_all = grab["pin"], grab["moved"]
+            grab["pin"] = None
+            if not moved_at_all:
+                # Ending where you started means nothing happened: committing a
+                # zero-delta move would mark the document changed for a click.
+                return "break"
+            la, lo = view_state["untransform"](event.x, event.y)
+            try:
+                doc["template"] = move_pin(grab["model"], pin_idx, la, lo).to_template()
+            except EditError as exc:
+                _debug(f"structure drop refused: {exc}")
+                self._draw_map(map_canvas, doc["template"], view_state)
+                return "break"
+            self._draw_map(map_canvas, doc["template"], view_state)
+            _refresh_budget()
+            _refresh_json()
+            # The reason history exists: a colony arranged by hand lived only
+            # in this window, and closing it threw the work away.
+            kind = STRUCT_TYPE_TO_NAME.get(
+                doc["template"]["P"][pin_idx].get("T")) or "structure"
+            self._history.record(doc["template"], f"Moved {kind}", kind="edit")
+            return "break"
+
+        def on_escape(_event=None):
+            if grab["pin"] is None:
+                return
+            grab["pin"] = None
+            self._draw_map(map_canvas, doc["template"], view_state)
+            _refresh_budget()
+
+        view_state["on_structure_grab"] = on_structure_grab
+        view_state["on_structure_drag"] = on_structure_drag
+        view_state["on_structure_drop"] = on_structure_drop
+        popup.bind("<Escape>", on_escape)
+        # Handles for tests/map_smoke.py, which drives this map from inside
+        # mainloop() and has no other way to reach the open document.
+        map_canvas._pi_view_state = view_state
+        map_canvas._pi_doc = doc
+
+        # ── Flow ──────────────────────────────────────────────────────────
+        # One dash period per step so the travel loops seamlessly: links are
+        # 5 on / 4 off, signals 2 on / 8 off. Nothing is redrawn — only the
+        # offset of items already on the canvas moves.
+        def _animate(phase=0):
+            try:
+                map_canvas.itemconfig("link", dashoffset=-(phase % 9))
+                map_canvas.itemconfig("signal", dashoffset=-(phase % 7))
+            except tk.TclError:
+                return          # canvas gone: the popup was closed
+            view_state["anim_job"] = popup.after(55, _animate, phase + 1)
+
+        _animate()
 
         def on_scroll(event):
             factor = 1.15 if event.delta > 0 else 1 / 1.15
@@ -2200,8 +2990,10 @@ class PIGeneratorApp:
             # Scaling about the canvas center also scales the pan offset.
             view_state["pan_x"] *= factor
             view_state["pan_y"] *= factor
-            cw = map_canvas.winfo_width() or 700
-            ch = map_canvas.winfo_height() or 500
+            cw = map_canvas.winfo_width()
+            ch = map_canvas.winfo_height()
+            cw = 700 if cw <= 1 else cw
+            ch = 500 if ch <= 1 else ch
             map_canvas.scale("map", cw / 2, ch / 2, factor, factor)
             _schedule_crisp_redraw()
 
@@ -2211,6 +3003,10 @@ class PIGeneratorApp:
             view_state["drag_start_y"] = event.y
 
         def on_drag(event):
+            # A grabbed structure owns the gesture; otherwise it pans.
+            if grab["pin"] is not None:
+                on_structure_drag(event)
+                return
             dx = event.x - view_state["drag_start_x"]
             dy = event.y - view_state["drag_start_y"]
             view_state["drag_start_x"] = event.x
@@ -2224,10 +3020,13 @@ class PIGeneratorApp:
         map_canvas.bind("<Button-5>", lambda e: on_scroll(type('obj', (object,), {'delta': -120})))
         map_canvas.bind("<Button-1>", on_drag_start)
         map_canvas.bind("<B1-Motion>", on_drag)
+        map_canvas.bind("<ButtonRelease-1>", on_structure_drop)
 
         popup.update_idletasks()
-        self._draw_map(map_canvas, template, view_state)
-        map_canvas.bind("<Configure>", lambda e: self._draw_map(map_canvas, template, view_state))
+        self._draw_map(map_canvas, doc["template"], view_state)
+        _refresh_budget()
+        map_canvas.bind("<Configure>",
+                        lambda e: self._draw_map(map_canvas, doc["template"], view_state))
         
         popup.lift()
         popup.focus_force()
@@ -2322,7 +3121,7 @@ class PIGeneratorApp:
         window.bind("<B1-Motion>", do_resize, add="+")
         window.bind("<ButtonRelease-1>", stop_resize, add="+")
 
-        grip = tk.Label(window, text="⋱", font=("Segoe UI", 10), 
+        grip = tk.Label(window, text="⋱", font=("Segoe UI", _fs(10)), 
                         bg=EVE["bg_deep"], fg=EVE["fg_dim"], cursor="bottom_right_corner")
         grip.place(relx=1.0, rely=1.0, anchor="se")
         
@@ -2343,8 +3142,15 @@ class PIGeneratorApp:
     def _draw_map(self, canvas, template, view_state=None):
         """Dessine la carte visuelle du template (pins, liens, légende) avec zoom et panoramique."""
         canvas.delete("all")
-        cw = canvas.winfo_width() or 700
-        ch = canvas.winfo_height() or 500
+        # An unmapped widget reports 1, not 0, so `or 700` kept the 1 and the
+        # whole map was drawn into a one-pixel box. Nothing showed it until the
+        # planet arrived: at cw=1 the artwork fell under its minimum size and
+        # was skipped, so a freshly opened template had no planet until the
+        # first pan forced a redraw at the real size.
+        cw = canvas.winfo_width()
+        ch = canvas.winfo_height()
+        cw = 700 if cw <= 1 else cw
+        ch = 500 if ch <= 1 else ch
         
         if view_state is None:
             view_state = {"zoom": 1.0, "pan_x": 0, "pan_y": 0}
@@ -2366,46 +3172,61 @@ class PIGeneratorApp:
         #      fixed cap), so the building-to-gap ratio is the same as in-game.
         # The cluster is then uniformly scaled to fit the window (pure zoom, which the
         # user can still adjust) — relative proportions are preserved exactly.
-        margin = 60
-        available_w = max(1.0, cw - 2 * margin)
-        available_h = max(1.0, ch - 2 * margin)
+        # The colony is drawn at a fixed scale on the planet, not fitted to the
+        # window. A colony is a patch of ground and has to read as one: filling
+        # the canvas with six buildings made each one bigger than the world it
+        # sits on, and stretching fourteen across it made them specks.
+        disc = min(cw, ch) * PLANET_SPAN
 
-        lats = [float(p.get("La", 0.0)) for p in pins]
-        lons = [float(p.get("Lo", 0.0)) for p in pins]
-        lat_min, lat_max = min(lats), max(lats)
-        lon_min, lon_max = min(lons), max(lons)
-        lat_span = (lat_max - lat_min) or 1e-9
+        # The fit is computed once and then held. Auto-fit derives the scale from
+        # the template's own extent, which is right for a first look and wrong the
+        # moment a structure can be dragged: every frame of a drag would change
+        # the extent, so the whole colony would swim while one building moved.
+        # Recomputed only when the canvas changes shape, or on Reset View.
+        fit = view_state.get("fit")
+        if fit is None or fit["cw"] != cw or fit["ch"] != ch:
+            lats = [float(p.get("La", 0.0)) for p in pins]
+            lons = [float(p.get("Lo", 0.0)) for p in pins]
+            lat_min, lat_max = min(lats), max(lats)
+            lon_min, lon_max = min(lons), max(lons)
+            # Longitude → surface distance shrinks by sin(colatitude); ~constant over a
+            # small cluster, so one factor at the mean latitude keeps the aspect ratio true.
+            lon_compress = max(0.05, math.sin((lat_min + lat_max) / 2.0))
 
-        # Longitude → surface distance shrinks by sin(colatitude); ~constant over a
-        # small cluster, so one factor at the mean latitude keeps the aspect ratio true.
-        lon_compress = max(0.05, math.sin((lat_min + lat_max) / 2.0))
-        lon_span = ((lon_max - lon_min) * lon_compress) or 1e-9
+            # One generator spacing is always the same number of pixels.
+            scale = (disc * SPACING_SPAN) / BASE_SPACING
 
-        # Uniform scale keeps the real aspect ratio (no horizontal/vertical stretch).
-        scale = min(available_w / lon_span, available_h / lat_span)
-        off_x = (cw - lon_span * scale) / 2.0
-        off_y = (ch - lat_span * scale) / 2.0
+            # Centred on the colony's middle rather than its corner, so a
+            # lopsided layout still sits on the middle of the planet.
+            lon_mid = (lon_min + lon_max) / 2.0
+            lat_mid = (lat_min + lat_max) / 2.0
+            fit = {"cw": cw, "ch": ch, "lat_max": lat_max, "lon_min": lon_min,
+                   "lon_compress": lon_compress, "scale": scale,
+                   "off_x": cw / 2.0 - (lon_mid - lon_min) * lon_compress * scale,
+                   "off_y": ch / 2.0 - (lat_max - lat_mid) * scale,
+                   "node_radius": max(4.0, disc * SPACING_SPAN * PLATE_RATIO)}
+            view_state["fit"] = fit
+
+        lat_max = fit["lat_max"]
+        lon_min = fit["lon_min"]
+        lon_compress = fit["lon_compress"]
+        scale = fit["scale"]
+        off_x, off_y = fit["off_x"], fit["off_y"]
+
+        def project(la, lo):
+            """Coordonnées planète → pixels non zoomés."""
+            return (off_x + (float(lo) - lon_min) * lon_compress * scale,
+                    off_y + (lat_max - float(la)) * scale)
 
         positions = {}
         for i, pin in enumerate(pins):
             # Lo → x (east-west); La → y, inverted so higher latitude sits higher up.
-            px = off_x + (float(pin.get("Lo", 0.0)) - lon_min) * lon_compress * scale
-            py = off_y + (lat_max - float(pin.get("La", 0.0))) * scale
-            positions[i] = (px, py)
+            positions[i] = project(pin.get("La", 0.0), pin.get("Lo", 0.0))
 
-        # Building size = fraction of the closest real spacing, so tightly-packed
-        # (optimised) layouts render snug — just like the in-game planet view.
-        pts = list(positions.values())
-        min_dist = None
-        for a in range(len(pts)):
-            ax, ay = pts[a]
-            for b in range(a + 1, len(pts)):
-                d = math.hypot(ax - pts[b][0], ay - pts[b][1])
-                if d > 0 and (min_dist is None or d < min_dist):
-                    min_dist = d
-        if min_dist is None:
-            min_dist = min(available_w, available_h)
-        node_radius = max(5.0, min(min_dist * 0.46, min(available_w, available_h) / 5.0))
+        # Building size comes from the fixed spacing, not from the template's
+        # tightest pair: it must not shrink because a drag briefly put two
+        # buildings on top of each other.
+        node_radius = fit["node_radius"]
 
         def transform(x, y):
             cx_canvas = cw / 2
@@ -2414,21 +3235,65 @@ class PIGeneratorApp:
             ty = cy_canvas + (y - cy_canvas) * zoom + pan_y
             return tx, ty
 
-        link_color = "#555555"
+        def untransform(tx, ty):
+            """Pixels écran → coordonnées planète : l'inverse exact de project+transform.
+
+            C'est ce qui permet à un glisser de reposer une structure là où le
+            pointeur l'a lâchée plutôt qu'à un décalage près.
+
+            Le panoramique et le zoom sont relus dans view_state à chaque appel,
+            jamais capturés au moment du dessin : déplacer la carte ne redessine
+            rien (canvas.move suffit), donc des valeurs figées au dessin sont
+            périmées dès le premier glissement de la vue — et la structure
+            sautait alors du décalage accumulé.
+            """
+            live_zoom = view_state.get("zoom", 1.0)
+            live_pan_x = view_state.get("pan_x", 0)
+            live_pan_y = view_state.get("pan_y", 0)
+            cx_canvas, cy_canvas = cw / 2, ch / 2
+            x = (tx - live_pan_x - cx_canvas) / live_zoom + cx_canvas
+            y = (ty - live_pan_y - cy_canvas) / live_zoom + cy_canvas
+            return (lat_max - (y - off_y) / scale,
+                    lon_min + (x - off_x) / (lon_compress * scale))
+
+        view_state["untransform"] = untransform
+
+        # ── The planet under it all ───────────────────────────────────────
+        # The artwork is the feature; everything else is drawn over it, so it
+        # goes down first and never takes a click. Sized to the stage rather
+        # than to the colony: the planet is the backdrop, not a container.
+        # Deliberately NOT zoomed and NOT panned: the planet is the backdrop the
+        # colony is looked at against, and a backdrop that slides and swells
+        # with every gesture is scenery competing with the thing being read.
+        # It is also excluded from the "map" tag below, which is what pan and
+        # zoom actually move.
+        art = get_planet_art(template.get("Pln"), min(cw, ch) * PLANET_SPAN)
+        if art is not None:
+            canvas.create_image(cw / 2, ch / 2, image=art, tags=("planet",),
+                                state=tk.DISABLED)
+            # Tk drops an image the moment nothing references it in Python.
+            view_state["_art_ref"] = art
+
+        # ── Physical links ────────────────────────────────────────────────
+        # Cyan dashes drawn only from L. A route never becomes a line here.
+        # The dash pattern is 5 on / 4 off, and the animation walks dashoffset
+        # by one full period so the travel loops seamlessly.
         link_width = max(1, int(2 * zoom))
-        
+
         for lk in links:
             src_1b = lk.get("S", 0)
             dst_1b = lk.get("D", 0)
             src_0b = src_1b - 1
             dst_0b = dst_1b - 1
-            
+
             if src_0b in positions and dst_0b in positions:
                 x1, y1 = positions[src_0b]
                 x2, y2 = positions[dst_0b]
                 tx1, ty1 = transform(x1, y1)
                 tx2, ty2 = transform(x2, y2)
-                canvas.create_line(tx1, ty1, tx2, ty2, fill=link_color, width=link_width)
+                canvas.create_line(tx1, ty1, tx2, ty2, fill=LINK_CYAN,
+                                   width=link_width, dash=(5, 4),
+                                   capstyle=tk.ROUND, tags=("link",))
 
         def draw_gear_icon(cx, cy, size, color="#ffffff", tags=()):
             teeth = 8
@@ -2668,7 +3533,7 @@ class PIGeneratorApp:
             # can't steal the <Leave> event from the pin under the cursor.
             tip = canvas.create_text(event.x + 16, event.y, anchor=tk.W,
                                      text="\n".join(lines), justify=tk.LEFT,
-                                     fill=EVE["fg_bright"], font=("Segoe UI", 9),
+                                     fill=EVE["fg_bright"], font=("Segoe UI", _fs(9)),
                                      tags=("tooltip",), state=tk.DISABLED)
             x1, y1, x2, y2 = canvas.bbox(tip)
             # Keep the tooltip inside the canvas
@@ -2684,49 +3549,146 @@ class PIGeneratorApp:
                                          width=1, tags=("tooltip",), state=tk.DISABLED)
             canvas.tag_raise(tip, bg)
 
+        # ── Route signals ─────────────────────────────────────────────────
+        # Directional commodity motion, shown only while a structure gives the
+        # network context — every route at once would be a coloured haystack.
+        # The path is real EVE route data; only colour and travel are ours.
+        def _live_pin_center(pin_idx):
+            """Où le bâtiment est *maintenant* à l'écran, d'après le canvas.
+
+            Pas via transform() : celui-ci fige le panoramique du moment du
+            dessin, or déplacer la carte ne redessine pas. Les signaux tracés
+            après un déplacement partaient donc de l'ancienne position et
+            filaient à côté de la colonie. La boîte du pin, elle, a bougé avec
+            lui, donc elle est toujours juste.
+            """
+            box = canvas.bbox(f"pin{pin_idx}")
+            if box is None:
+                return None
+            return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+
+        def _show_route_signals(pin_idx):
+            canvas.delete("signal")
+            focused_1b = pin_idx + 1
+            for route in template.get("R", []):
+                path = route.get("P") or []
+                if focused_1b not in path:
+                    continue
+                color = commodity_color(route.get("T"))
+                for step in range(len(path) - 1):
+                    src, dst = path[step] - 1, path[step + 1] - 1
+                    if src not in positions or dst not in positions:
+                        continue
+                    start = _live_pin_center(src)
+                    end = _live_pin_center(dst)
+                    if start is None or end is None:
+                        continue
+                    sx, sy = start
+                    dx_, dy_ = end
+                    # Tagged "map" at birth. These are drawn on hover, long
+                    # after the draw tagged everything else, so without this
+                    # they sat still while the colony panned out from under
+                    # them.
+                    #
+                    # Dash 3/4, not the web's 2/8: only the gap between two
+                    # plates is ever visible — about 9px — and a 2px dot every
+                    # 10px is usually not in that gap at all, so the flow was
+                    # running where nothing could see it.
+                    canvas.create_line(sx, sy, dx_, dy_, fill=color,
+                                       width=max(2, int(3 * zoom)), dash=(3, 4),
+                                       capstyle=tk.ROUND, tags=("signal", "map"),
+                                       state=tk.DISABLED)
+            # Under the buildings, over the links and the planet: a signal must
+            # never cover the structure whose network it is explaining.
+            if canvas.find_withtag("pinlayer"):
+                canvas.tag_lower("signal", "pinlayer")
+
+        # ── Crowding ──────────────────────────────────────────────────────
+        # A dashed red circle at the minimum-spacing radius on every crowded
+        # structure: it must not contain another structure. It persists — a
+        # colony left with buildings on top of each other must not look fine
+        # afterwards, exactly as an over-budget one does not.
+        crowded = set(crowded_pins(pins))
+        for pin_idx in crowded:
+            if pin_idx not in positions:
+                continue
+            cx_, cy_ = transform(*positions[pin_idx])
+            ring = MIN_SEPARATION * scale * zoom
+            canvas.create_oval(cx_ - ring, cy_ - ring, cx_ + ring, cy_ + ring,
+                               outline=EVE["red"], width=max(1, int(1.5 * zoom)),
+                               dash=(4, 3), tags=("crowd",), state=tk.DISABLED)
+
         for pin_idx, (x, y) in positions.items():
             pin = pins[pin_idx]
             sname = STRUCT_TYPE_TO_NAME.get(pin.get("T"))
             # Known structures render white; unknown type ids render grey "?"
             stroke = "#ffffff" if sname else "#888888"
+            # A crowded building says so on itself, not only via its ring.
+            if pin_idx in crowded:
+                stroke = EVE["red"]
             pin_tag = f"pin{pin_idx}"
+            tags = (pin_tag, "pinlayer")
 
             tx, ty = transform(x, y)
             r = node_radius * zoom
 
-            canvas.create_oval(tx - r - 5 * zoom, ty - r - 5 * zoom,
-                             tx + r + 5 * zoom, ty + r + 5 * zoom,
-                             outline=stroke, width=1, dash=(3, 3), tags=(pin_tag,))
-
+            # No dashed halo at rest. It used to ring every structure, which
+            # said nothing — and now that a dashed ring means "too close", one
+            # on every building would drown the only ring that carries meaning.
+            #
+            # A dark plate with a thin rim, not a bright white disc: the plate
+            # sits on artwork now, and a heavy white ring fought the planet for
+            # attention and won. The glyph carries the identity; the plate only
+            # has to be legible against whatever is behind it.
             canvas.create_oval(tx - r, ty - r, tx + r, ty + r,
-                             fill="#1a1a1a", outline=stroke, width=max(2, int(2.5 * zoom)),
-                             tags=(pin_tag,))
+                             fill=EVE["bg_panel"],
+                             outline=EVE["red"] if pin_idx in crowded else EVE["border_hi"],
+                             width=max(1, int(1.4 * zoom)), tags=tags)
 
-            icon_size = r * 0.7
+            icon_size = r * 0.58
             if sname == "Launch Pad":
-                draw_rocket_icon(tx, ty, icon_size, stroke, tags=(pin_tag,))
+                draw_rocket_icon(tx, ty, icon_size, stroke, tags=tags)
             elif sname == "Storage Facility":
-                draw_storage_icon(tx, ty, icon_size, stroke, tags=(pin_tag,))
+                draw_storage_icon(tx, ty, icon_size, stroke, tags=tags)
             elif sname == "Extractor Control Unit":
-                draw_crosshair_icon(tx, ty, icon_size, stroke, tags=(pin_tag,))
+                draw_crosshair_icon(tx, ty, icon_size, stroke, tags=tags)
             elif sname == "High-Tech Industry Facility":
-                draw_htf_icon(tx, ty, icon_size, stroke, tags=(pin_tag,))
+                draw_htf_icon(tx, ty, icon_size, stroke, tags=tags)
             elif sname in ("Basic Industry Facility", "Advanced Industry Facility"):
-                draw_gear_icon(tx, ty, icon_size, stroke, tags=(pin_tag,))
+                draw_gear_icon(tx, ty, icon_size, stroke, tags=tags)
             else:
                 font_size = max(8, int(r * 0.5))
                 canvas.create_text(tx, ty, text="?", fill=stroke,
                                  font=("Segoe UI Symbol", font_size, "bold"),
-                                 tags=(pin_tag,))
+                                 tags=tags)
 
-            canvas.tag_bind(pin_tag, "<Enter>",
-                            lambda e, i=pin_idx: _show_pin_tooltip(e, i))
-            canvas.tag_bind(pin_tag, "<Leave>",
-                            lambda e: canvas.delete("tooltip"))
+            def _enter(e, i=pin_idx):
+                _show_pin_tooltip(e, i)
+                _show_route_signals(i)
+
+            def _leave(_e):
+                canvas.delete("tooltip")
+                canvas.delete("signal")
+
+            canvas.tag_bind(pin_tag, "<Enter>", _enter)
+            canvas.tag_bind(pin_tag, "<Leave>", _leave)
+            # A press on a structure is a move, not a pan. "break" stops the
+            # canvas-wide pan binding from also claiming this gesture.
+            # Only the press is bound to the structure. Motion and release live
+            # on the canvas: a drag redraws the stage every frame, which deletes
+            # the very item the gesture started on, and an item binding would
+            # die with it mid-move.
+            on_grab = view_state.get("on_structure_grab")
+            if on_grab is not None:
+                canvas.tag_bind(pin_tag, "<Button-1>",
+                                lambda e, i=pin_idx: on_grab(e, i))
 
         # Everything drawn so far is the template itself — tag it so pan/zoom
         # can move/scale it as one group. The legend below stays fixed.
         canvas.addtag_all("map")
+        # …except the planet. "map" is exactly the set pan moves and zoom
+        # scales, so leaving the artwork out of it is what pins it in place.
+        canvas.dtag("planet", "map")
 
         legend_items = [
             ("Launch Pad", "rocket"),
@@ -2737,15 +3699,17 @@ class PIGeneratorApp:
             ("Extractor (ECU)", "crosshair"),
         ]
         
-        lx, ly = 12, ch - 140
-        canvas.create_rectangle(lx - 4, ly - 8, lx + 155, ly + len(legend_items) * 20 + 8,
+        row = _px(20)
+        lx, ly = 12, ch - (row * len(legend_items) + _px(40))
+        canvas.create_rectangle(lx - 4, ly - 8, lx + _px(155),
+                                ly + len(legend_items) * row + 8,
                                 fill=EVE["bg_panel"], outline=EVE["border"], width=1)
         canvas.create_text(lx + 2, ly, text="Legend", fill=EVE["accent"],
-                           font=("Segoe UI", 9, "bold"), anchor=tk.NW)
+                           font=("Segoe UI", _fs(9), "bold"), anchor=tk.NW)
         
         for j, (name, icon_type) in enumerate(legend_items):
-            ly2 = ly + 20 + j * 20
-            icx, icy = lx + 12, ly2
+            ly2 = ly + row + j * row
+            icx, icy = lx + _px(12), ly2
 
             canvas.create_oval(icx - 8, icy - 8, icx + 8, icy + 8,
                              fill="#1a1a1a", outline="#ffffff", width=1)
@@ -2769,11 +3733,11 @@ class PIGeneratorApp:
                 canvas.create_line(icx - 5, icy, icx + 5, icy, fill="#ffffff", width=1)
             
             canvas.create_text(lx + 28, ly2, text=name, fill=EVE["fg"],
-                             font=("Segoe UI", 8), anchor=tk.W)
+                             font=("Segoe UI", _fs(8)), anchor=tk.W)
 
         zoom_pct = int(zoom * 100)
         canvas.create_text(cw - 12, 14, text=f"{len(pins)} pins  •  {len(links)} links  •  {zoom_pct}%",
-                           fill=EVE["fg_dim"], font=("Segoe UI", 9), anchor=tk.NE)
+                           fill=EVE["fg_dim"], font=("Segoe UI", _fs(9)), anchor=tk.NE)
 
     def _open_region_scanner(self):
         """Ouvre le Proximity Scout : scan ESI des planètes dans un rayon de N sauts autour d'un système."""
@@ -2843,38 +3807,38 @@ class PIGeneratorApp:
         top.pack(fill=tk.X, pady=(0, 6))
 
         tk.Label(top, text="SYSTEM", bg=EVE["bg_card"], fg=EVE["accent"],
-                 font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT, padx=(10, 4), pady=8)
+                 font=("Segoe UI", _fs(8), "bold")).pack(side=tk.LEFT, padx=(10, 4), pady=8)
 
         sys_var = tk.StringVar(value=_last_system)
         sys_entry = tk.Entry(top, textvariable=sys_var,
                              bg=EVE["bg_input"], fg=EVE["fg_bright"],
                              insertbackground=EVE["accent"], relief=tk.FLAT,
-                             font=("Segoe UI", 11), width=16)
+                             font=("Segoe UI", _fs(11)), width=16)
         sys_entry.pack(side=tk.LEFT, pady=6)
 
         tk.Label(top, text="JUMPS", bg=EVE["bg_card"], fg=EVE["accent"],
-                 font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT, padx=(14, 4))
+                 font=("Segoe UI", _fs(8), "bold")).pack(side=tk.LEFT, padx=(14, 4))
         jumps_var = tk.IntVar(value=_last_jumps)
         jumps_spin = ttk.Spinbox(top, from_=0, to=10, textvariable=jumps_var,
-                                 width=4, font=("Segoe UI", 10))
+                                 width=4, font=("Segoe UI", _fs(10)))
         jumps_spin.pack(side=tk.LEFT, pady=6)
 
         status_var = tk.StringVar(value="Enter a system name and click Scan")
-        scan_btn = tk.Button(top, text="⟳  SCAN", font=("Segoe UI", 10, "bold"),
+        scan_btn = tk.Button(top, text="⟳  SCAN", font=("Segoe UI", _fs(10), "bold"),
                              bg=EVE["accent_dim"], fg=EVE["fg_bright"],
                              activebackground=EVE["accent"], activeforeground="white",
                              relief=tk.FLAT, cursor="hand2", padx=14)
         scan_btn.pack(side=tk.RIGHT, padx=10, pady=6)
 
         tk.Label(top, textvariable=status_var, bg=EVE["bg_card"],
-                 fg=EVE["fg_dim"], font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=10)
+                 fg=EVE["fg_dim"], font=("Segoe UI", _fs(9))).pack(side=tk.LEFT, padx=10)
 
         # ── Autocomplete dropdown (placed over body, not top) ─────────
         ac_frame = tk.Frame(body, bg=EVE["bg_card"],
                             highlightbackground=EVE["accent"], highlightthickness=1)
         ac_lb = tk.Listbox(ac_frame, bg=EVE["bg_input"], fg=EVE["fg_bright"],
                            selectbackground=EVE["accent_dim"], selectforeground="white",
-                           font=("Segoe UI", 10), relief=tk.FLAT, height=6,
+                           font=("Segoe UI", _fs(10)), relief=tk.FLAT, height=6,
                            activestyle="none", borderwidth=0)
         ac_lb.pack(fill=tk.BOTH, expand=True)
         ac_frame.place_forget()
@@ -2893,10 +3857,17 @@ class PIGeneratorApp:
 
         def _on_key(e=None):
             """Filtre les systèmes correspondant à la saisie et met à jour la liste d'autocomplétion."""
-            q = sys_var.get().strip().upper()
+            q = sys_var.get().strip()
             if len(q) < 2:
                 _hide_ac(); return
-            matches = [n for n in _SYSTEM_NAMES_CACHE if n.upper().startswith(q)][:10]
+            # The snapshot also matches mid-name, which the old prefix-only scan
+            # of the downloaded name list could not: "anoo" now finds Tanoo.
+            universe = _offline_universe()
+            if universe is not None:
+                matches = universe.suggest(q, limit=10)
+            else:
+                matches = [n for n in _SYSTEM_NAMES_CACHE
+                           if n.upper().startswith(q.upper())][:10]
             if not matches:
                 _hide_ac(); return
             ac_lb.delete(0, tk.END)
@@ -2944,7 +3915,7 @@ class PIGeneratorApp:
         filt.pack(fill=tk.X, pady=(0, 6))
 
         tk.Label(filt, text="SHOW", bg=EVE["bg_card"], fg=EVE["accent"],
-                 font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT, padx=(10, 6), pady=6)
+                 font=("Segoe UI", _fs(8), "bold")).pack(side=tk.LEFT, padx=(10, 6), pady=6)
 
         type_btns = {}
 
@@ -2975,14 +3946,14 @@ class PIGeneratorApp:
             _apply_filter()
 
         for t in PLANET_ORDER:
-            b = tk.Button(filt, text=t.upper(), font=("Segoe UI", 8, "bold"),
+            b = tk.Button(filt, text=t.upper(), font=("Segoe UI", _fs(8), "bold"),
                           relief=tk.FLAT, cursor="hand2", padx=4, pady=1,
                           borderwidth=0, highlightthickness=0,
                           command=lambda t=t: _toggle_type(t))
             b.pack(side=tk.LEFT, padx=1, pady=6)
             type_btns[t] = b
 
-        tk.Button(filt, text="ALL", font=("Segoe UI", 8, "bold"),
+        tk.Button(filt, text="ALL", font=("Segoe UI", _fs(8), "bold"),
                   bg=EVE["bg_input"], fg=EVE["accent"], relief=tk.FLAT,
                   cursor="hand2", padx=8, pady=1, borderwidth=0,
                   highlightthickness=0, command=_all_types).pack(side=tk.RIGHT, padx=(4, 10))
@@ -3055,8 +4026,8 @@ class PIGeneratorApp:
             if sec >= 0.1:  return "#e0a030"
             return "#cc4444"
 
-        CARD_H = 46
-        ICON_PX = 36
+        CARD_H = _px(46)
+        ICON_PX = _px(36)
 
         def _make_planet_card(parent, planet_data):
             """Carte compacte d'une planète : vignette, nom, type et rayon — rien d'autre."""
@@ -3090,19 +4061,30 @@ class PIGeneratorApp:
                                      fill=color, outline=_lighten(color, 30))
 
                 card.create_text(58, 9, anchor=tk.NW, text=pname,
-                                 fill=EVE["fg_bright"], font=("Segoe UI", 11))
+                                 fill=EVE["fg_bright"], font=("Segoe UI", _fs(11)))
                 card.create_text(58, 27, anchor=tk.NW, text=ptype.upper(),
-                                 fill=color, font=("Segoe UI", 8, "bold"))
+                                 fill=color, font=("Segoe UI", _fs(8), "bold"))
 
                 r_text = f"{int(pradius):,} km" if pradius else "—"
-                card.create_text(w - 12, h // 2, anchor=tk.E, text=r_text,
-                                 fill="#e8d48a" if pradius else EVE["fg_dim"],
-                                 font=("Consolas", 13, "bold"))
+                # The prompt takes the radius' place on hover: the number is
+                # what you scan for, the action is what you do once you have it.
+                if state["hovered"]:
+                    card.create_text(w - 12, h // 2, anchor=tk.E,
+                                     text="▶  BUILD HERE",
+                                     fill=EVE["accent"], font=("Segoe UI", _fs(9), "bold"))
+                else:
+                    card.create_text(w - 12, h // 2, anchor=tk.E, text=r_text,
+                                     fill="#e8d48a" if pradius else EVE["fg_dim"],
+                                     font=("Consolas", _fs(13), "bold"))
 
             # <Configure> fires when the canvas first gets its real width
             card.bind("<Configure>", lambda e: _draw())
-            card.bind("<Enter>", lambda e: _draw(hovered=True))
+            card.bind("<Enter>", lambda e: (_draw(hovered=True),
+                                            card.config(cursor="hand2")))
             card.bind("<Leave>", lambda e: _draw(hovered=False))
+            card.bind("<Button-1>",
+                      lambda e: self._build_on_scouted_planet(ptype, pradius,
+                                                              pname, popup))
 
             return card
 
@@ -3115,7 +4097,7 @@ class PIGeneratorApp:
             if not systems_data:
                 tk.Label(cards_frame, text="No systems found.",
                          bg=EVE["bg_deep"], fg=EVE["fg_dim"],
-                         font=("Segoe UI", 11)).pack(pady=40)
+                         font=("Segoe UI", _fs(11))).pack(pady=40)
                 status_var.set("No results.")
                 _sync_scroll(reset=True)
                 return
@@ -3166,26 +4148,26 @@ class PIGeneratorApp:
                 arrow_var = tk.StringVar(value="▼" if filtering else "▶")
                 arrow_lbl = tk.Label(hdr, textvariable=arrow_var,
                                      bg=EVE["bg_card"], fg=EVE["accent"],
-                                     font=("Segoe UI", 9, "bold"), width=2)
+                                     font=("Segoe UI", _fs(9), "bold"), width=2)
                 arrow_lbl.pack(side=tk.LEFT, padx=(8, 2), pady=6)
 
                 tk.Label(hdr, text=sname, bg=EVE["bg_card"],
                          fg=EVE["fg_bright"],
-                         font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT, padx=4)
+                         font=("Segoe UI", _fs(10), "bold")).pack(side=tk.LEFT, padx=4)
                 tk.Label(hdr, text=f"{sec:.2f}", bg=EVE["bg_card"],
                          fg=_sec_color(sec),
-                         font=("Segoe UI", 9)).pack(side=tk.LEFT)
+                         font=("Segoe UI", _fs(9))).pack(side=tk.LEFT)
 
                 planet_types_str = "  ·  ".join(
                     sorted(set(p.get("type","?") for p in planets)))
                 tk.Label(hdr, text=f"  {planet_types_str}",
                          bg=EVE["bg_card"], fg=EVE["fg_dim"],
-                         font=("Segoe UI", 8)).pack(side=tk.LEFT)
+                         font=("Segoe UI", _fs(8))).pack(side=tk.LEFT)
 
                 jlbl = f"  {jdist} jump{'s' if jdist!=1 else ''}" if jdist else "  ★ origin"
                 tk.Label(hdr, text=jlbl + f"  ·  {len(planets)}p",
                          bg=EVE["bg_card"], fg=EVE["fg_dim"],
-                         font=("Segoe UI", 8)).pack(side=tk.RIGHT, padx=10)
+                         font=("Segoe UI", _fs(8))).pack(side=tk.RIGHT, padx=10)
 
                 # ── Planet cards container ────────────────────────────
                 cards_container = tk.Frame(section, bg=EVE["bg_deep"])
@@ -3218,7 +4200,7 @@ class PIGeneratorApp:
             if not total_planets:
                 tk.Label(cards_frame, text="No planet matches the type filter.",
                          bg=EVE["bg_deep"], fg=EVE["fg_dim"],
-                         font=("Segoe UI", 11)).pack(pady=40)
+                         font=("Segoe UI", _fs(11))).pack(pady=40)
                 status_var.set("No planet matches the type filter.")
             else:
                 status_var.set(f"{total_planets} planets · {shown_systems} systems")
@@ -3255,6 +4237,24 @@ class PIGeneratorApp:
 
             def _bg():
                 try:
+                    # The bundled SDE snapshot answers every question a scan asks
+                    # — names, stargates, planet types and radii — so when it is
+                    # present nothing here touches the network, and nothing is
+                    # cached to disk either: the source is already local.
+                    universe = _offline_universe()
+                    if universe is not None:
+                        start_id = universe.resolve(sys_name)
+                        if not start_id:
+                            popup.after(0, lambda: status_var.set(f"'{sys_name}' not found."))
+                            popup.after(0, _reset_btn)
+                            return
+                        popup.after(0, lambda: status_var.set("Walking the jump network…"))
+                        systems_data = universe.scan(start_id, jumps)
+                        popup.after(0, lambda: _render_results(systems_data))
+                        _update_window_config("scanner_last_system", sys_name)
+                        _update_window_config("scanner_last_jumps", jumps)
+                        return
+
                     # Radii must be loaded before scanning (and before reading a
                     # cache, which gets its missing radii backfilled from them)
                     _ensure_planet_radii()
@@ -3344,9 +4344,15 @@ class PIGeneratorApp:
 
         scan_btn.config(command=do_scan)
 
-        # Pre-warm caches in background: system names + planet radii
-        threading.Thread(target=_ensure_system_names, daemon=True).start()
-        threading.Thread(target=_ensure_planet_radii, daemon=True).start()
+        # Pre-warm in background. With the snapshot present that is one 2.6 MB
+        # parse and no network at all; the ESI downloads are only for the
+        # fallback path, so asking for them anyway would download 8 MB of radii
+        # nothing is going to read.
+        if _offline_universe() is None:
+            threading.Thread(target=_ensure_system_names, daemon=True).start()
+            threading.Thread(target=_ensure_planet_radii, daemon=True).start()
+        else:
+            threading.Thread(target=_offline_universe, daemon=True).start()
 
         popup.lift()
         popup.focus_force()
@@ -3356,6 +4362,9 @@ class PIGeneratorApp:
 
 def main():
     """Point d'entrée : crée la fenêtre Tk et démarre la boucle principale."""
+    # Avant toute construction : les tailles de police sont figées au moment où
+    # chaque widget est créé.
+    _load_ui_scale()
     root = tk.Tk()
     app = PIGeneratorApp(root)
     root.mainloop()

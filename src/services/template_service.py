@@ -438,6 +438,136 @@ def factory_clamp_note(requested, built, pads, arm_len=None):
     return None
 
 
+# La structure qui mange du P0 : elle seule mesure ce que le sol nourrit.
+P0_CONSUMER = "Basic Industry Facility"
+
+
+class Shortfall(NamedTuple):
+    """Un P0 que la colonie ne sait pas creuser elle-même."""
+    name: str
+    per_hour: float
+
+
+class Coverage(NamedTuple):
+    """Ce que l'extraction nourrit vraiment, et ce qu'il faut importer."""
+    fed: int          # usines réellement alimentées, arrondi vers le bas
+    total: int
+    shortfalls: tuple  # de Shortfall, plus gros manque d'abord
+
+
+def factory_coverage(analysis):
+    """Dit quelle part de sa propre demande en P0 la colonie extrait.
+
+    Une colonie a le droit de faire tourner plus d'usines que ses têtes ne le
+    permettent — on importe la différence, et le générateur l'a toujours
+    autorisé. Ce qui manquait, c'était de le dire : le déficit n'apparaissait
+    que comme une quantité dans le bloc HAUL IN, qui se lit pareil qu'il
+    s'agisse d'un import voulu ou d'extracteurs à la traîne.
+
+    Seul le P0 compte. Une colonie P0 → P2 sur une planète dépourvue d'un de ses
+    P0 importe ce P1 par conception et ne construit aucune usine basique pour
+    lui ; compter ce P1 reviendrait à râler contre un plan qui marche.
+
+    Renvoie None quand il n'y a rien à dire : pas d'usine, ou le sol suffit.
+    """
+    total = analysis.get("structures", {}).get(P0_CONSUMER, 0)
+    if total == 0:
+        return None
+
+    shortfalls = tuple(sorted(
+        (Shortfall(n, q) for n, q in analysis.get("imports", {}).items()
+         if get_tier(n) == "P0"),
+        key=lambda s: s.per_hour, reverse=True))
+    if not shortfalls:
+        return None
+
+    # Le P0 le plus mal couvert fixe le compte : une colonie qui en demande deux
+    # ne tourne qu'au rythme de celui qui s'épuise le premier.
+    produced = analysis.get("produced", {})
+    ratios = [1.0 if qty <= 0 else produced.get(name, 0.0) / qty
+              for name, qty in analysis.get("consumed", {}).items()
+              if get_tier(name) == "P0"]
+    covered = min(ratios) if ratios else 1.0
+
+    return Coverage(fed=max(0, min(total, int(math.floor(total * covered)))),
+                    total=total, shortfalls=shortfalls)
+
+
+def factory_coverage_note(coverage):
+    """Rend la couverture en deux phrases, ou None si elle est absente.
+
+    L'inverse d'un refus : la colonie *est* ce qui a été demandé, et ceci dit ce
+    que la faire tourner coûte en transport.
+    """
+    if coverage is None:
+        return None
+    noun = "factory is" if coverage.total == 1 else "factories are"
+    title = f"{coverage.fed} of {coverage.total} {noun} fed by extraction."
+    # Rien n'est nourri : « le reste » n'aurait aucun antécédent.
+    subject = "The rest" if coverage.fed else "They"
+    needs = ", ".join(f"{s.per_hour:,.0f}/h of {s.name}"
+                      for s in coverage.shortfalls)
+    return title, f"{subject} need {needs} hauled in."
+
+
+# Compteurs manuels, dans l'ordre où la note d'échec les accuse. « Heads » vient
+# en tête : c'est le champ qui coûte le plus d'énergie par point (550 MW × un
+# par extracteur) et donc le coupable habituel d'un budget dépassé.
+_MANUAL_FIELDS = (
+    ("heads", "Heads", "per extractor"),
+    ("factories", "Factories", None),
+    ("extractors", "Extractors", None),
+    ("launch_pads", "Pads", None),
+    ("arm_length", "Arm len", None),
+)
+
+
+def infeasible_note(product_name, chain_name, planet_type, cc_level,
+                    planet_diameter, layout=None, use_sf=False):
+    """Dit en une ligne pourquoi la génération a échoué.
+
+    Les générateurs ne renvoient que None : impossible, vu de l'appelant, de
+    distinguer « le CC est trop petit pour cette chaîne » d'un compteur manuel
+    hors budget. On rejoue donc la génération en relâchant un compteur à la
+    fois. Si relâcher un champ suffit, c'est lui le coupable et on cherche la
+    plus grande valeur qui passe encore ; si tout relâcher échoue quand même,
+    c'est bien le CC. Renvoie None quand la config génère normalement.
+    """
+    def _fits(overrides):
+        cfg = dict(layout or {})
+        cfg.update(overrides)
+        try:
+            return generate_template_json(
+                product_name, chain_name, planet_type, cc_level,
+                planet_diameter, use_sf=use_sf, layout=cfg) is not None
+        except Exception:
+            return False
+
+    if _fits({}):
+        return None
+
+    asked = {key: (layout or {}).get(key) for key, _, _ in _MANUAL_FIELDS}
+    asked = {k: v for k, v in asked.items() if v}
+    # Nothing manual to blame, or the colony fails even wide open: the command
+    # center really is too small for this chain.
+    if not asked or not _fits({k: None for k in asked}):
+        return f"Does not fit a level {cc_level} command center"
+
+    for key, label, unit in _MANUAL_FIELDS:
+        want = asked.get(key)
+        if not want or not _fits({key: None}):
+            continue
+        # Every other count stays as asked, so the ceiling reported is the one
+        # that applies to *this* colony, not to a hypothetical empty planet.
+        best = max((n for n in range(1, want) if _fits({key: n})), default=0)
+        where = f" {unit}" if unit else ""
+        if best:
+            return (f"{label} {want}{where} does not fit — "
+                    f"{best} is the most that fits here")
+        return f"{label} {want}{where} does not fit here"
+    return f"These counts do not fit a level {cc_level} command center"
+
+
 # Tier(s) at which each chain's bill of materials stops decomposing.
 # P4 recipes can require P1 directly (e.g. Reactive Metals in Nano-Factory),
 # so P4 chains also stop at P1.
@@ -757,8 +887,11 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, opti
     sf_1b = None
     sf_pins = []
     if use_sf:
+        # Stacked away from the hub row, not along it: the first storage becomes
+        # the hub, and the factories fill that same row at +/- step * sp, so a
+        # second storage placed at i * sp would land exactly on a factory.
         for i in range(num_sf):
-            pins.append(_make_pin(CENTER_LAT + sp * 0.6, i * sp, sf_type))
+            pins.append(_make_pin(CENTER_LAT + sp * (0.6 + i), 0.0, sf_type))
             sf_pins.append(len(pins))
         sf_1b = sf_pins[0]
 
@@ -851,8 +984,12 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, opti
     for extra_lp in lp_pins[1:]:
         links.append({"D": lp_1b, "Lv": 0, "S": extra_lp})
     if use_sf:
-        for sf_pin in sf_pins:
-            links.append({"D": lp_1b, "Lv": 0, "S": sf_pin})
+        # Chained, so every storage link stays one spacing long — the budget
+        # above charges one spacing per storage, and a star back to the pad
+        # would run a long link straight through the storages below it.
+        for i, sf_pin in enumerate(sf_pins):
+            links.append({"D": lp_1b if i == 0 else sf_pins[i - 1],
+                          "Lv": 0, "S": sf_pin})
         for ecu_pin in ecu_pins:
             links.append({"D": sf_1b, "Lv": 0, "S": ecu_pin})
     else:
@@ -2019,6 +2156,18 @@ class TemplateService:
             config["planet_diameter"],
             use_sf=config.get("use_sf", use_sf),
             layout=config.get("layout"),
+        )
+
+    def why_not(self, config: dict[str, Any], *, use_sf: bool = False) -> Optional[str]:
+        """Raison lisible de l'échec de `generate` sur cette même config."""
+        return infeasible_note(
+            config["product_name"],
+            config["chain_name"],
+            config["planet_type"],
+            config["cc_level"],
+            config["planet_diameter"],
+            layout=config.get("layout"),
+            use_sf=config.get("use_sf", use_sf),
         )
 
     def get_supply_chain(self, product_name: str, chain_name: str) -> dict:

@@ -230,6 +230,59 @@ def _too_close(model, la, lo, sp):
     return any(pin_angle(probe, p) < 0.6 * sp for p in model.pins)
 
 
+# Distance en deçà de laquelle la colonie signale un chevauchement, en radians.
+#
+# Un seuil qui *marque* un placement, jamais qui le refuse : quelqu'un qui
+# déplace une structure choisit où elle va, et on a tranché pareil pour le
+# budget CPU/énergie — on laisse dépasser, on montre en rouge.
+#
+# Fixe, contrairement à _too_close qui se mesure à l'espacement médian du
+# template. Cette règle relative est juste pour add_factory et add_hub, qui
+# choisissent une position *à la place* de l'utilisateur et ont besoin d'un
+# creux libre — pas la même question qu'un déplacement délibéré.
+MIN_SEPARATION = 0.012 * 0.6  # BASE_SPACING * 0.6
+
+
+def crowded_pins(pins):
+    """Indices de toutes les structures posées à moins de MIN_SEPARATION d'une autre.
+
+    Prend des coordonnées et non un ColonyModel, pour qu'un écran puisse
+    interroger un template sans le parser à chaque rendu, et pour que la règle
+    soit triviale à tester. Une seule définition de « trop près », valable
+    pendant le glisser comme sur le document au repos.
+    """
+    from src.services.template_service import pin_angle
+    crowded = set()
+    for left in range(len(pins)):
+        for right in range(left + 1, len(pins)):
+            if pin_angle(pins[left], pins[right]) < MIN_SEPARATION:
+                crowded.add(left)
+                crowded.add(right)
+    return sorted(crowded)
+
+
+def move_pin(model, pin_idx, la, lo):
+    """Repose une structure à une position absolue.
+
+    Absolue et non relative : l'appelant possède la traduction d'un geste en
+    position, l'édition possède la validité de cette position — c'est ce qui
+    permet de la tester sans pointeur. Ne refuse jamais pour cause de
+    proximité ; crowded_pins s'en charge après coup.
+    """
+    if isinstance(pin_idx, bool) or not isinstance(pin_idx, int) \
+            or not 0 <= pin_idx < len(model.pins):
+        raise EditError(f"no structure at index {pin_idx}")
+    for value in (la, lo):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or value != value or value in (float("inf"), float("-inf")):
+            raise EditError("a structure needs a finite latitude and longitude")
+
+    tpl = _working_copy(model)
+    tpl["P"][pin_idx]["La"] = round(la, 5)
+    tpl["P"][pin_idx]["Lo"] = round(lo, 5)
+    return parse_colony(tpl)
+
+
 def _free_spot_near(model, anchor_idx, sp):
     """Première position libre autour d'un pin, à un espacement du template."""
     a = model.pins[anchor_idx]
