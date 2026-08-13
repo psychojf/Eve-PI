@@ -4,17 +4,19 @@ A desktop tool for EVE Online players that generates ready-to-import Planetary I
 
 ## Features
 
+- **Starts empty** — Nothing is chosen on arrival, so the tool never opens describing a colony you did not ask for
 - **Template Generation** — Produces JSON templates for any PI product (P1–P4) across all planet types and Command Center levels (0–5)
 - **Eight Production Chains** — `P0→P1`, `P0→P2`, `P1→P2`, `P1→P3`, `P2→P3`, `P1→P4`, `P2→P4`, `P3→P4`
 - **Colonies sized to work, not just to fit** — Factory counts follow what the extractors actually produce and how often you are willing to collect, rather than filling the CPU budget with factories that would starve
 - **Manual override with live validation** — Set exact structure counts yourself, arm length included; the layout panel reports CPU, power, link load, material balance and how long the colony runs untended instead of silently refusing
 - **Routes that drain the right pad first** — Every factory pulls from its own launch pad before any other, so multi-pad colonies consume in parallel instead of emptying one pad while the rest sit full
-- **Bill of Materials** — One factory's recipe, plus the whole colony's hourly throughput: what it extracts, what you must haul in, and what you collect — so you can size one planet against another
+- **Bill of Materials** — One factory's recipe, plus the whole colony's throughput both per hour and **per collection trip** — what it extracts, what you must haul in, what you collect. The per-trip column is the number you load a hauler against, and it is capped at what storage actually survives: ask 48h of a colony that jams at 33 and it says so and computes for 33
 - **Extraction coverage** — When a colony runs more factories than its heads support, the BOM says so in words (*"6 of 7 factories are fed by extraction; the rest need 2,000/h of Planktic Colonies hauled in"*). The shortfall was always in the haul-in figures, but a quantity there reads the same whether it is a deliberate import or the extractors falling behind
 - **Assign P2 per factory** — For `P1→P2`, give each Advanced Industry Facility its own P2 on the proven layout: only the schematics and route payloads are rewritten, never the pins, links or route paths. Comes with an aggregated P1 shopping list, P2 output totals, factory allocation, and how many whole hourly cycles a full launch-pad load runs
 - **Visual Preview** — The colony drawn on real planet artwork, at a fixed scale so buildings keep their size no matter how big the colony gets. Cyan links flow along their dashes, hovering a structure lights its routes in per-commodity colours, and anything placed too close wears a red ring
-- **Move structures by hand** — Drag any building on the map; CPU and power update *during* the drag, and the result can be copied, saved or resumed later. Crowding is shown, never refused — landing on a neighbour is your call, the same way an over-budget colony is
-- **Proximity Scout** — Scans every system within N jumps and lists their planets with type icons and radii, filterable by planet type. Runs entirely from a bundled SDE snapshot (8,490 systems, 67,693 PI planets): no network, no ESI outage, a 4-jump scan in under a millisecond. Click any planet to build a template for it, with its type *and* radius carried across
+- **Move structures by hand** — Drag any building on the map; CPU and power update *during* the drag, and the result can be copied, saved to the library or resumed later. Crowding is shown, never refused — landing on a neighbour is your call, the same way an over-budget colony is
+- **The result window follows the settings** — Change a factory or pad count with it open and the map, the budget and the JSON all redraw. Nothing to regenerate
+- **Proximity Scout** — Scans every system within N jumps and lists their planets with type icons and radii. Runs entirely from a bundled SDE snapshot (8,490 systems, 67,693 PI planets): no network, no ESI outage, a 4-jump scan in under a millisecond. Choose the P1 you mean to extract and the planet filter narrows to the types that carry its raw material, disabling the rest. Click any planet to build for it, with its type *and* radius carried across
 - **History** — Always on. Every generate and every hand-made move is recorded, so stopping and coming back is not a decision you have to make in advance. Resume any state, or promote it into the library under a name
 - **Template Library** — Your own colonies, saved from History or from the editor
 - **Template Editor** — Edit any library or pasted template: five structure counters plus radius, Command Center level and name, validated live rather than blocked; *Fit to planet* trims until the colony fits, and the result copies out, saves into EVE's template folder, or joins the library under a new Custom category
@@ -130,27 +132,26 @@ python -m unittest discover -s tests
 Stdlib `unittest` only — no test dependency is installed, and none belongs in
 `requirements.txt`, which `build.spec` ships into the executable. The suite
 covers the link cost model against readings taken in-game, the throughput
-grouping, the arm-length override with its link-capacity guard and local-first
-route order, and a sweep asserting that every chain × product × planet builds a
-colony inside its CPU and power budget at small, medium and large planet radii.
-That last one is the guard against generating templates EVE will refuse.
+grouping and the per-trip figures, the arm-length override with its
+link-capacity guard and local-first route order, the colony model's round-trip
+identity and edit invariants, the offline Scout, the mixed-P2 planner and the
+work history — plus a sweep asserting that every chain × product × planet
+builds a colony inside its CPU and power budget at small, medium and large
+planet radii. That last one is the guard against generating templates EVE will
+refuse.
 
-Two extra tools, neither part of the unittest run:
+Two things the unittest run does not cover:
 
-- `python tests/golden.py` captures every product × chain × planet template to
-  `tests/baseline_golden.json`; `python tests/golden.py compare` diffs the
-  current code against it. Run the capture before a refactor and the compare
-  after, and unrelated layouts are provably untouched. ~1,000 templates,
-  about a minute. The baseline is a local working artifact, not something to
-  keep.
-- Five smoke harnesses drive the real Tk app: `ui_smoke.py` (BOM and layout
-  canvases, plus the BOM's reflow on resize), `map_smoke.py` (artwork, flowing
-  links, route signals, drag, crowding), `mixed_ui_smoke.py`,
-  `scout_build_smoke.py` and `history_ui_smoke.py`. The UI can only be
-  exercised from inside `mainloop()` — a `root.update()` polling loop makes the
-  app's worker threads die with "main thread is not in main loop". They read
-  the canvases back rather than trusting the code, which is the only way to
-  catch things like text drawn past the edge of its panel.
+- `python tests/golden.py` captures every product × chain × planet template and
+  `python tests/golden.py compare` diffs the current code against it. Run the
+  capture before a refactor and the compare after, and unrelated layouts are
+  provably untouched. ~1,000 templates, about a minute.
+- A set of smoke harnesses drive the real Tk app and read the canvases back,
+  which is the only way to catch things a unit test cannot see — text drawn past
+  the edge of its panel, a window that will not resize, a tooltip left floating.
+  The UI can only be exercised from inside `mainloop()`: a `root.update()`
+  polling loop makes the app's worker threads die with "main thread is not in
+  main loop".
 
 ## Compiled Executable
 
@@ -186,25 +187,6 @@ PI/
 │   │   └── history.py           # Always-on record of what you were working on
 │   └── ui/
 │       └── template_editor.py   # Template Editor window
-├── tests/
-│   ├── test_link_cost.py        # Link cost model vs readings taken in-game
-│   ├── test_throughput.py       # BOM panel throughput grouping
-│   ├── test_sweep.py            # Every chain builds an importable colony
-│   ├── test_arm_length.py       # Arm-length override, link capacity, route order
-│   ├── test_layout_clamp.py     # Manual factory count trimmed by pad geometry
-│   ├── test_colony_model.py     # Round-trip identity across the whole corpus
-│   ├── test_colony_edits.py     # Edit invariants + Fit to planet sweep
-│   ├── test_colony_move.py      # move_pin, crowded_pins, MIN_SEPARATION
-│   ├── test_factory_coverage.py # The extraction-coverage sentence
-│   ├── test_mixed_p2.py         # Per-factory P2 rewrite + batch summary
-│   ├── test_scout_universe.py   # Offline resolve / jump walk / scan shape
-│   ├── test_history.py          # Recording, dedup, cap, persistence
-│   ├── golden.py                # Capture/compare every generated template
-│   ├── ui_smoke.py              # Drives the real Tk app, dumps the canvases
-│   ├── map_smoke.py             # Artwork, links, signals, drag, crowding
-│   ├── mixed_ui_smoke.py        # The Assign-P2-per-factory window
-│   ├── scout_build_smoke.py     # Build-from-a-scanned-planet carry-over
-│   └── history_ui_smoke.py      # Work → close → resume → save to library
 ├── docs/superpowers/            # Design specs and implementation plans
 └── data/
     ├── planet_icons/            # CCP planet renders, one per planet type

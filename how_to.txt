@@ -20,6 +20,14 @@ GENERATE TEMPLATE, PROXIMITY SCOUT and TEMPLATE LIBRARY.
 
 -----------------------------------------------------------
 STEP 1 — GENERATING A TEMPLATE
+
+NOTHING IS CHOSEN WHEN YOU OPEN THE TOOL
+
+  Product reads "Choose a product...", and chain and planet
+  are blank. That is deliberate: the tool should not open
+  describing a colony you never asked for, and the Proximity
+  Scout uses the difference to tell "I am starting a build"
+  from "I opened this to go find a planet".
 -----------------------------------------------------------
 
 Work down the numbered panels:
@@ -259,6 +267,28 @@ WHAT THE LINES MEAN
   light up too, one colour per commodity, so you can follow
   where a material actually goes.
 
+IT FOLLOWS YOUR SETTINGS
+
+  Leave this window open, go back to the main panel and
+  change the factory or pad count: the map, the CPU/PWR
+  figures and the JSON all redraw here. You do not have to
+  generate again.
+
+  One exception worth knowing: if you have dragged a
+  building by hand and then change a count, the regenerated
+  colony replaces your arrangement -- the generator has no
+  way to keep hand placement. It is not lost, every drag is
+  recorded in HISTORY.
+
+SAVING IT
+
+  "Save to Library" sits next to Reset View. It asks for a
+  name and stores the colony as "Custom - <name>.json", so
+  it appears in TEMPLATE LIBRARY straight away.
+
+  It saves what is on screen -- including any building you
+  dragged -- not the template the window opened with.
+
 MOVING A BUILDING
 
   Drag any structure to move it. The CPU and power figures
@@ -320,7 +350,23 @@ with how many of each, followed by INPUTS — one factory's
 recipe for one cycle, the same numbers EVE shows you in the
 facility window.
 
-The blocks below it describe the WHOLE colony, per hour:
+PER HOUR, AND PER TRIP
+
+  Each row shows two numbers: the hourly rate, and what that
+  comes to over one collection trip. The per-trip figure is
+  the one you load a hauler against.
+
+  It is capped at what storage actually survives. Ask for
+  48h from a colony whose pads fill in 33 and you get:
+
+    Storage lasts 33.2h, not the 48h asked for -- the trip
+    figures below are for 33.2h, after which the colony jams.
+
+  That is not a smaller haul, it is 15 hours of a jammed
+  factory. The figures are computed at 33.2h so the number
+  you act on is the honest one.
+
+The blocks below it describe the WHOLE colony:
 
   - "EXTRACTED ON-PLANET" (green) — what your extractor
     heads pull out of the ground each hour

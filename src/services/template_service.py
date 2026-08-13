@@ -438,6 +438,33 @@ def factory_clamp_note(requested, built, pads, arm_len=None):
     return None
 
 
+class Trip(NamedTuple):
+    """L'intervalle de ramassage qu'il vaut vraiment la peine de planifier."""
+    requested: float    # ce qui a été demandé, en heures
+    effective: float    # ce que la colonie tient réellement, sans surveillance
+    capped: bool        # vrai quand le stockage lâche avant l'échéance demandée
+
+
+def trip_interval(analysis, requested):
+    """Borne l'intervalle demandé à ce que le stockage encaisse.
+
+    « buffer_hours » est le temps que les pads et les entrepôts tiennent avant
+    que les entrées soient à sec ou que les sorties débordent. Demander une
+    tournée de 48 h à une colonie qui sature en 33, ce n'est pas un plus gros
+    convoi : c'est 15 heures d'usine bloquée. Les quantités par tournée se
+    calculent donc sur le plus petit des deux, et l'écran dit lequel.
+
+    On ne touche pas au réglage de l'utilisateur : « collection_hours » est une
+    *entrée* du générateur — il dimensionne les pads — et réécrire en douce un
+    champ que quelqu'un a réglé est précisément ce qu'il ne faut pas faire.
+    """
+    buffer_hours = analysis.get("buffer_hours", float("inf"))
+    capped = math.isfinite(buffer_hours) and buffer_hours < requested
+    return Trip(requested=requested,
+                effective=buffer_hours if capped else requested,
+                capped=capped)
+
+
 # La structure qui mange du P0 : elle seule mesure ce que le sol nourrit.
 P0_CONSUMER = "Basic Industry Facility"
 

@@ -2,7 +2,9 @@
 # Based on Planetary_Interaction_PI_Template_Generator_1_0_8.xlsx by Razkin, Pandemic Horde
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, simpledialog
+import tkinter.font as tkfont
 import colorsys
+import copy
 import json
 import math
 import os
@@ -54,6 +56,7 @@ from src.services.template_service import (
     factory_clamp_note,
     factory_coverage,
     factory_coverage_note,
+    trip_interval,
     PRODUCTION_FACILITIES,
     get_full_supply_chain,
     get_tier,
@@ -367,6 +370,25 @@ def get_base_path():
 # dessinées à la main. Lu au démarrage depuis pi_config.json et modifiable
 # dans les Paramètres.
 UI_SCALE = 1.0
+
+# Le libellé du choix vide, comme sur le site. Ce n'est pas un produit : tant
+# qu'il est sélectionné, l'outil ne décrit aucune colonie.
+CHOOSE_PRODUCT = "Choose a product…"
+
+# La seule chaîne dont le type de planète décide vraiment : elle mine son P0
+# sur place. Les chaînes d'usine importent leurs entrées et tournent partout.
+EXTRACTION_CHAIN = "P0 → P1 (Extraction)"
+
+
+def _num(value):
+    """Comme `toLocaleString("en-US", {maximumFractionDigits: 2})` du webtool.
+
+    Deux décimales au plus, et jamais de zéros de queue : 5319.15 -> « 5,319.15 »,
+    160.0 -> « 160 ». C'est le formateur du site, repris tel quel pour que les
+    deux affichent exactement le même nombre.
+    """
+    text = f"{value:,.2f}"
+    return text.rstrip("0").rstrip(".") if "." in text else text
 
 
 def _fs(size):
@@ -951,6 +973,9 @@ class PIGeneratorApp:
         self._full_height = 0
         self._main_frame = None
         self._template_service = TemplateService()
+        # The open result window, if any, and its pending redraw.
+        self._live_popup = None
+        self._live_sync_job = None
         # Always on. Work you did not deliberately name is exactly the work
         # that used to be lost when a window closed.
         self._history = History(os.path.join(get_base_path(), "data",
@@ -960,23 +985,33 @@ class PIGeneratorApp:
         self.root.attributes("-topmost", True)
 
         cfg = _load_window_config()
-        self._current_theme = cfg.get("theme", THEME_DEFAULT)
+        # `or`, not a get() default: a config carrying an explicit null still
+        # has the key, so the default never applied and the theme resolved to
+        # None — which silently fell back to the stock palette.
+        self._current_theme = cfg.get("theme") or THEME_DEFAULT
         self.alpha = cfg.get("alpha", 0.90)
         apply_theme_colors(self._current_theme)
         
         # Restore position from config; height auto-fits after content loads
         saved_geom = cfg.get("main_geometry", f"{_px(420)}x{_px(600)}")
+        # A size reached by dragging the edges is honoured on the way back in;
+        # one the window chose for itself is not, so it stays free to re-fit
+        # when the contents change.
+        chosen = bool(cfg.get("main_user_sized"))
         try:
             parts = saved_geom.split('+')
+            size = parts[0] if chosen and "x" in parts[0] \
+                else f"{_px(420)}x{_px(600)}"
             if len(parts) == 3:
-                # Keep saved position, start with neutral height (will be fitted)
-                saved_geom = f"{_px(420)}x{_px(600)}+{parts[1]}+{parts[2]}"
+                saved_geom = f"{size}+{parts[1]}+{parts[2]}"
             else:
-                saved_geom = f"{_px(420)}x{_px(600)}"
+                saved_geom = size
         except Exception:
+            chosen = False
             saved_geom = f"{_px(420)}x{_px(600)}"
-        
+
         self.root.geometry(saved_geom)
+        self.root._pi_user_sized = chosen
 
         try:
             self.root.attributes("-alpha", self.alpha)
@@ -1050,6 +1085,20 @@ class PIGeneratorApp:
                       selectforeground=[("readonly", "white")],
                       bordercolor=[("focus", EVE["border_hi"])])
 
+        # Slim, arrowless, theme-coloured. A stock scrollbar beside this panel
+        # looks like it wandered in from another program — and clam is the one
+        # ttk theme that lets the trough and thumb be recoloured at all.
+        style.layout("PI.Vertical.TScrollbar", [
+            ("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+                ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nswe"})]})])
+        style.configure("PI.Vertical.TScrollbar",
+                        troughcolor=EVE["bg_deep"], background=EVE["border"],
+                        bordercolor=EVE["bg_deep"], darkcolor=EVE["border"],
+                        lightcolor=EVE["border"], width=_px(7), relief="flat")
+        style.map("PI.Vertical.TScrollbar",
+                  background=[("pressed", EVE["accent"]),
+                              ("active", EVE["border_hi"])])
+
         style.configure("TRadiobutton",     background=EVE["bg_deep"], foreground=EVE["fg"], font=("Segoe UI", _fs(10)))
         style.map("TRadiobutton", background=[("active", EVE["bg_card"])])
         style.configure("TCheckbutton",    background=EVE["bg_deep"], foreground=EVE["fg"], font=("Segoe UI", _fs(10)))
@@ -1074,6 +1123,10 @@ class PIGeneratorApp:
 
     def _rebuild_ui(self):
         """Détruit et reconstruit toute l'UI (utilisé lors d'un changement de thème)."""
+        # Changer la taille du texte change ce que « tenir dans la fenêtre »
+        # veut dire, donc on redonne la main à l'ajustement automatique. Un
+        # redimensionnement manuel reprend la priorité au geste suivant.
+        self.root._pi_user_sized = False
         for widget in self.root.winfo_children():
             widget.destroy()
         self._setup_styles()
@@ -1505,9 +1558,55 @@ class PIGeneratorApp:
 
     def _build_config_panel(self, parent):
         """Construit les 5 étapes de configuration (produit, chaîne, planète, rayon, CC) et la BOM."""
-        # Simple frame — no scrollbar. Window auto-sizes to content after build.
-        scroll_frame = ttk.Frame(parent)
-        scroll_frame.pack(fill=tk.BOTH, expand=True)
+        # Le panneau défile. Il ne le faisait pas : la fenêtre se dimensionnait
+        # sur son contenu, donc il n'y avait jamais rien à faire défiler. Deux
+        # choses ont cassé ça — pouvoir redimensionner la fenêtre à la main, et
+        # une taille de texte réglable qui rend le contenu plus haut que
+        # l'écran. Dans les deux cas les boutons du bas devenaient
+        # inatteignables, sans rien pour les rattraper.
+        viewport = tk.Canvas(parent, bg=EVE["bg_deep"], highlightthickness=0)
+        bar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=viewport.yview,
+                            style="PI.Vertical.TScrollbar")
+        viewport.configure(yscrollcommand=bar.set)
+        viewport.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        scroll_frame = ttk.Frame(viewport)
+        window_id = viewport.create_window((0, 0), window=scroll_frame, anchor="nw")
+        self._panel_viewport = viewport
+        self._panel_bar = bar
+
+        def _on_inner(_event=None):
+            viewport.configure(scrollregion=viewport.bbox("all"))
+            # Ask for the height the content actually needs, so the window can
+            # still size itself to the panel on first launch. Without this the
+            # viewport only ever requested its own default and the window came
+            # up short with everything hidden behind a scrollbar.
+            viewport.configure(height=min(scroll_frame.winfo_reqheight(),
+                                          self.root.winfo_screenheight()))
+            # The bar earns its place or it does not appear: a permanent one
+            # would steal width from a panel that usually fits.
+            needed = scroll_frame.winfo_reqheight() > viewport.winfo_height()
+            if needed and not bar.winfo_manager():
+                bar.pack(side=tk.RIGHT, fill=tk.Y)
+            elif not needed and bar.winfo_manager():
+                bar.pack_forget()
+                viewport.yview_moveto(0)
+
+        def _on_viewport(event):
+            # The inner frame is as wide as the viewport, so everything inside
+            # keeps filling the window when it is resized horizontally.
+            viewport.itemconfigure(window_id, width=event.width)
+            _on_inner()
+
+        scroll_frame.bind("<Configure>", _on_inner)
+        viewport.bind("<Configure>", _on_viewport)
+
+        def _wheel(event):
+            if scroll_frame.winfo_reqheight() <= viewport.winfo_height():
+                return
+            viewport.yview_scroll(int(-event.delta / 120), "units")
+
+        viewport.bind_all("<MouseWheel>", _wheel, add="+")
 
         # ── STEP 1: PRODUCT ───────────────────────────────────────────
         # Build master product list: all products across all chains, sorted
@@ -1545,7 +1644,8 @@ class PIGeneratorApp:
         self._product_display_var = tk.StringVar()   # display string with [Px]
         self.product_combo = ttk.Combobox(grp1, textvariable=self._product_display_var,
                                           state="readonly", width=30)
-        self.product_combo["values"] = _prod_display
+        # The placeholder heads the list so "nothing chosen" is reachable again.
+        self.product_combo["values"] = [CHOOSE_PRODUCT] + _prod_display
         self.product_combo.pack(fill=tk.X, padx=8, pady=(2, 8))
         self.product_combo.bind("<<ComboboxSelected>>", lambda e: self._on_product_pick())
 
@@ -1649,8 +1749,10 @@ class PIGeneratorApp:
         # Collection interval — the "I hate collecting" dial
         int_row = tk.Frame(self.grp_layout, bg=EVE["bg_card"])
         int_row.pack(fill=tk.X, padx=8, pady=(2, 0))
-        tk.Label(int_row, text="Collect every", bg=EVE["bg_card"], fg=EVE["fg_dim"],
-                 font=("Segoe UI", _fs(9))).pack(side=tk.LEFT)
+        self._interval_label = tk.Label(int_row, text="Collect every",
+                                        bg=EVE["bg_card"], fg=EVE["fg_dim"],
+                                        font=("Segoe UI", _fs(9)))
+        self._interval_label.pack(side=tk.LEFT)
         self.interval_var = tk.IntVar(
             value=cfg_layout.get("layout_collection_hours", DEFAULT_COLLECTION_HOURS))
         self._interval_buttons = {}
@@ -1786,7 +1888,7 @@ class PIGeneratorApp:
                               font=("Segoe UI", _fs(10), "bold"),
                               bg=EVE["bg_card"], fg=EVE["fg"],
                               activebackground=EVE["border_hi"], activeforeground=EVE["fg_bright"],
-                              relief=tk.FLAT, cursor="hand2", command=self._open_region_scanner)
+                              relief=tk.FLAT, cursor="hand2", command=self._open_scout_from_build)
         scout_btn.pack(fill=tk.X, ipady=5, pady=(5, 0))
 
         hist_btn = tk.Button(btn_frame, text="🕘  HISTORY",
@@ -1805,17 +1907,31 @@ class PIGeneratorApp:
                             relief=tk.FLAT, cursor="hand2", command=self._open_template_library)
         lib_btn.pack(fill=tk.X, ipady=5, pady=(5, 0))
 
-        # Seed first product selection
-        if _prod_display:
-            self.product_combo.current(0)
-            self._on_product_pick()
+        # Nothing is chosen on arrival. Seeding the first product meant the tool
+        # opened already describing a Bacteria colony nobody asked for, and the
+        # Proximity Scout could not tell a real intention from that default.
+        self.product_combo.set(CHOOSE_PRODUCT)
+        self.chain_combo.set("")
+        self.planet_var.set("")
+        self.planet_combo.set("")
+        self._update_bom()
         self.root.after(50, self._refresh_cc_buttons)
         # Auto-fit window height after content is fully laid out
         self.root.after(100, self._fit_window_to_content)
 
     def _fit_window_to_content(self):
-        """Redimensionne la fenêtre principale en hauteur pour contenir tout le contenu."""
+        """Redimensionne la fenêtre principale en hauteur pour contenir tout le contenu.
+
+        Sauf si l'utilisateur a lui-même choisi une taille : c'est une décision,
+        et cette méthode tourne à chaque redessin de la BOM — sans ce garde-fou
+        elle réinitialisait la fenêtre en plein geste. C'est ce qui faisait
+        paraître le redimensionnement vertical cassé et transformait un
+        glissement en diagonale en glissement horizontal. Le panneau défile
+        désormais, donc plus rien n'est hors d'atteinte à la taille choisie.
+        """
         try:
+            if getattr(self.root, "_pi_user_sized", False):
+                return
             self.root.update_idletasks()
             # Width follows the text size. It used to be pinned at 420, and
             # since this runs on every BOM redraw it silently undid any wider
@@ -1853,9 +1969,19 @@ class PIGeneratorApp:
     def _on_product_pick(self):
         """Réagit au choix d'un produit (étape ①) et met à jour la liste des chaînes disponibles."""
         display_val = self._product_display_var.get()
-        # Recover raw name: strip the '  [Px]' suffix
+        # The placeholder is not a product: picking it back means "nothing
+        # chosen", which is a state the tool has to be able to return to.
+        if display_val == CHOOSE_PRODUCT:
+            self.product_var.set("")
+            self.chain_combo["values"] = []
+            self.chain_var.set("")
+            self._update_bom()
+            return
+        # Recover raw name: strip the '  [Px]' suffix. Indexed against the
+        # display list, not the combo's values — the combo carries the
+        # placeholder at position 0 and would offset every product by one.
         try:
-            idx = self.product_combo["values"].index(display_val)
+            idx = self._prod_display.index(display_val)
             raw_name = self._prod_names[idx]
         except (ValueError, IndexError):
             raw_name = display_val.split("  [")[0]
@@ -1998,6 +2124,11 @@ class PIGeneratorApp:
         # Layouts built from fixed geometry cannot honour manual counts.
         configurable = chain in CONFIGURABLE_CHAINS
         self.manual_chk.state(["!disabled"] if configurable else ["disabled"])
+        # "Collect every" promises the colony is built around the interval.
+        # Where it cannot be, the word has to change rather than the control
+        # quietly doing nothing.
+        self._interval_label.config(
+            text="Collect every" if configurable else "Check against")
         if not configurable and self.manual_var.get():
             self.manual_frame.pack_forget()
 
@@ -2062,6 +2193,18 @@ class PIGeneratorApp:
                       fill=EVE["green"] if ok else EVE["orange"],
                       font=("Segoe UI", _fs(9), "bold"))
         y += _px(16)
+
+        # On a chain whose geometry is fixed, the interval judges the colony
+        # but cannot reshape it — so every figure above and the whole HAUL IN
+        # block stay put whichever interval is picked. That reads as a broken
+        # control unless it is said out loud.
+        if not configurable:
+            c.create_text(8, y, anchor=tk.NW,
+                          width=max(_px(120), c.winfo_width() - 16),
+                          text="This chain's layout is fixed — the interval "
+                               "checks it, it cannot resize the colony",
+                          fill=EVE["fg_dim"], font=("Segoe UI", _fs(8)))
+            y += _px(14) * 2
 
         if a["p0_supply_h"]:
             fed = a["p0_supply_h"] >= a["p0_demand_h"]
@@ -2154,6 +2297,38 @@ class PIGeneratorApp:
 
         self._update_bom()
 
+    def _sync_live_popup(self):
+        """Renvoie l'aperçu courant à la fenêtre de résultat, si elle est ouverte.
+
+        Débounce : _update_bom part à chaque frappe, et redessiner la planète
+        à chaque caractère d'un champ de rayon n'apporte rien. La dernière
+        valeur gagne, ce qui est exactement ce qu'on veut voir.
+        """
+        if self._live_popup is None or self.current_preview is None:
+            return
+        if self._live_sync_job:
+            try:
+                self.root.after_cancel(self._live_sync_job)
+            except Exception:
+                pass
+
+        def _push():
+            self._live_sync_job = None
+            follow = self._live_popup
+            if follow is None or self.current_preview is None:
+                return
+            try:
+                # follow() reports False once its window is gone; forgetting it
+                # then keeps a closed popup from being redrawn forever.
+                if not follow(self.current_preview):
+                    self._live_popup = None
+            except tk.TclError:
+                self._live_popup = None
+            except Exception as exc:
+                _debug(f"_sync_live_popup failed: {exc}")
+
+        self._live_sync_job = self.root.after(140, _push)
+
     def _redraw_bom(self):
         """Redessine la BOM après un changement de largeur du canvas."""
         self._bom_redraw_job = None
@@ -2211,6 +2386,8 @@ class PIGeneratorApp:
                                                   self._layout_options())
                                  if self.current_preview is not None else None)
         self._refresh_layout_panel()
+        # A result window left open follows the settings.
+        self._sync_live_popup()
 
         self.bom_product_lbl.config(text=product)
 
@@ -2268,15 +2445,75 @@ class PIGeneratorApp:
             c.create_line(8, y, right_x, y, fill=EVE["border"], width=1)
             y += 4
 
+            # What a single collection run actually costs you, which is the
+            # number you load a hauler against — the hourly rate never was.
+            # Capped at what storage survives: asking 48h of a colony that
+            # jams at 33 is not a bigger haul, it is 15 idle hours.
+            trip = trip_interval(self.current_analysis, self.interval_var.get())
+            trip_h = trip.effective
+            # Rounded for the label only. The arithmetic keeps every decimal:
+            # 501.6 m³/h over a real 33.245h is 22 m³ more than over "33.2".
+            trip_label = f"{trip_h:,.1f}".rstrip("0").rstrip(".")
+
+            # Three right-aligned columns: tier, per trip, per hour. Their
+            # widths are measured from the numbers actually about to be drawn,
+            # not guessed — a fixed 62px gap was fine until a colony hauled
+            # 11,365.17 of something and the per-trip figure backed straight
+            # into "280/h".
+            digits = tkfont.Font(family="Consolas", size=_fs(9))
+            every = (rows["extracted"] + rows["haul_in"] + rows["collect"]
+                     + rows["surplus"])
+            gap = _px(10)
+            tier_w = digits.measure("[P0]")
+            hour_w = max([digits.measure(f"{_num(f.per_hour)}/h") for f in every]
+                         + [digits.measure("000/h")])
+            trip_w = max([digits.measure(_num(f.per_hour * trip_h)) for f in every]
+                         + [digits.measure("0,000")])
+
+            tier_x = right_x
+            per_trip_x = tier_x - tier_w - gap
+            per_hour_x = per_trip_x - trip_w - gap
+
             def draw_flows(flows, indent=4):
                 for flow in flows:
                     clr = TIER_CLR.get(flow.tier, EVE["fg"])
-                    draw_row(f"  {flow.name}",
-                             f"{flow.per_hour:,.0f}/h  [{flow.tier}]",
-                             clr, indent=indent)
+                    c.create_text(8 + indent, y, anchor=tk.W, text=f"  {flow.name}",
+                                  fill=clr, font=("Segoe UI", _fs(9)))
+                    c.create_text(per_hour_x, y, anchor=tk.E,
+                                  text=f"{_num(flow.per_hour)}/h",
+                                  fill=clr, font=("Consolas", _fs(9)))
+                    c.create_text(per_trip_x, y, anchor=tk.E,
+                                  text=_num(flow.per_hour * trip_h),
+                                  fill=clr, font=("Consolas", _fs(9), "bold"))
+                    c.create_text(tier_x, y, anchor=tk.E, text=f"[{flow.tier}]",
+                                  fill=clr, font=("Consolas", _fs(9)))
+                    _advance()
+
+            def _advance():
+                nonlocal y
+                y += lh
+
+            def draw_flow_header(text, color):
+                """Column captions, so the middle number says what it counts."""
+                nonlocal y
+                c.create_text(8, y, anchor=tk.W, text=text, fill=color,
+                              font=("Segoe UI", _fs(9)))
+                _advance()
+                c.create_text(per_hour_x, y, anchor=tk.E, text="per hour",
+                              fill=EVE["fg_dim"], font=("Segoe UI", _fs(7)))
+                c.create_text(per_trip_x, y, anchor=tk.E,
+                              text=f"per {trip_label}h",
+                              fill=EVE["fg_dim"], font=("Segoe UI", _fs(7), "bold"))
+                _advance()
 
             def draw_subtotal(m3):
-                draw_row("", f"{m3:,.0f} m³/h", EVE["fg_dim"])
+                nonlocal y
+                c.create_text(per_hour_x, y, anchor=tk.E, text=f"{_num(m3)} m³/h",
+                              fill=EVE["fg_dim"], font=("Consolas", _fs(9)))
+                c.create_text(tier_x, y, anchor=tk.E,
+                              text=f"{_num(m3 * trip_h)} m³",
+                              fill=EVE["fg_dim"], font=("Consolas", _fs(9), "bold"))
+                _advance()
 
             def draw_note(text, color, indent=4):
                 """Prose, so it wraps to the panel and advances y by its real height."""
@@ -2284,14 +2521,24 @@ class PIGeneratorApp:
                 item = c.create_text(8 + indent, y, anchor=tk.NW, text=text,
                                      fill=color, font=("Segoe UI", _fs(8)),
                                      width=max(120, right_x - 8 - indent))
-                y += (c.bbox(item)[3] - c.bbox(item)[1]) + 2
+                # Half a row of clearance: everything after this is drawn
+                # anchor=W, centred on y, so it would ride up over the note.
+                y += (c.bbox(item)[3] - c.bbox(item)[1]) + lh // 2
+
+            # Why the trip figures are not the interval that was asked for.
+            if trip.capped:
+                draw_note(f"Storage lasts {trip_label}h, not the "
+                          f"{trip.requested:g}h asked for — the trip figures "
+                          f"below are for {trip_label}h, after which the "
+                          f"colony jams.", EVE["orange"], indent=0)
 
             if rows["extracted"]:
-                draw_row("⛏ EXTRACTED ON-PLANET", "", EVE["green"])
+                draw_flow_header("⛏ EXTRACTED ON-PLANET", EVE["green"])
                 draw_flows(rows["extracted"])
 
             if rows["haul_in"]:
-                draw_row("⬆ HAUL IN · whole colony, per hour", "", EVE["orange"])
+                draw_flow_header("⬆ HAUL IN · whole colony, per trip",
+                                 EVE["orange"])
                 draw_flows(rows["haul_in"])
                 draw_subtotal(rows["haul_in_m3_h"])
                 # A haul-in quantity reads the same whether it is a deliberate
@@ -2302,7 +2549,8 @@ class PIGeneratorApp:
                     draw_note(note[1], EVE["fg_dim"])
 
             if rows["collect"] or rows["surplus"]:
-                draw_row("⬇ COLLECT · whole colony, per hour", "", EVE["accent"])
+                draw_flow_header("⬇ COLLECT · whole colony, per trip",
+                                 EVE["accent"])
                 draw_flows(rows["collect"])
                 if rows["surplus"]:
                     # Raw material the factories cannot keep up with: it fills
@@ -2364,6 +2612,88 @@ class PIGeneratorApp:
                              kind="generate")
         self._show_popup(template)
 
+
+    def _has_work(self):
+        """Y a-t-il quelque chose en cours qu'on perdrait en changeant d'écran ?
+
+        Un produit choisi suffit : c'est le premier geste de construction, et
+        c'est aussi ce qui distingue « je commence une colonie » de « j'ouvre
+        l'outil pour chercher une planète ».
+        """
+        return bool(self.product_var.get()) or self.current_template is not None
+
+    def _reset_build(self):
+        """Ramène les étapes ① à ⑥ à l'état vide du démarrage."""
+        self.current_template = None
+        self.current_preview = None
+        self.current_analysis = None
+        self.product_combo.set(CHOOSE_PRODUCT)
+        self.product_var.set("")
+        self.chain_combo["values"] = []
+        self.chain_combo.set("")
+        self.chain_var.set("")
+        self.planet_combo.set("")
+        self.planet_var.set("")
+        if self.manual_var.get():
+            self.manual_var.set(False)
+            self._toggle_manual_layout()
+        self._update_bom()
+
+    def _open_scout_from_build(self):
+        """Le Scout depuis l'écran principal : demande avant de jeter un travail.
+
+        L'historique garde ce qui a été *généré* ; ce qui est seulement
+        configuré n'existe nulle part ailleurs, d'où la question.
+        """
+        if self._has_work():
+            if not messagebox.askyesno(
+                    "Discard this build?",
+                    "You have a colony in progress.\n\n"
+                    "Opening the Proximity Scout clears it so you can pick a "
+                    "planet first. Discard and continue?",
+                    parent=self.root):
+                return
+            self._reset_build()
+        self._open_region_scanner()
+
+    def _save_template_to_library(self, template, suggested, parent):
+        """Enregistre un template sous un nom, dans data/templates.
+
+        Une seule implémentation pour les deux portes d'entrée — la fenêtre de
+        résultat et l'historique — sinon la convention de nommage et le garde-fou
+        d'écrasement finissent par diverger entre les deux.
+
+        Même règle que l'éditeur : préfixe « Custom - », et jamais par-dessus un
+        fichier fourni, car sans git ici ce serait définitif.
+        """
+        name = simpledialog.askstring(
+            "Save to library", "Name this template:",
+            initialvalue=(suggested or "Unnamed")[:60], parent=parent)
+        if not name:
+            return False
+        name = "".join(ch for ch in name.strip() if ch not in '\\/:*?"<>|')
+        if not name:
+            return False
+        fname = f"Custom - {name}.json"
+        path = os.path.join(get_base_path(), "data", "templates", fname)
+        if os.path.exists(path) and not messagebox.askyesno(
+                "Overwrite?",
+                f"{fname} already exists in the library. Replace it?",
+                parent=parent):
+            return False
+        # The name is what the library lists, so it becomes the comment too.
+        saved = copy.deepcopy(template)
+        saved["Cmt"] = name
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(saved, handle, default=str)
+        except OSError as exc:
+            messagebox.showerror("Save failed", str(exc), parent=parent)
+            return False
+        messagebox.showinfo("Saved", f"Saved to the library as:\n{fname}",
+                            parent=parent)
+        return True
 
     def _open_history(self):
         """Liste ce sur quoi on travaillait, pour y revenir.
@@ -2450,36 +2780,9 @@ class PIGeneratorApp:
                 return
             entry = rows[sel[0]]
             template = self._history.get(entry.id)
-            if template is None:
-                return
-            suggested = (template.get("Cmt") or entry.label or "Unnamed")
-            name = simpledialog.askstring(
-                "Save to library", "Name this template:",
-                initialvalue=suggested[:60], parent=popup)
-            if not name:
-                return
-            name = "".join(ch for ch in name.strip() if ch not in '\\/:*?"<>|')
-            if not name:
-                return
-            fname = f"Custom - {name}.json"
-            path = os.path.join(get_base_path(), "data", "templates", fname)
-            if os.path.exists(path) and not messagebox.askyesno(
-                    "Overwrite?",
-                    f"{fname} already exists in the library. Replace it?",
-                    parent=popup):
-                return
-            # The name is what the library lists, so it becomes the comment too.
-            template["Cmt"] = name
-            try:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "w", encoding="utf-8") as handle:
-                    json.dump(template, handle, default=str)
-            except OSError as exc:
-                messagebox.showerror("Save failed", str(exc), parent=popup)
-                return
-            messagebox.showinfo("Saved",
-                                f"Saved to the library as:\n{fname}",
-                                parent=popup)
+            if template is not None:
+                self._save_template_to_library(
+                    template, template.get("Cmt") or entry.label, popup)
 
         def _delete():
             sel = listbox.curselection()
@@ -2529,7 +2832,7 @@ class PIGeneratorApp:
         listbox.focus_set()
 
     def _build_on_scouted_planet(self, planet_type, radius_km, planet_name,
-                                 scanner_popup=None):
+                                 scanner_popup=None, product=None, chain=None):
         """Génère un template pour la planète scannée qu'on vient de cliquer.
 
         Le Scout dit *où* construire ; jusqu'ici il fallait ensuite recopier le
@@ -2537,7 +2840,18 @@ class PIGeneratorApp:
         travers reprice tous les liens en silence. Ici les deux valeurs
         traversent ensemble, telles que le SDE les donne.
         """
-        chain = self.chain_var.get()
+        # A P1 picked inside the Scout decides the build: that choice is the
+        # whole reason the planet list was narrowed, so it comes back with it.
+        if product and chain:
+            self.product_combo.set(next(
+                (d for d, n in zip(self._prod_display, self._prod_names)
+                 if n == product), product))
+            self.product_var.set(product)
+            self._update_chain_list()
+            self.chain_var.set(chain)
+            self._on_chain_changed()
+
+        chain = chain or self.chain_var.get()
         chain_info = CHAINS.get(chain, {})
 
         # Une chaîne d'extraction n'a de sens que si la planète porte bien les
@@ -2787,6 +3101,15 @@ class PIGeneratorApp:
                     popup.after_cancel(job)
                 except Exception:
                     pass
+            self._live_popup = None
+            # A tooltip is a separate toplevel: closing the map would otherwise
+            # leave it floating on the desktop with nothing to dismiss it.
+            tip = view_state.pop("tooltip_win", None)
+            if tip is not None:
+                try:
+                    tip.destroy()
+                except Exception:
+                    pass
             popup.destroy()
 
         self._build_title_bar(popup, "Generated PI Template", close_popup)
@@ -2824,6 +3147,18 @@ class PIGeneratorApp:
                   bg=EVE["bg_card"], fg=EVE["fg"], activebackground=EVE["border_hi"],
                   activeforeground=EVE["fg_bright"], relief=tk.FLAT, cursor="hand2",
                   command=reset_view).pack(side=tk.LEFT, padx=(10, 0))
+
+        def save_to_library():
+            # doc["template"], not the one this window opened with: whatever is
+            # on screen now — dragged, or followed from the settings — is what
+            # the user means by "save this".
+            suggested = doc["template"].get("Cmt") or self.product_var.get()
+            self._save_template_to_library(doc["template"], suggested, popup)
+
+        tk.Button(btn_bar, text="💾 Save to Library", font=("Segoe UI", _fs(9), "bold"),
+                  bg=EVE["bg_card"], fg=EVE["fg"], activebackground=EVE["border_hi"],
+                  activeforeground=EVE["fg_bright"], relief=tk.FLAT, cursor="hand2",
+                  command=save_to_library).pack(side=tk.LEFT, padx=(10, 0))
 
         # Two figures rather than a verdict. At 0.2 CPU per km even the largest
         # possible move on a small colony cannot cross the budget line, so a
@@ -2884,6 +3219,16 @@ class PIGeneratorApp:
 
             view_state["redraw_job"] = popup.after(delay, _do)
 
+        def _hide_map_tooltip():
+            """The tooltip is a window now, so panning and dragging have to
+            dismiss it explicitly — there is no canvas tag left to delete."""
+            tip = view_state.pop("tooltip_win", None)
+            if tip is not None:
+                try:
+                    tip.destroy()
+                except Exception:
+                    pass
+
         # ── Moving a structure ────────────────────────────────────────────
         # Committed once, on release. Every frame would rewrite the document
         # dozens of times for one drag. Escape abandons the gesture entirely,
@@ -2891,7 +3236,7 @@ class PIGeneratorApp:
         grab = {"pin": None, "moved": False, "model": None}
 
         def on_structure_grab(event, pin_idx):
-            map_canvas.delete("tooltip")
+            _hide_map_tooltip()
             map_canvas.delete("signal")
             try:
                 grab["model"] = parse_colony(doc["template"])
@@ -2966,6 +3311,23 @@ class PIGeneratorApp:
         map_canvas._pi_view_state = view_state
         map_canvas._pi_doc = doc
 
+        # ── Following the settings ────────────────────────────────────────
+        # While this window is open, changing pads or factories on the main
+        # panel redraws it here rather than making you generate again. The
+        # fixed-scale projection is what makes that watchable: a colony that
+        # gains two factories grows into the space instead of the whole map
+        # jumping to a new fit.
+        def follow(template):
+            if not popup.winfo_exists():
+                return False
+            doc["template"] = template
+            self._draw_map(map_canvas, template, view_state)
+            _refresh_budget()
+            _refresh_json()
+            return True
+
+        self._live_popup = follow
+
         # ── Flow ──────────────────────────────────────────────────────────
         # One dash period per step so the travel loops seamlessly: links are
         # 5 on / 4 off, signals 2 on / 8 off. Nothing is redrawn — only the
@@ -2998,7 +3360,7 @@ class PIGeneratorApp:
             _schedule_crisp_redraw()
 
         def on_drag_start(event):
-            map_canvas.delete("tooltip")
+            _hide_map_tooltip()
             view_state["drag_start_x"] = event.x
             view_state["drag_start_y"] = event.y
 
@@ -3113,6 +3475,17 @@ class PIGeneratorApp:
             window.geometry(f"{new_w}x{new_h}+{new_x}+{new_y}")
 
         def stop_resize(event):
+            if resize_data["active"]:
+                # From here on this window keeps the size it was given. Only
+                # set on a real gesture, so merely opening a window does not
+                # count as choosing its size.
+                window._pi_user_sized = True
+                if window is self.root:
+                    # Remembered across restarts, and separately from the
+                    # geometry: a size the window picked for itself should
+                    # still be free to re-fit, a size you dragged should not.
+                    _update_window_config("main_user_sized", True)
+                    _update_window_config("main_geometry", window.geometry())
             resize_data["active"] = False
             resize_data["edge"] = None
 
@@ -3526,28 +3899,52 @@ class PIGeneratorApp:
             # Unrecognised structure type id (rendered as a grey "?")
             return [f"Unknown structure (type {pin.get('T')})"]
 
+        # The tooltip is its own little window rather than canvas items, purely
+        # so it can be see-through: a canvas rectangle has no alpha channel in
+        # Tk, and the only honest transparency available is a toplevel's.
+        # It never takes focus and never sees the pointer, so it cannot steal
+        # the <Leave> that dismisses it.
+        def _hide_pin_tooltip(_event=None):
+            tip = view_state.pop("tooltip_win", None)
+            if tip is not None:
+                try:
+                    tip.destroy()
+                except Exception:
+                    pass
+
         def _show_pin_tooltip(event, pin_idx):
-            canvas.delete("tooltip")
+            _hide_pin_tooltip()
             lines = _pin_tooltip_lines(pin_idx)
-            # state=DISABLED keeps the tooltip out of mouse hit-testing so it
-            # can't steal the <Leave> event from the pin under the cursor.
-            tip = canvas.create_text(event.x + 16, event.y, anchor=tk.W,
-                                     text="\n".join(lines), justify=tk.LEFT,
-                                     fill=EVE["fg_bright"], font=("Segoe UI", _fs(9)),
-                                     tags=("tooltip",), state=tk.DISABLED)
-            x1, y1, x2, y2 = canvas.bbox(tip)
-            # Keep the tooltip inside the canvas
-            w_now = canvas.winfo_width() or cw
-            h_now = canvas.winfo_height() or ch
-            dx = min(0, (w_now - 8) - x2)
-            dy = max(0, 8 - y1) + min(0, (h_now - 8) - y2)
-            if dx or dy:
-                canvas.move(tip, dx, dy)
-                x1, y1, x2, y2 = canvas.bbox(tip)
-            bg = canvas.create_rectangle(x1 - 8, y1 - 6, x2 + 8, y2 + 6,
-                                         fill=EVE["bg_panel"], outline=EVE["accent"],
-                                         width=1, tags=("tooltip",), state=tk.DISABLED)
-            canvas.tag_raise(tip, bg)
+
+            tip = tk.Toplevel(canvas)
+            tip.overrideredirect(True)
+            tip.attributes("-topmost", True)
+            try:
+                # A shade under the window's own opacity: the planet stays
+                # readable under it, which is the point of hovering a building
+                # sitting on top of the thing you are reading about.
+                tip.attributes("-alpha", max(0.35, self.alpha * 0.86))
+            except Exception:
+                pass
+            tip.configure(bg=EVE["accent"])
+            tk.Label(tip, text="\n".join(lines), justify=tk.LEFT,
+                     bg=EVE["bg_panel"], fg=EVE["fg_bright"],
+                     font=("Segoe UI", _fs(9)), padx=8, pady=6,
+                     anchor=tk.W).pack(padx=1, pady=1)
+            view_state["tooltip_win"] = tip
+
+            # Placed against the screen, not the canvas, and nudged back inside
+            # it when the pointer is near an edge.
+            tip.update_idletasks()
+            w, h = tip.winfo_reqwidth(), tip.winfo_reqheight()
+            x = canvas.winfo_rootx() + event.x + _px(16)
+            y = canvas.winfo_rooty() + event.y - h // 2
+            right = canvas.winfo_rootx() + canvas.winfo_width()
+            bottom = canvas.winfo_rooty() + canvas.winfo_height()
+            x = min(x, right - w - 8)
+            x = max(x, canvas.winfo_rootx() + 8)
+            y = min(max(y, canvas.winfo_rooty() + 8), bottom - h - 8)
+            tip.geometry(f"+{int(x)}+{int(y)}")
 
         # ── Route signals ─────────────────────────────────────────────────
         # Directional commodity motion, shown only while a structure gives the
@@ -3667,7 +4064,7 @@ class PIGeneratorApp:
                 _show_route_signals(i)
 
             def _leave(_e):
-                canvas.delete("tooltip")
+                _hide_pin_tooltip()
                 canvas.delete("signal")
 
             canvas.tag_bind(pin_tag, "<Enter>", _enter)
@@ -3907,8 +4304,29 @@ class PIGeneratorApp:
         active_types = {t for t in (cfg.get("scanner_planet_filter") or ()) if t in PLANET_ORDER}
         if not active_types:
             active_types = set(PLANET_ORDER)
+        # Les types que le produit choisi rend utilisables. Tout, tant qu'on
+        # n'a rien choisi — le Scout sert aussi à regarder sans idée précise.
+        allowed_types = set(PLANET_ORDER)
         # Results of the last scan, kept so filtering redraws without rescanning
         last_results = {"data": None}
+
+        # ── Extract what? ─────────────────────────────────────────────────
+        # Only extraction has a planet requirement worth scanning for: a
+        # factory colony imports its inputs and will run on any rock. So this
+        # offers the P1s of P0 → P1 and narrows the filter to the planets that
+        # actually carry their raw material.
+        want = tk.Frame(body, bg=EVE["bg_card"],
+                        highlightbackground=EVE["border"], highlightthickness=1)
+        want.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(want, text="EXTRACT", bg=EVE["bg_card"], fg=EVE["accent"],
+                 font=("Segoe UI", _fs(8), "bold")).pack(side=tk.LEFT,
+                                                         padx=(10, 6), pady=6)
+        ANY_P1 = "anything — show every planet"
+        p1_var = tk.StringVar(value=ANY_P1)
+        p1_combo = ttk.Combobox(want, textvariable=p1_var, state="readonly",
+                                font=("Segoe UI", _fs(9)),
+                                values=[ANY_P1] + sorted(RECIPES_P0_P1))
+        p1_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10), pady=6)
 
         filt = tk.Frame(body, bg=EVE["bg_card"],
                         highlightbackground=EVE["border"], highlightthickness=1)
@@ -3920,11 +4338,20 @@ class PIGeneratorApp:
         type_btns = {}
 
         def _paint_filter_btns():
-            """Colore chaque bouton de type selon qu'il est actif ou non."""
+            """Colore chaque bouton de type : actif, éteint, ou hors-sujet.
+
+            « Éteint » et « impossible » doivent se distinguer : le premier est
+            un choix, le second dit que cette planète ne peut pas produire ce
+            qui a été demandé.
+            """
             for t, b in type_btns.items():
-                on = t in active_types
-                b.config(bg=PLANET_COLORS[t] if on else EVE["bg_input"],
-                         fg=EVE["bg_deep"] if on else EVE["fg_dim"])
+                usable = t in allowed_types
+                on = usable and t in active_types
+                if not usable:
+                    b.config(bg=EVE["bg_deep"], fg=EVE["border"])
+                else:
+                    b.config(bg=PLANET_COLORS[t] if on else EVE["bg_input"],
+                             fg=EVE["bg_deep"] if on else EVE["fg_dim"])
 
         def _apply_filter():
             """Sauvegarde la sélection et redessine les résultats déjà scannés."""
@@ -3941,9 +4368,34 @@ class PIGeneratorApp:
             _apply_filter()
 
         def _all_types():
+            # "All" means all the types the chosen product can actually use.
             active_types.clear()
-            active_types.update(PLANET_ORDER)
+            active_types.update(allowed_types)
             _apply_filter()
+
+        def _on_p1_pick(_event=None):
+            """Narrow the planet types to the ones carrying this P1's raw material.
+
+            The others are switched off *and* disabled: leaving them clickable
+            would offer planets that cannot run the colony being planned, which
+            is the opposite of what the choice is for.
+            """
+            product = p1_var.get()
+            allowed_types.clear()
+            if product == ANY_P1:
+                allowed_types.update(PLANET_ORDER)
+            else:
+                allowed_types.update(
+                    self._planets_for_extraction(product, EXTRACTION_CHAIN))
+            active_types.clear()
+            active_types.update(allowed_types)
+            for planet_type, button in type_btns.items():
+                usable = planet_type in allowed_types
+                button.config(state=tk.NORMAL if usable else tk.DISABLED,
+                              cursor="hand2" if usable else "")
+            _apply_filter()
+
+        p1_combo.bind("<<ComboboxSelected>>", _on_p1_pick)
 
         for t in PLANET_ORDER:
             b = tk.Button(filt, text=t.upper(), font=("Segoe UI", _fs(8), "bold"),
@@ -4083,8 +4535,10 @@ class PIGeneratorApp:
                                             card.config(cursor="hand2")))
             card.bind("<Leave>", lambda e: _draw(hovered=False))
             card.bind("<Button-1>",
-                      lambda e: self._build_on_scouted_planet(ptype, pradius,
-                                                              pname, popup))
+                      lambda e: self._build_on_scouted_planet(
+                          ptype, pradius, pname, popup,
+                          product=None if p1_var.get() == ANY_P1 else p1_var.get(),
+                          chain=None if p1_var.get() == ANY_P1 else EXTRACTION_CHAIN))
 
             return card
 
