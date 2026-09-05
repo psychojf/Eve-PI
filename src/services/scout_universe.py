@@ -36,6 +36,18 @@ def _base_path():
 
 
 def default_universe_path():
+    """L'instantané SDE livré, dans le paquet PyInstaller ou à côté de l'exe.
+
+    Même raison que `bundled_path` dans PI : gelée en un fichier, l'archive
+    est déballée dans `sys._MEIPASS`, pas à côté de l'exe. Sans ce premier
+    regard, le scanner retombait sur les téléchargements ESI alors que ses
+    2,6 Mo de données voyageaient dans l'exe.
+    """
+    bundle = getattr(sys, "_MEIPASS", None)
+    if bundle:
+        candidate = os.path.join(bundle, "data", UNIVERSE_FILENAME)
+        if os.path.exists(candidate):
+            return candidate
     return os.path.join(_base_path(), "data", UNIVERSE_FILENAME)
 
 

@@ -1,4 +1,4 @@
-"""Debug logging gated by PI_DEBUG environment variable."""
+"""Journal de débogage, conditionné par la variable d'environnement PI_DEBUG."""
 import os
 
 DEBUG = os.environ.get("PI_DEBUG", "").lower() in ("1", "true", "yes")

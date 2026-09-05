@@ -1,4 +1,4 @@
-"""EVE PI reference data: commodities, recipes, structures, chains."""
+"""Données de référence EVE PI : commodités, recettes, structures, chaînes."""
 COMMODITIES = {
     "P0": {
         "Aqueous Liquids": 2268, "Autotrophs": 2305, "Base Metals": 2267,
@@ -51,7 +51,7 @@ NAME_TO_ID = {name: tid for items in COMMODITIES.values() for name, tid in items
 
 NAME_TO_TIER = {name: tier for tier, items in COMMODITIES.items() for name in items}
 
-COMMODITY_SIZE = {"P0": 0.01, "P1": 0.38, "P2": 1.5, "P3": 6.0, "P4": 100.0}  # m³/unit, EVE values
+COMMODITY_SIZE = {"P0": 0.01, "P1": 0.38, "P2": 1.5, "P3": 6.0, "P4": 100.0}  # m³/unité, valeurs EVE
 
 RECIPES_P0_P1 = {
     "Bacteria":           {"input": [("Micro Organisms", 3000)],    "output": 20},
@@ -138,7 +138,8 @@ PLANET_TYPES = {
     "Oceanic": 2014, "Plasma": 2063, "Storm": 2017, "Temperate": 11,
 }
 
-# High-Tech Industry Facilities only exist on Barren and Temperate planets.
+# Les High-Tech Industry Facilities n'existent que sur les planètes Barren et
+# Temperate.
 HTIF_PLANET_TYPES = ("Barren", "Temperate")
 
 PLANET_RESOURCES = {
@@ -152,9 +153,11 @@ PLANET_RESOURCES = {
     "Temperate": ["Aqueous Liquids", "Autotrophs", "Carbon Compounds", "Complex Organisms", "Micro Organisms"],
 }
 
-# Priority recommendations per planet type based on EVE Uni resource distribution data.
-# Each entry: (P1 product, P0 resource, tier_rank)  where 1=Top, 2=Mid, 3=Lower priority.
-# Tier rank drives the badge colour in the planet card.
+# Recommandations de priorité par type de planète, d'après les données de
+# répartition des ressources d'EVE Uni.
+# Chaque entrée : (produit P1, ressource P0, rang)  où 1 = priorité haute,
+# 2 = moyenne, 3 = basse. Le rang pilote la couleur du badge dans la fiche
+# planète.
 PLANET_PI_PRIORITY = {
     "Barren":    [
         ("Reactive Metals",     "Base Metals",       1),
@@ -214,9 +217,9 @@ PLANET_PI_PRIORITY = {
     ],
 }
 
-# Colours and badge labels for the three priority tiers
+# Couleurs et pastilles des trois rangs de priorité
 _TIER_BADGE  = {1: "🥇", 2: "🥈", 3: "🥉"}
-_TIER_CLR_PI = {1: "#f5c842", 2: "#c0c0c0", 3: "#cd7f32"}   # gold / silver / bronze
+_TIER_CLR_PI = {1: "#f5c842", 2: "#c0c0c0", 3: "#cd7f32"}   # or / argent / bronze
 
 STRUCTURE_IDS = {
     "Basic Industry Facility":    {"Barren": 2473, "Gas": 2492, "Ice": 2493, "Lava": 2469, "Oceanic": 2490, "Plasma": 2471, "Storm": 2483, "Temperate": 2481},
@@ -246,47 +249,78 @@ CC_LEVELS = {
     5: {"cpu": 25415, "power": 19000, "cost": 2100000},
 }
 
-# A link's cost scales with its length: these are the base and the per-km slope,
-# measured in-game by dragging links of known length on planets of known radius
-# (0.20 CPU/km and 0.15 MW/km came out of two same-planet pairs, exactly).
-# Charging only the base is what made full templates fail to import: on a
-# 30,000 km planet the real cost of a colony's links is thousands of CPU.
+# Le coût d'un lien croît avec sa longueur : voici la base et la pente au km,
+# mesurées en jeu en tirant des liens de longueur connue sur des planètes de
+# rayon connu (0,20 CPU/km et 0,15 MW/km sont sortis, exactement, de deux
+# paires prises sur une même planète).
+# Ne facturer que la base, c'est ce qui faisait échouer l'import des templates
+# complets : sur une planète de 30 000 km, les liens d'une colonie coûtent
+# réellement des milliers de CPU.
 LINK_CPU_BASE = 15
 LINK_CPU_PER_KM = 0.20
 LINK_POWER_BASE = 10
 LINK_POWER_PER_KM = 0.15
 
-# Schematic cycle length per facility, in hours. Rates are recipe quantity
-# divided by these: a Basic Industry Facility running a P1 schematic turns
-# 3000 P0 into 20 P1 every 30 minutes, so it eats 6000 P0/h and makes 40 P1/h.
+# Durée d'un cycle de schematic par bâtiment, en heures. Les débits sont la
+# quantité de la recette divisée par ces durées : une Basic Industry Facility
+# sur un schematic P1 transforme 3000 P0 en 20 P1 toutes les 30 minutes, donc
+# elle consomme 6000 P0/h et produit 40 P1/h.
 CYCLE_HOURS = {
     "Basic Industry Facility":     0.5,
     "Advanced Industry Facility":  1.0,
     "High-Tech Industry Facility": 1.0,
 }
 
-# Buffer capacity in m³ — what a colony can hold between collection trips.
+# Capacité tampon en m³ — ce qu'une colonie peut retenir entre deux ramassages.
 STORAGE_CAPACITY_M3 = {
     "Launch Pad":       10000,
     "Storage Facility": 12000,
     "Command Center":     500,
 }
 
-# Assumed extractor yield, in raw units per head per hour. Real output depends
-# on deposit richness, program length and head placement, and decays over the
-# program — this is the planning figure the layout is balanced against, and the
-# user can change it. 2000/head/h ≈ 20k/h for a full 10-head extractor, which
-# is a realistic sustained figure for a decent deposit.
+# Rendement d'extraction supposé, en unités brutes par tête et par heure. Le
+# rendement réel dépend de la richesse du gisement, de la durée du programme et
+# du placement des têtes, et il décroît au fil du programme — c'est ici le
+# chiffre de planification sur lequel l'implantation est équilibrée, et
+# l'utilisateur peut le changer. 2000/tête/h ≈ 20k/h pour un extracteur complet
+# de 10 têtes, ce qui est un régime soutenu réaliste sur un gisement correct.
 DEFAULT_YIELD_PER_HEAD = 2000
 MAX_EXTRACTOR_HEADS = 10
 
-# How long the colony should run unattended between collection trips.
+# Combien de temps la colonie doit tourner sans surveillance entre deux
+# ramassages.
 DEFAULT_COLLECTION_HOURS = 24
+# Le contrat de parité avec le webtool, qui vérifie cette liste-ci et refuse
+# explicitement de l'élargir. On n'y touche pas.
 COLLECTION_INTERVALS = (6, 12, 24, 48)
 
-# "extracts": the planet mines its own P0, so the chain is limited to planet
-#   types that actually hold those resources and needs no P0 hauled in.
-# "supports_sf": the generator can add an optional Storage Facility.
+# Ce que les boutons de l'écran proposent : les quatre du contrat, plus trois
+# jours et une semaine, pour qui ramasse une ou deux fois par semaine plutôt que
+# tous les soirs. Demandé sur r/Eve.
+#
+# Une seconde constante, délibérément, et non une COLLECTION_INTERVALS plus
+# longue : les boutons d'un écran sont l'affaire de cet écran, et le contrat
+# ci-dessus est passé avec le webtool. C'est exactement le partage que
+# `COLLECTION_INTERVALS` (builder-model) et `PREVIEW_INTERVALS` (preview-model)
+# font côté webtool, pour la même raison.
+#
+# Rien ne prétend que les trajets longs sont gratuits : les pads sont
+# dimensionnés pour l'intervalle et plafonnés à quatre, puis `trip_interval`
+# rapporte la tournée que le stockage encaisse vraiment. Mesuré ici — Robotics
+# P2 → P3 sur Barren passe de 26 à 8 structures entre 24 h et 168 h, tandis que
+# Biocells P0 → P2 bâtit la même colonie à tous les intervalles, sa sortie P2
+# étant petite en volume.
+#
+# Ce qui n'est modélisé d'aucun côté, c'est la décroissance du programme
+# d'extracteur : `yield_per_head` est un débit plat, donc une colonie
+# hebdomadaire se lit comme ne coûtant que du débit là où en jeu elle coûterait
+# aussi du rendement. C'est un travail à part entière.
+BUILD_COLLECTION_INTERVALS = (6, 12, 24, 48, 72, 168)
+
+# « extracts » : la planète mine son propre P0, donc la chaîne est réservée aux
+#   types de planète qui portent vraiment ces ressources et n'exige aucun P0
+#   importé.
+# « supports_sf » : le générateur peut ajouter une Storage Facility optionnelle.
 CHAINS = {
     "P0 → P1 (Extraction)":   {"source_tier": "P0", "target_tier": "P1", "recipes": RECIPES_P0_P1,  "facility": "Basic Industry Facility",     "extracts": True, "supports_sf": True},
     "P0 → P2 (Extraction)":   {"source_tier": "P0", "target_tier": "P2", "recipes": RECIPES_P1_P2,  "facility": "Advanced Industry Facility",  "extracts": True},
@@ -298,7 +332,8 @@ CHAINS = {
     "P3 → P4 (Factory)":      {"source_tier": "P3", "target_tier": "P4", "recipes": RECIPES_P3_P4,  "facility": "High-Tech Industry Facility"},
 }
 
-# P1 product → the single P0 resource it is refined from (reverse of RECIPES_P0_P1),
-# and the other way round. The mapping is one-to-one: 15 raw resources, 15 P1s.
+# Produit P1 → l'unique ressource P0 dont il est raffiné (l'inverse de
+# RECIPES_P0_P1), et réciproquement. La correspondance est bijective :
+# 15 ressources brutes, 15 P1.
 P1_TO_P0 = {p1: recipe["input"][0][0] for p1, recipe in RECIPES_P0_P1.items()}
 P0_TO_P1 = {p0: p1 for p1, p0 in P1_TO_P0.items()}

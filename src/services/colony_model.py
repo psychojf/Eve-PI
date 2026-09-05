@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+from collections import deque
 from dataclasses import dataclass, field
 
 from src.services.template_service import (MAX_ARM_LEN, MAX_ARM_LEN_HARD,
@@ -56,10 +57,23 @@ def template_shape_error(template):
 
 @dataclass
 class Arm:
-    """Chaîne de pins accrochée à un hub ; end_hub si l'autre bout rejoint un hub."""
+    """Chaîne de pins accrochée à un hub ; end_hub si l'autre bout rejoint un hub.
+
+    `hub` est le hub *propriétaire*, celui à la racine de tout l'ensemble ;
+    `parent` est le pin dont ce bras part réellement. Les deux coïncident pour
+    un bras posé directement sur un hub — le cas de toute la bibliothèque. Ils
+    divergent quand un bras se ramifie : chaque branche devient alors son
+    propre bras, de parent le pin où ça bifurque, et garde le hub d'origine
+    pour que l'équilibrage de charge continue de compter au bon endroit.
+    """
     hub: int
     pins: list[int]
     end_hub: int | None = None
+    parent: int | None = None
+
+    def __post_init__(self):
+        if self.parent is None:
+            self.parent = self.hub
 
 
 @dataclass
@@ -107,7 +121,7 @@ def parse_colony(template):
             raise ParseError(f"pin {i + 1}: unknown structure type id {p.get('T')}")
         kinds.append(k)
 
-    adj = {i: [] for i in range(n)}          # 0-based
+    adj = {i: [] for i in range(n)}          # base 0
     for lk in links:
         s, d = lk.get("S"), lk.get("D")
         if not (isinstance(s, int) and isinstance(d, int)
@@ -144,27 +158,42 @@ def parse_colony(template):
     visited = set(hubs)
     arms = []
     for h in hubs:
-        for start in sorted(adj[h]):
-            if start in visited:
+        # (parent, premier pin) — la file grandit quand un bras se ramifie.
+        pending = deque((h, start) for start in sorted(adj[h])
+                        if start not in visited)
+        while pending:
+            parent, first = pending.popleft()
+            if first in visited:
                 continue
-            arm, prev, cur, end_hub = [], h, start, None
+            arm, prev, cur, end_hub = [], parent, first, None
             while True:
                 visited.add(cur)
                 arm.append(cur)
                 nxt = [x for x in adj[cur] if x != prev]
-                if len(nxt) > 1:
-                    raise ParseError(f"pin {cur + 1} branches mid-arm")
-                if not nxt:
-                    break
-                if nxt[0] in hubset:
-                    end_hub = nxt[0]
-                    break
-                prev, cur = cur, nxt[0]
-            # Tolerate anything the generator's arm_length override can emit;
-            # the compact MAX_ARM_LEN stays the ceiling for automatic growth.
+                # Les hubs sont dans `visited` dès le départ : le filtre ne
+                # vaut que pour la suite du bras, sinon aucun bras-pont ne
+                # serait jamais reconnu.
+                onward = [x for x in nxt if x not in hubset and x not in visited]
+                to_hub = [x for x in nxt if x in hubset]
+                if to_hub:
+                    # Un bras-pont : l'autre bout rejoint un second hub.
+                    end_hub = to_hub[0]
+                if len(onward) == 1 and not to_hub:
+                    prev, cur = cur, onward[0]
+                    continue
+                # Zéro suite : bras ouvert. Plusieurs : le bras s'arrête ici et
+                # chaque branche repart comme un bras à part entière, de parent
+                # ce pin — un éventail P4 n'est pas un template malformé, c'est
+                # ce que nos propres générateurs posent.
+                for branch in onward:
+                    pending.append((cur, branch))
+                break
+            # On tolère tout ce que la surcharge arm_length du générateur peut
+            # produire ; MAX_ARM_LEN, plus compact, ne plafonne que la
+            # croissance automatique.
             if len(arm) > MAX_ARM_LEN_HARD:
                 raise ParseError(f"arm of {len(arm)} pins exceeds {MAX_ARM_LEN_HARD}")
-            arms.append(Arm(hub=h, pins=arm, end_hub=end_hub))
+            arms.append(Arm(hub=h, pins=arm, end_hub=end_hub, parent=parent))
     if len(visited) != n:
         raise ParseError("structures not reachable from any hub")
 
@@ -240,7 +269,34 @@ def _too_close(model, la, lo, sp):
 # template. Cette règle relative est juste pour add_factory et add_hub, qui
 # choisissent une position *à la place* de l'utilisateur et ont besoin d'un
 # creux libre — pas la même question qu'un déplacement délibéré.
-MIN_SEPARATION = 0.012 * 0.6  # BASE_SPACING * 0.6
+#
+# BASE_SPACING parce que c'est la limite du jeu et non un goût à nous : EVE ne
+# tient pas deux structures plus près, et les écarte à l'import. Le seuil valait
+# 0,6 * BASE_SPACING, emprunté à la règle relative ci-dessus, ce qui laissait
+# une bande entre 0,6 et 1 espacement où un placement n'était pas marqué et où
+# le jeu le déplaçait quand même — le silence exact sur la seule chose que la
+# marque existe pour dire. Chaque générateur tasse à exactement BASE_SPACING,
+# donc le seuil plus strict ne marque rien de ce que l'outil construit.
+MIN_SEPARATION = 0.012  # BASE_SPACING
+
+# De combien une paire doit passer *sous* le seuil avant d'être dite encombrée.
+#
+# Le seuil vaut exactement l'espacement auquel les générateurs tassent, donc une
+# paire posée dessus est le cas courant et non un cas limite — et mesurée sur une
+# sphère elle passe d'un cheveu en dessous. pin_angle prend l'acos d'un cosinus à
+# 1e-13 de 1, là où les derniers chiffres ont disparu : deux structures
+# équatoriales à un BASE_SPACING exact lisent 2e-13 sous le seuil. Hors de
+# l'équateur, sin(La) rétrécit réellement un écart de longitude, ce qui coûte
+# 8e-6 trois rangées plus loin. Ni l'un ni l'autre n'est de l'encombrement, et
+# les coordonnées sont écrites à cinq décimales — rien sous 1e-5 n'est une
+# mesure.
+#
+# 1e-4 dépasse les deux effets d'un ordre de grandeur tout en restant loin à
+# l'intérieur d'une vraie violation : la colonie qu'EVE a refusée se tenait à
+# 4,7e-3 sous la limite, quarante-sept fois cette marge. Sans elle, une colonie
+# fraîchement générée marquait ses 24 structures — c'est ainsi que le défaut a
+# été trouvé, déployé.
+SEPARATION_TOLERANCE = 1e-4
 
 
 def crowded_pins(pins):
@@ -255,7 +311,8 @@ def crowded_pins(pins):
     crowded = set()
     for left in range(len(pins)):
         for right in range(left + 1, len(pins)):
-            if pin_angle(pins[left], pins[right]) < MIN_SEPARATION:
+            if (pin_angle(pins[left], pins[right])
+                    < MIN_SEPARATION - SEPARATION_TOLERANCE):
                 crowded.add(left)
                 crowded.add(right)
     return sorted(crowded)
@@ -286,7 +343,8 @@ def move_pin(model, pin_idx, la, lo):
 def _free_spot_near(model, anchor_idx, sp):
     """Première position libre autour d'un pin, à un espacement du template."""
     a = model.pins[anchor_idx]
-    # Try multiple radii and more directions for denser layouts
+    # Plusieurs rayons et davantage de directions : de quoi caser un pin même
+    # dans une implantation dense.
     for radius_factor in (1, 1.5, 2, 2.5):
         r = sp * radius_factor
         for dla, dlo in ((0, r), (0, -r), (r, 0), (-r, 0),
@@ -344,7 +402,12 @@ def _drop_pin(template, idx_1b, repair=None):
 
 
 def add_factory(model):
-    """Ajoute une usine : plus court bras ouvert d'usines, sinon nouveau bras.
+    """Ajoute une usine : premier bras ouvert qui a de la place, sinon nouveau bras.
+
+    Les bras ouverts sont essayés du plus court au plus long. Ne tenter que le
+    plus court et renoncer si son bout est occupé rendait la croissance
+    dépendante d'un seul bras : déplacer une structure près de ce bout-là
+    bloquait toute la colonie alors que les autres bras étaient libres.
 
     Les bras-ponts ne grandissent jamais — insérer entre le bout et le hub
     d'en face tasserait le layout sous son propre espacement.
@@ -361,19 +424,31 @@ def add_factory(model):
         raise EditError("template has no factory to copy from")
 
     tpl = _working_copy(model)
-    growable = [a for a in open_arms if len(a.pins) < MAX_ARM_LEN]
-    if growable:
-        arm = min(growable, key=lambda a: len(a.pins))
-        donor_0b = arm.pins[-1]
+    sp = _median_spacing(model)
+    # Tous les bras ouverts, du plus court au plus long, et le premier qui a de
+    # la place gagne. Prendre le seul plus court bras et abandonner si son bout
+    # est pris suffisait à bloquer la croissance : déplacer une structure près
+    # d'un bout condamnait toute la colonie alors que trois autres bras étaient
+    # libres.
+    placed = None
+    for arm in sorted((a for a in open_arms if len(a.pins) < MAX_ARM_LEN),
+                      key=lambda a: len(a.pins)):
         tip = model.pins[arm.pins[-1]]
-        prev = model.pins[arm.pins[-2]] if len(arm.pins) > 1 else model.pins[arm.hub]
+        # arm.parent, pas arm.hub : sur une branche d'éventail le pin d'amont
+        # est celui où ça bifurque, et prolonger depuis le hub viserait à côté.
+        prev = (model.pins[arm.pins[-2]] if len(arm.pins) > 1
+                else model.pins[arm.parent])
         la = round(2 * tip["La"] - prev["La"], 5)
         lo = round(2 * tip["Lo"] - prev["Lo"], 5)
-        sp = _median_spacing(model)
-        if _too_close(model, la, lo, sp):
-            raise EditError("no room at the arm tip")
-        attach_1b = arm.pins[-1] + 1
+        if not _too_close(model, la, lo, sp):
+            placed = (arm.pins[-1], la, lo, arm.pins[-1] + 1)
+            break
+
+    if placed is not None:
+        donor_0b, la, lo, attach_1b = placed
     else:
+        # Aucun bout libre — y compris quand il n'y avait aucun bras ouvert du
+        # tout. Le vrai cul-de-sac est celui de `_free_spot_near`, plus bas.
         # Nouveau bras sur le hub le moins chargé, en miroir d'un bras existant.
         donor_arm = min(factory_arms, key=lambda a: len(a.pins))
         donor_0b = donor_arm.pins[-1]
@@ -610,7 +685,8 @@ def editability(model):
     reasons = {k: None for k in
                ("factories", "extractors", "heads", "launch_pads", "storage")}
 
-    # Amendment: separate mixed checks for factories and extractors
+    # Contrôles « mixtes » séparés : une usine et un extracteur peuvent être
+    # verrouillés pour des raisons différentes, on ne les confond pas.
     fac_schematics = {p.get("S") for p in model.pins if kind_of(p) in FACTORY_KINDS} - {None}
     ecu_schematics = {p.get("S") for p in model.pins
                       if kind_of(p) == "Extractor Control Unit"} - {None}

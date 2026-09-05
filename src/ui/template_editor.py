@@ -1,4 +1,14 @@
-"""Fenêtre d'édition d'un template importé.
+"""Fenêtre d'édition d'un template importé. DORMANT — plus rien ne l'ouvre.
+
+Depuis le 2026-09-04, Build est le seul endroit où une colonie se regarde et
+se change : la bibliothèque et le collage JSON y posent directement ce qu'ils
+ouvrent. Cette fenêtre redessinait la même planète dans une seconde scène, ce
+qui est exactement la raison pour laquelle le webtool a supprimé son écran
+équivalent le 2026-08-06.
+
+Le fichier reste en place le temps qu'on soit sûr de ne rien vouloir en
+reprendre — ses compteurs, notamment. Il n'est plus importé par PI.py : le
+réveiller demande de rétablir cet import.
 
 Compteurs de structures, rayon, niveau CC, nom — le modèle (colony_model)
 fait la chirurgie, analyze_template mesure, _draw_map dessine. Tout est
@@ -200,13 +210,14 @@ def open_template_editor(app, template, source_name=None):
         bar("PWR", analysis["power_used"], analysis["power_max"], mid + 10, right)
         y += 26
 
-        # Runs line — mirrors PI._refresh_layout_panel, minus an "asked"
-        # target: the editor has no interval setting to compare against.
+        # Ligne d'autonomie — calquée sur PI._refresh_layout_panel, sans la
+        # cible « demandée » : l'éditeur n'a pas de réglage d'intervalle
+        # auquel se comparer.
         runs = analysis["buffer_hours"]
         if runs == float("inf"):
             runs_txt, runs_col = "nothing accumulates — collect whenever", EVE["green"]
         else:
-            runs_txt = f"runs {runs:.0f}h untended"
+            runs_txt = f"storage lasts {runs:.0f}h"
             runs_col = EVE["green"] if runs >= 24 else EVE["orange"]
         c.create_text(8, y, anchor=tk.NW, text=runs_txt, fill=runs_col,
                       font=("Segoe UI", PI._fs(9), "bold"))
@@ -220,9 +231,10 @@ def open_template_editor(app, template, source_name=None):
                           fill=EVE["green"] if fed else EVE["red"], font=("Consolas", PI._fs(8)))
             y += 16
 
-        # Only real budget overruns get the hard-red ⚠ treatment; storage and
-        # extractor-balance warnings are already conveyed by the softer lines
-        # above and depend on assumed options this template doesn't carry.
+        # Seuls les vrais dépassements de budget ont droit au ⚠ rouge vif :
+        # les avertissements de stockage et d'équilibre des extracteurs sont
+        # déjà rendus par les lignes plus douces au-dessus, et ils dépendent
+        # d'options supposées que ce template ne transporte pas.
         budget_warnings = [w for w in analysis["warnings"]
                            if w.startswith("CPU over budget")
                            or w.startswith("Power over budget")]

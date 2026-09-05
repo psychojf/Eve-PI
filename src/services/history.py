@@ -30,7 +30,7 @@ PLANET_NAMES = {
 class Entry(NamedTuple):
     """Une ligne de la liste, sans le template lui-même."""
     id: str
-    at: float           # epoch seconds
+    at: float           # secondes epoch
     label: str
     kind: str           # generate | edit | open | mixed
     pins: int

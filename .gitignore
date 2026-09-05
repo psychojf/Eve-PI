@@ -1,0 +1,30 @@
+# Bytecode. Twenty-two of these were committed before this file existed: they
+# are whoever-ran-it-last's build products, and they conflict on every pull.
+__pycache__/
+*.py[cod]
+
+# Virtual environments and build output.
+venv/
+.venv/
+build/
+dist/
+
+# Local settings: window geometry, theme, opacity, last scan, layout prefs.
+# Machine-specific, and rewritten every time the app closes.
+pi_config.json
+
+# Debug log, written only when PI_DEBUG is set.
+pi_debug.log
+
+# The compiled executable: 34 MB, rebuilt by `python -m PyInstaller build.spec`.
+Eve PI.exe
+
+# Test and screenshot artefacts.
+.pytest_cache/
+test_output.txt
+shots/
+
+# Note on what is deliberately NOT ignored:
+#   data/planet_radii.json, data/system_names.json and the cached scan results
+#   are caches the app can rebuild, but they ship on purpose so a fresh clone
+#   works offline from the first launch.

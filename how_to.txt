@@ -10,25 +10,74 @@ Double-click "Eve PI.exe" to launch the app.
   OR
 Run from source:  python PI.py
 
-Keep the "data" folder next to the .exe — the planet icons,
-template library and planet radius table are read from
-there, not from inside the executable.
+The executable is self-contained. Planet artwork, the Scout's
+offline map snapshot and the planet icons all travel inside
+it, so you can move the .exe anywhere. It creates a "data"
+folder beside itself the first time it runs, for the things
+it writes: your saved templates, the work history and your
+settings.
 
-The main window has six configuration steps, a Bill of
-Materials panel below them, and three buttons at the bottom:
-GENERATE TEMPLATE, PROXIMITY SCOUT and TEMPLATE LIBRARY.
+The window is one screen split in two: the settings on the
+left, and the colony those settings describe on the right.
+They are the same job, so they are in the same window — you
+change a number and watch the planet answer.
+
+Down the far left is a narrow rail with four destinations:
+
+  Build             the settings and the planet
+  Library           your saved colonies, as cards
+  Proximity Scout   find a planet to build on
+  JSON              paste a colony in, copy one out
+
+Build, Library and JSON replace what you are looking at. The
+Scout opens its own window and leaves the rail where it is,
+because you go looking for a planet *while* you are building,
+not instead of it.
+
+Settings live behind the gear icon at the top right, from
+every screen.
+
+THE WINDOW SIZES ITSELF
+
+  You should never have to scroll to see your own colony, so
+  the window height follows what there is to show. A small
+  P1 colony gets a short window; a P4 with a long bill of
+  materials gets a taller one; clearing it shrinks back.
+
+  Only the height moves — nothing overflows sideways.
+
+  If your screen cannot fit what the colony needs, the text
+  size steps down in small increments rather than cutting
+  anything off, and steps back up when there is room again.
+  Your own text-size setting is never overwritten by this.
 
 -----------------------------------------------------------
-STEP 1 — GENERATING A TEMPLATE
+STEP 1 — DESCRIBING THE COLONY
+-----------------------------------------------------------
 
 NOTHING IS CHOSEN WHEN YOU OPEN THE TOOL
 
-  Product reads "Choose a product...", and chain and planet
-  are blank. That is deliberate: the tool should not open
-  describing a colony you never asked for, and the Proximity
-  Scout uses the difference to tell "I am starting a build"
-  from "I opened this to go find a planet".
------------------------------------------------------------
+  All three dropdowns read "Choose a…", and the right half
+  shows an empty barren planet with a single launch pad.
+  That is deliberate: the tool should not open describing a
+  colony you never asked for.
+
+  Choosing a product does NOT choose a chain for you, and
+  choosing a chain does not choose a planet type. A setting
+  you did not pick should not read like one you did — and
+  the panel stays quiet until all three are yours.
+
+  What is already chosen and still valid is kept. Switching
+  product inside the same chain leaves the chain alone.
+
+THERE IS NO "GENERATE" BUTTON
+
+  There used to be, and it offered to produce a colony the
+  panel had already calculated. The moment product, chain
+  and planet type are all set, the colony is drawn, priced
+  and complete on the right.
+
+  Everything after that adjusts what is already there.
 
 Work down the numbered panels:
 
@@ -82,8 +131,10 @@ Work down the numbered panels:
        - P4 chains are limited to Barren and Temperate,
          the only types that allow a High-Tech facility.
        - Extraction chains list the planet types that
-         actually hold the raw resources, with the most
-         complete ones first.
+         actually hold the raw resources.
+
+     This is the choice that brings the colony to life. Make
+     it and the planet on the right fills in.
 
   4. PLANET RADIUS (km)
      Type the radius of your actual planet. Find it in-game:
@@ -120,39 +171,7 @@ Work down the numbered panels:
 
   6. LAYOUT
      There is no single correct PI layout, so the decisions
-     that actually shape a colony are yours:
-
-     Collect every — how long the colony must run without
-       you. It is a MINIMUM, not a target: the generator adds
-       launch pads, and if that is not enough drops
-       factories, until the colony can survive that long
-       unattended. If it already lasts longer, nothing
-       changes and the panel says so — "runs 160h untended
-       (48h asked, already covered)".
-
-       So whether this control does anything depends entirely
-       on the chain:
-
-         P3 → P4 — changes every step. At level 5: 16
-           facilities on 2 pads at 6h, 12 on 3 pads at 12h,
-           8 on 4 pads at 24h, 4 on 4 pads at 48h.
-         P1 → P2 — nothing until 48h; the default build
-           already survives about 34 hours.
-         P2 → P3 — nothing until 24h (23 facilities on 3
-           pads becomes 20 on 4), then 13 on 4 pads at 48h.
-           Its P3 output is bulkier, so it fills pads faster
-           and only lasts about 21 hours by default.
-         P0 → P1, P0 → P2 — usually nothing at any setting.
-           P1 and P2 are compact, so one pad already holds
-           several days: a balanced level 5 extraction planet
-           runs roughly 150 hours untended.
-
-       In short, it bites on planets you have to feed. A
-       planet that mines its own input has almost nothing
-       accumulating except its finished goods, and those take
-       days to fill a pad. If you want more storage there
-       anyway, tick "Set counts myself" and raise Pads by
-       hand — each pad added multiplies the time.
+     that actually shape a colony are yours.
 
      Extractor yield — units per head per hour, shown only
        for extraction chains. This is the number the whole
@@ -167,7 +186,7 @@ Work down the numbered panels:
        Ticking it fills the boxes with what the generator
        just chose on its own, so it doubles as a readout: you
        see the colony is 21 factories on 4 pads without
-       generating anything. Ticking never changes the layout,
+       changing anything. Ticking never changes the layout,
        it only shows you the numbers behind it. Edit from
        there, or untick to hand the decision back.
 
@@ -215,7 +234,7 @@ Work down the numbered panels:
          These include every link priced by its real length,
          so they move when you change the planet radius in
          ④ even though nothing else about the colony did.
-       "runs Nh untended (Nh asked)" — green when it meets
+       "storage lasts Nh (Nh asked)" — green when it meets
          the interval, amber when it falls short. When it is
          already comfortably past it, the line reads
          "already covered", which is your confirmation that
@@ -226,39 +245,87 @@ Work down the numbered panels:
          link named as carrying more than 1250 m3/h — see
          Arm len above.
 
-     Your interval and yield choices are remembered between
-     sessions; the manual counts are not.
-
-  Then click GENERATE TEMPLATE.
+     Your yield choice is remembered between sessions; the
+     manual counts are not.
 
 -----------------------------------------------------------
-STEP 2 — READING THE OUTPUT
+COLLECT EVERY — ON THE PLANET
 -----------------------------------------------------------
 
-A popup window appears with:
+The collection interval floats on the planet itself, top
+left, as a small bar: 6h · 12h · 24h · 48h · 72h · 168h.
+Drag it by the ⠿ handle if it sits over something you want
+to see.
 
-  - The JSON template text
-  - A visual planet map of the layout
-  - A "Copy JSON" button
+It is there rather than in the settings column because its
+answer is written on the planet — in the drop-off panel and
+in "storage lasts". The control and its result were at
+opposite ends of the screen.
+
+It is a MINIMUM, not a target: the generator adds launch
+pads, and if that is not enough drops factories, until the
+colony can survive that long unattended. If it already lasts
+longer, nothing changes and the panel says so.
+
+So whether it does anything depends entirely on the chain:
+
+  P3 → P4 — changes every step. At level 5: 16 facilities
+    on 2 pads at 6h, 12 on 3 pads at 12h, 8 on 4 pads at
+    24h, 4 on 4 pads at 48h.
+  P1 → P2 — nothing until 48h; the default build already
+    survives about 34 hours.
+  P2 → P3 — nothing until 24h, then 13 on 4 pads at 48h.
+    Its P3 output is bulkier, so it fills pads faster.
+  P0 → P1, P0 → P2 — usually nothing at any setting. P1 and
+    P2 are compact, so one pad already holds several days.
+
+In short, it bites on planets you have to feed. A planet
+that mines its own input has almost nothing accumulating
+except its finished goods, and those take days to fill a
+pad. If you want more storage there anyway, tick "Set counts
+myself" and raise Pads by hand — each pad added multiplies
+the time.
+
+On a chain whose geometry is fixed, the bar reads CHECK
+AGAINST instead of COLLECT EVERY: there the interval judges
+the colony rather than resizing it, and a title promising to
+collect would be a lie.
+
+-----------------------------------------------------------
+STEP 2 — READING THE COLONY
+-----------------------------------------------------------
+
+The right half shows, top to bottom:
+
+  - A toolbar: Copy JSON, Reset View, Save to Library,
+    Start over
+  - The import notice
+  - The JSON, exactly as EVE will read it
+  - The colony drawn on the real artwork of the planet type
+    you picked
 
 To import into EVE Online:
   1. Click "Copy JSON"
   2. In EVE, open the planet's Planetary Interaction view
   3. Use the in-game template import and paste
 
-The colony is drawn on the real artwork of the planet type
-you picked. The planet stays put — panning and zooming move
-the colony over it, not the world behind it.
+The planet stays put — panning and zooming move the colony
+over it, not the world behind it.
 
 The map has a legend in the corner covering Launch Pad,
 Storage Facility, Basic Industry, Advanced Industry,
 High-Tech Industry and Extractor (ECU).
 
-Drag to pan the map, scroll to zoom, and drag the popup
-edges to resize. Hover any structure for a tooltip listing
-what it consumes and produces per cycle. On pure factory
-planets the Launch Pad tooltip also estimates how long it
-takes to fill up, so you know how often to collect.
+Drag to pan the map, scroll to zoom. Hover any structure for
+a tooltip listing what it consumes and produces per cycle. On
+pure factory planets the Launch Pad tooltip also estimates
+how long it takes to fill up, so you know how often to
+collect.
+
+An extractor wears its head count as a small badge. That
+number decides everything downstream — what the ground gives,
+so how many factories run — and it should be readable without
+hovering each one.
 
 WHAT THE LINES MEAN
 
@@ -269,25 +336,36 @@ WHAT THE LINES MEAN
 
 IT FOLLOWS YOUR SETTINGS
 
-  Leave this window open, go back to the main panel and
-  change the factory or pad count: the map, the CPU/PWR
-  figures and the JSON all redraw here. You do not have to
-  generate again.
+  Change a factory or pad count and the map, the CPU/PWR
+  figures and the JSON all redraw. There is nothing to
+  regenerate.
 
-  One exception worth knowing: if you have dragged a
-  building by hand and then change a count, the regenerated
-  colony replaces your arrangement -- the generator has no
-  way to keep hand placement. It is not lost, every drag is
-  recorded in HISTORY.
+  What a change is allowed to do depends on what it means.
+  Product, chain and planet type describe a *different*
+  colony, so they rebuild it. Radius and command center
+  level only change what the existing layout costs, so
+  nothing moves. The counters edit the colony in place and
+  keep every structure you positioned yourself.
+
+START OVER
+
+  Next to Save to Library. It empties the planet and returns
+  all six steps to how they were at launch.
+
+  If you have arranged structures by hand and not saved
+  them, it asks first: save to library, discard, or cancel.
+  A colony the panel just generated is not worth asking
+  about — it is three clicks from being reproduced — so it
+  does not ask.
 
 SAVING IT
 
-  "Save to Library" sits next to Reset View. It asks for a
-  name and stores the colony as "Custom - <name>.json", so
-  it appears in TEMPLATE LIBRARY straight away.
+  "Save to Library" asks for a name and stores the colony as
+  "Custom - <name>.json", so it appears in the Library
+  straight away.
 
-  It saves what is on screen -- including any building you
-  dragged -- not the template the window opened with.
+  It saves what is on screen — including any building you
+  dragged — not the template the screen opened with.
 
 MOVING A BUILDING
 
@@ -302,111 +380,65 @@ MOVING A BUILDING
   tool lets you go over budget and shows it in red. The ring
   stays until you move them apart.
 
-  Every move is recorded in HISTORY (see below), so closing
-  the window no longer throws the work away.
+  Every move is recorded in HISTORY, so leaving the screen
+  never throws the work away.
 
 -----------------------------------------------------------
 HOW THE ROUTES ARE ORDERED
 -----------------------------------------------------------
 
-On a colony with more than one launch pad, every factory
-gets an input route from every pad. That is deliberate: a
-factory whose own pad runs dry keeps working off the others
-instead of stopping.
+EVE drains a factory's input routes in the order they were
+created, not evenly. A factory with two sources empties the
+first one completely before touching the second.
 
-What makes it work is the order. EVE feeds a factory from
-its input routes in the order they were created, so the
-first route wins until it runs out. Every template this tool
-generates therefore lists each factory's OWN pad first, and
-the other pads after it.
+So every factory is routed from its OWN launch pad first,
+and only then from the others. On a multi-pad colony that is
+the difference between the pads emptying together and one
+pad emptying while the rest sit full.
 
-The result in game: each row of factories eats from the pad
-in its own row, all pads drain together, and the cross-pad
-routes stay idle until a row actually runs short. Then they
-take over on their own.
+This matters when you split a planet between two products:
+each bank of factories drinks from the pad it sits on, so
+the two products never compete for the same stock.
 
-You can check it on any factory: open its Routes tab, click
-the sort arrow off so you see creation order, and the first
-input route should come from the same pad its output goes
-to. Sorted by commodity instead, every factory on the planet
-looks identical — that view is alphabetical, not priority,
-so it tells you nothing about which pad gets drained.
-
-One thing worth knowing: this order is written into the
-template when it is generated. A colony you already built
-keeps the order it was imported with, so if an old planet
-drains one pad while the others sit full, regenerate the
-template and rebuild the routes — editing structures alone
-will not reorder them.
+If you built a colony from an older copy of this tool and
+see every factory pulling from one pad, regenerate it and
+rebuild the input routes in game — EVE keeps the order a
+route was created in, so editing the template alone is not
+enough.
 
 -----------------------------------------------------------
 BILL OF MATERIALS
 -----------------------------------------------------------
 
-The BOM panel below the configuration steps has two halves.
+Under the layout strip, and it answers three questions.
 
-The top names every production facility the colony builds,
-with how many of each, followed by INPUTS — one factory's
-recipe for one cycle, the same numbers EVE shows you in the
-facility window.
+  ONE FACTORY, PER CYCLE
+    The recipe. What a single facility consumes each cycle
+    and what it produces.
 
-PER HOUR, AND PER TRIP
+  HAUL IN · whole colony, per trip
+    What you must bring, per hour and per collection trip.
+    The per-trip column is the number you load a hauler
+    against.
 
-  Each row shows two numbers: the hourly rate, and what that
-  comes to over one collection trip. The per-trip figure is
-  the one you load a hauler against.
+  COLLECT · whole colony, per trip
+    What you take away, in units and in m3.
 
-  It is capped at what storage actually survives. Ask for
-  48h from a colony whose pads fill in 33 and you get:
+The per-trip columns are capped at what storage actually
+survives. Ask 48h of a colony that jams at 33 and the panel
+says so, then computes for 33 — a figure for 48 hours the
+colony cannot reach would be a number you would pack a ship
+against and be wrong.
 
-    Storage lasts 33.2h, not the 48h asked for -- the trip
-    figures below are for 33.2h, after which the colony jams.
+EXTRACTED ON-PLANET replaces HAUL IN on extraction chains
+for anything the planet mines itself.
 
-  That is not a smaller haul, it is 15 hours of a jammed
-  factory. The figures are computed at 33.2h so the number
-  you act on is the honest one.
-
-The blocks below it describe the WHOLE colony:
-
-  - "EXTRACTED ON-PLANET" (green) — what your extractor
-    heads pull out of the ground each hour
-  - "HAUL IN" (orange) — what you must ship to the Launch
-    Pad each hour to keep the factories fed
-  - "COLLECT" (accent) — what piles up for you to pick up
-
-Under HAUL IN, a note may say something like:
-
-  6 of 7 factories are fed by extraction.
-  The rest need 2,000/h of Planktic Colonies hauled in.
-
-That is the tool telling you the difference between an
-import you MEANT and extractors quietly falling behind the
-factory count you typed. The quantity above it reads the
-same either way, which is exactly why it is spelled out.
-It is advice about hauling, not a refusal — the colony is
-what you asked for, and this is what running it costs. Add
-an extractor head, drop a factory, or haul it in.
-
-Only raw P0 counts here. A P0 -> P2 colony on a planet
-missing one of its P0s imports that P1 by design, and
-nagging about it would be wrong.
-
-Under COLLECT, a "surplus" sub-list means raw material your
-factories cannot keep up with. It fills storage exactly like
-finished goods and is then lost, so either add a factory or
-pull an extractor head.
-
-Each colony-wide block ends with its volume in m3/h, so you
-can size a hauler against it.
-
-Because these are hourly totals for the whole planet, you
-can size one planet against another: if a P2 → P4 planet
-eats 60 Transmitters/h and a P1 → P2 planet makes 105/h,
-one feeds it with room to spare. That is how you build
-modular factory planets you can clone.
-
-Rows are colour-coded by tier — P0 grey, P1 pale blue,
-P2 green, P3 sand, P4 in the theme's accent colour.
+When a colony runs more factories than its heads support,
+the panel says so in words: "6 of 7 factories are fed by
+extraction; the rest need 2,000/h of Planktic Colonies
+hauled in". The shortfall was always visible in the haul-in
+figures, but a quantity there reads the same whether it is a
+deliberate import or the extractors falling behind.
 
 -----------------------------------------------------------
 PROXIMITY SCOUT
@@ -415,12 +447,15 @@ PROXIMITY SCOUT
 Finds the planets around a system so you can pick where to
 set up.
 
-  1. Click "PROXIMITY SCOUT" at the bottom of the main
-     window.
+  1. Click "Proximity Scout" in the rail.
   2. Type a system name — autocomplete suggests matches
      after two characters.
   3. Set JUMPS (0–10) for how far out to scan.
   4. Click SCAN, or press Enter.
+
+It opens in its own window and leaves your build alone. You
+can look at what is nearby without losing what you were
+doing.
 
 Results are grouped by system, closest first. Each system
 header shows its security status, the planet types it
@@ -433,12 +468,16 @@ heads spread further apart and better yield.
 
 CLICK A PLANET TO BUILD ON IT
 
-  Hover a card and it offers "BUILD HERE". Clicking carries
-  BOTH the planet type and its exact radius into the
-  generator and builds the template straight away. That
-  matters: the radius sets link length, and link cost scales
-  with length, so a radius retyped by hand quietly reprices
-  the whole colony.
+  Hover a card and it offers "BUILD HERE". Clicking closes
+  the Scout, returns you to Build, and carries BOTH the
+  planet type and its exact radius across. That matters: the
+  radius sets link length, and link cost scales with length,
+  so a radius retyped by hand quietly reprices the whole
+  colony.
+
+  If you have not chosen a product yet, that is fine — the
+  planet and radius are filled in and the panel asks you for
+  the one thing still missing.
 
   If the chain you have selected cannot run there — an
   extraction chain on a planet without the raw material, or
@@ -452,6 +491,10 @@ expands the systems that still have matches, so you can hunt
 for, say, every Lava planet within 5 jumps in one glance.
 Your selection is remembered for next time.
 
+Choose the P1 you mean to extract in the EXTRACT box and the
+planet filter narrows to the types that carry its raw
+material, disabling the rest.
+
 Scanning is instant and works offline. The tool ships with
 a snapshot of the map — 8,490 systems and 67,693 PI planets
 — so resolving a name, walking the stargates and listing
@@ -462,112 +505,90 @@ One honest limit: wormhole systems have no fixed stargates,
 so scanning from inside J-space returns that system alone.
 Nothing can precompute a wormhole route.
 
-If the snapshot file is ever missing, the tool falls back to
-the old live-ESI scan, which is slow and needs a connection.
-
 -----------------------------------------------------------
-TEMPLATE LIBRARY
+LIBRARY
 -----------------------------------------------------------
 
-"TEMPLATE LIBRARY" holds the colonies YOU keep. It starts
-empty; nothing is shipped in it. Double-click one to open it
-in the same preview window used for generated templates,
-then copy it as usual.
+Your saved colonies, one card each. It starts empty; nothing
+is shipped in it.
 
-Two ways in:
+A card answers the four questions you ask standing in front
+of a library, without opening anything: which chain, which
+planet, how many structures, and when you saved it — plus a
+breakdown of what those structures are.
 
-  - From HISTORY, select a state and click "Save to library"
-  - From the TEMPLATE EDITOR, click Save to Library
+The search box filters on the name and on the template's own
+comment, so typing "barren" finds a barren colony you named
+something else.
 
-Either way it is stored as "Custom - <your name>.json". The
-editor refuses to overwrite anything that is not a Custom
-file, because there is no undo here.
+Three buttons per card:
 
-To change a template instead of just copying it, select it
-and click "✎ Edit" — see TEMPLATE EDITOR below.
+  Load    opens the colony on the Build stage
+  Edit    the same, but it checks first that the structures
+          can be rearranged and tells you if they cannot,
+          rather than landing you somewhere nothing moves
+  Delete  asks first — there is no undo and no recycle bin
+
+Opening a colony fills the whole settings panel in from it:
+product, chain, planet type, radius and command center
+level. None of that is read from the file's name or comment
+— it is derived from the colony itself, so a template from a
+forum post reads correctly too.
+
+That matters for what happens next: because the panel now
+describes what is on screen, changing the command center
+level or the radius re-prices the colony you opened instead
+of replacing it with a different one.
+
+If you have unsaved hand-arranged work, Load and Edit ask
+before replacing it.
 
 -----------------------------------------------------------
-TEMPLATE EDITOR
+JSON
 -----------------------------------------------------------
 
-Every bundled template is built for one planet size, and
-link cost grows with link length, so the same colony on a
-bigger planet can blow its CPU and power budget. The
-editor is how you fix that: open a template, re-price it
-for your planet, trim it until it fits, and take corrected
-JSON back out.
+Where a colony comes in and goes out as raw text.
 
-Open it from the Template Library: select a template and
-click "✎ Edit", or click "📋 Paste JSON" to start from a
-template copied from anywhere else.
+  IMPORT
+    "Open JSON file" reads a .json from disk.
+    Paste into the box and press "Use pasted JSON", or use
+    the "from clipboard" link to fill the box in one click.
 
-The window shows the map, the live JSON and the same
-validation strip as the main window. You can change:
+    Either way the colony lands on the Build stage, with the
+    settings panel filled in from it, exactly as a Library
+    load does.
 
-  - Five counters: Factories, Extractors, Heads per
-    extractor, Launch Pads and Storage.
-  - Planet radius and Command Center level. These move
-    nothing — they change what the existing layout costs,
-    which is usually the whole point.
-  - The template name, as EVE's import list will show it.
+  EXPORT
+    "Copy JSON" puts the colony on your clipboard in the
+    compact form EVE reads.
+    "Save JSON file" writes it to disk.
 
-As everywhere else, nothing is refused: go over budget and
-the strip turns red and says by how much. "🧲 Fit to
-planet" is the way back — it trims factories from the arm
-tips until the colony fits, then reports what it removed.
+Below both, the colony currently on the stage, in the same
+compact form the Copy button produces — so what you read is
+what you would paste.
 
-Getting the result out:
-
-  - "📋 Copy JSON" — paste into EVE's PI import, exactly
-    as from the preview window.
-  - "⬇ Save to EVE Folder" — writes the file into
-    Documents\EVE\PlanetaryInteractionTemplates, so it
-    appears in the in-game import list after a restart or
-    relog.
-  - "💾 Save to Library" — keeps it in this app under a
-    new "Custom" category, listed at the top of the
-    Template Library. Bundled templates are never
-    overwritten.
-
-A template the editor cannot restructure — one that makes
-two different products, say — still opens, with the
-counters greyed out and the reason shown; you keep the map
-and the analysis.
+Importing in EVE: leave "Compress Pins" unticked. Ticked,
+the game repacks the colony to its own spacing and the
+layout you drew is lost without a word. Unticked, it names
+any structure sitting too close and refuses, which is the
+answer worth having.
 
 -----------------------------------------------------------
 ASSIGN P2 PER FACTORY
 -----------------------------------------------------------
 
-Only shown for the "P1 -> P2 (Factory)" chain, because it is
+Only shown for the "P1 → P2 (Factory)" chain, because it is
 the only one where every factory makes a P2 out of P1s.
 
 Normally a colony makes one product on every factory. This
 lets each Advanced Industry Facility make a DIFFERENT P2 on
-the same proven layout — useful when you want one planet to
-cover several P2s instead of dedicating a planet to each.
+the same proven layout: only the schematics and the route
+payloads are rewritten, never the pins, the links or the
+route paths.
 
-  1. Set up the colony as usual (product, planet, counts).
-  2. Click "ASSIGN P2 PER FACTORY".
-  3. Pick a P2 for each factory, or "All -> <product>" to
-     reset them.
-  4. Click "GENERATE MIXED".
-
-The panel updates as you choose, showing:
-
-  FACTORY ALLOCATION   how many factories make what
-  P1 SHOPPING LIST     everything to haul in for one full
-                       batch, per hour and per batch
-  P2 OUTPUT            what comes back out
-  RUNS FOR             how long a full launch-pad load keeps
-                       the plan running, in whole hours
-
-Only the schematics and the goods on the routes change. Pin
-positions, links and route paths are exactly what the normal
-generator produced, so the layout is the one already known
-to import cleanly.
-
-Whole cycles only: a part-finished cycle produces nothing,
-so the runtime never rounds up.
+You get an aggregated P1 shopping list, P2 output totals,
+the factory allocation, and how many whole hourly cycles a
+full launch-pad load runs.
 
 -----------------------------------------------------------
 HISTORY
@@ -576,14 +597,14 @@ HISTORY
 Always on. There is nothing to switch on and nothing to
 remember to press.
 
-Every template you generate, every mixed plan you build and
-every structure you drag is recorded. That last one is the
-point: a colony you arranged by hand used to live only in
-the window that drew it, so closing it threw the work away.
+Every colony you build, every mixed plan and every structure
+you drag is recorded. That last one is the point: a colony
+you arranged by hand used to live only in the window that
+drew it, so closing it threw the work away.
 
-Click "HISTORY" to see the list, newest first, with the
-time, what you were doing, the planet, and the structure and
-link counts.
+Click "HISTORY" in the Build panel to see the list, newest
+first, with the time, what you were doing, the planet, and
+the structure and link counts.
 
   RESUME            reopen that colony on the map
                     (or double-click the row)
@@ -604,7 +625,7 @@ delete it.
 SETTINGS
 -----------------------------------------------------------
 
-Click the gear icon in the title bar.
+Click the gear icon in the title bar, from any screen.
 
   Opacity   — window transparency
   Text size — 80% to 200%, for every font in the app
@@ -614,9 +635,8 @@ Click APPLY to confirm. Text size and theme both rebuild the
 window, so it will blink once.
 
 Text size scales the panels as well as the text, so nothing
-overlaps or gets cut off. You can also drag any window edge
-to resize it, and every window position and size is saved
-automatically.
+overlaps or gets cut off. The window then re-fits itself
+around the new size.
 
 The "?" button opens the About panel.
 
@@ -646,12 +666,11 @@ TIPS
 
 - Run the Proximity Scout before committing to a system, and
   use the type filter to find the planet types your chain
-  needs.
+  needs. It no longer costs you the build you had started.
 
-- Radius matters. Check it in-game and type the real value
-  before generating.
+- Radius matters. Check it in-game and type the real value.
 
-- Two products on one factory planet: generate with Pads 2,
+- Two products on one factory planet: set Pads 2,
   Factories 24, Arm len 6, then in game set half the
   factories to the second schematic. Two pads instead of
   three is what buys the 24th factory, and each bank of 12
@@ -673,6 +692,11 @@ TIPS
 -----------------------------------------------------------
 TROUBLESHOOTING
 -----------------------------------------------------------
+
+Nothing appears on the planet
+  — All three of product, chain and planet type have to be
+    chosen. None of them is filled in for you. The panel
+    names whichever one is still missing.
 
 "Could not generate template"
   — The Command Center level is too low for that layout.
@@ -704,6 +728,13 @@ TROUBLESHOOTING
     does not break the import; the factories behind that
     link simply cannot all be fed at once.
 
+Two structures on top of each other
+  — Should not happen any more; every colony the tool can
+    build is checked against EVE's minimum spacing. If you
+    see it, it came from a hand drag: both structures wear a
+    dashed red ring until you move them apart. EVE refuses
+    to import a colony with structures touching.
+
 All factories drain the same launch pad
   — The template was generated before route order was fixed,
     or the colony was built from an old copy. See HOW THE
@@ -718,28 +749,29 @@ The layout panel is greyed out
 
 "Collect every" changes nothing
   — Almost always because the colony already outlasts the
-    interval; the panel confirms this with "already covered"
-    on the untended line. It is a minimum to meet, not a size
-    to hit, so it only acts when the colony would fall short.
-    Extraction planets rarely need it at all. Raise Pads
-    manually if you want a bigger buffer regardless.
+    interval; the panel confirms this with "already covered".
+    It is a minimum to meet, not a size to hit, so it only
+    acts when the colony would fall short. Extraction planets
+    rarely need it at all. Raise Pads manually if you want a
+    bigger buffer regardless.
+
+The window keeps resizing itself
+  — That is the fit. It follows what there is to show, so it
+    only moves when the colony's size actually changes. Drag
+    an edge and it stays where you put it until then.
 
 Radius shows "—" in the Proximity Scout
-  — The planet radius table is missing. The app downloads it
-    once from the Fuzzwork SDE dump (~85 MB, several
-    minutes) and caches it in data/planet_radii.json. Make
-    sure that file is present next to the executable.
-
-Planet cards show plain coloured circles instead of icons
-  — data/planet_icons is missing next to the executable.
+  — The offline map snapshot could not be read. The tool
+    normally answers from the copy inside the executable and
+    never needs the network for this.
 
 "No systems found" / scan errors
-  — Check your internet connection; the scout reads live
-    data from ESI.
+  — Check the system name first. The Scout works offline
+    from the bundled snapshot; it only reaches for ESI if
+    that snapshot is missing.
 
 App crashes on launch (from source)
   — Install the dependencies: pip install -r requirements.txt
   — pystray is optional, but required for tray support.
 
 ===========================================================
-</content>

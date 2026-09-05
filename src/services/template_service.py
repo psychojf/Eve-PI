@@ -1,4 +1,4 @@
-"""Template generation service for EVE PI."""
+"""Service de génération de templates pour EVE PI."""
 from __future__ import annotations
 
 import datetime
@@ -35,6 +35,7 @@ from src.pi_data import (
     STRUCTURE_IDS,
     STRUCTURES,
 )
+from src.services.sourcing import EXTRACT, IMPORT, material_legs
 
 ID_TO_NAME = {tid: name for name, tid in NAME_TO_ID.items()}
 STRUCT_ID_TO_NAME = {tid: name for name, per_planet in STRUCTURE_IDS.items()
@@ -66,6 +67,18 @@ class LayoutOptions:
     launch_pads: Optional[int] = None
     storage: Optional[int] = None
     arm_length: Optional[int] = None
+    # Les entrées P1 à faire entrer plutôt qu'à extraire, quoi que porte le sol.
+    #
+    # None veut dire « le sol décide », ce que tous les appelants voulaient dire
+    # avant que ce champ existe : un P1 dont le P0 est dans les ressources de la
+    # planète est extrait, le reste arrive par le pad. Garder None comme défaut
+    # est ce qui laisse la référence dorée intacte.
+    #
+    # Un nom ici est la réponse de l'utilisateur à une question que le sol ne
+    # peut pas trancher — importer un P1 qu'on *pourrait* extraire rend son
+    # extracteur et ses usines basiques, et concentre toutes les têtes sur la
+    # ressource gardée.
+    imported_inputs: Optional[tuple] = None
 
     @classmethod
     def from_config(cls, data):
@@ -239,7 +252,7 @@ def analyze_template(template, options=None):
     cc_level = template.get("CmdCtrLv", 0)
 
     counts = {}
-    produced, consumed = {}, {}      # commodity -> units/hour
+    produced, consumed = {}, {}      # marchandise -> unites/heure
     p0_supply = 0.0
     heads_total = 0
     cpu = pw = 0
@@ -261,7 +274,8 @@ def analyze_template(template, options=None):
         if not product:
             continue
         if sname == "Extractor Control Unit":
-            # Extractors make raw material out of nothing but time.
+            # Un extracteur sort de la matière première à partir de rien — rien
+            # d'autre que du temps.
             rate = heads * opts.yield_per_head
             p0_supply += rate
             produced[product] = produced.get(product, 0) + rate
@@ -273,20 +287,21 @@ def analyze_template(template, options=None):
         for inp_name, inp_qty in recipe["input"]:
             consumed[inp_name] = consumed.get(inp_name, 0) + hourly_rate(inp_qty, sname)
 
-    # Links are priced by length, so the same layout costs more on a bigger
-    # planet. Charging a flat rate here is what let the tool bless templates
-    # that EVE then refused to import.
+    # Le prix d'un lien dépend de sa longueur : la même implantation coûte donc plus
+    # cher sur une planète plus grosse. Facturer ici un tarif forfaitaire, c'est ce
+    # qui faisait bénir par l'outil des templates qu'EVE refusait ensuite d'importer.
     link_cpu, link_pw = links_cost(template)
     cpu += link_cpu
     pw += link_pw
 
-    # What the planet cannot make for itself has to be hauled in; what it makes
-    # beyond its own needs piles up until collected. Both consume pad space.
+    # Ce que la planète ne sait pas fabriquer doit être importé ; ce qu'elle produit
+    # au-delà de ses propres besoins s'entasse jusqu'au ramassage. Les deux occupent
+    # de la place sur les pads.
     imports = {n: q - produced.get(n, 0) for n, q in consumed.items()
                if q - produced.get(n, 0) > 1e-9}
-    # Raw material the factories cannot keep up with counts too: it piles up in
-    # storage exactly like finished goods, and once storage is full the
-    # extractor's output is simply lost.
+    # La matière brute que les usines n'arrivent pas à suivre compte aussi : elle
+    # s'entasse en stock exactement comme un produit fini, et une fois le stock
+    # plein, la production de l'extracteur est purement et simplement perdue.
     exports = {n: q - consumed.get(n, 0) for n, q in produced.items()
                if q - consumed.get(n, 0) > 1e-9}
 
@@ -296,7 +311,13 @@ def analyze_template(template, options=None):
     import_m3_h = _volume(imports)
     export_m3_h = _volume(exports)
     buffer_m3 = sum(STORAGE_CAPACITY_M3.get(n, 0) * c for n, c in counts.items())
-    throughput = import_m3_h + export_m3_h
+    # Le côté le plus chargé, jamais la somme. Les entrées se vident à mesure
+    # que les sorties s'accumulent : l'occupation à l'instant τ d'un cycle de
+    # durée t vaut I·(t−τ) + E·τ, linéaire en τ, donc maximale à l'une des
+    # deux bornes — I·t à l'arrivée, pads pleins d'intrants, ou E·t à la fin,
+    # pleins de produit. Les additionner dimensionne le stockage pour un
+    # instant qui n'arrive jamais et sous-estime toute colonie qui importe.
+    throughput = max(import_m3_h, export_m3_h)
     buffer_hours = (buffer_m3 / throughput) if throughput > 0 else float("inf")
 
     p0_demand = sum(q for n, q in consumed.items() if get_tier(n) == "P0")
@@ -314,10 +335,11 @@ def analyze_template(template, options=None):
         warnings.append(f"Storage only lasts {buffer_hours:.0f}h, "
                         f"not the {opts.collection_hours}h asked for")
 
-    # The innermost link of an arm carries every factory behind it, so a long
-    # arm can quietly outgrow what the game lets routes use. Only level-0
-    # links are judged: the generator never emits upgraded ones, and each
-    # upgrade level has its own capacity this model does not track.
+    # Le lien le plus intérieur d'un bras porte toutes les usines situées derrière
+    # lui : un bras long peut donc discrètement dépasser ce que le jeu autorise aux
+    # routes. Seuls les liens de niveau 0 sont jugés — le générateur n'en émet
+    # jamais d'améliorés, et chaque niveau d'amélioration a sa propre capacité, que
+    # ce modèle ne suit pas.
     flows = link_flows(template, opts)
     level = {}
     for lk in links:
@@ -343,8 +365,9 @@ def analyze_template(template, options=None):
         "warnings": warnings,
     }
 
-# Structures that actually make something. Launch pads, storage and extractor
-# control units are infrastructure and stay out of the facility row.
+# Les structures qui fabriquent vraiment quelque chose. Launch pads, stockages et
+# extractor control units sont de l'infrastructure et restent hors de la ligne
+# « usines ».
 PRODUCTION_FACILITIES = (
     "Basic Industry Facility",
     "Advanced Industry Facility",
@@ -431,7 +454,8 @@ def factory_clamp_note(requested, built, pads, arm_len=None):
     geo_cap = pads * (arm_len or MAX_ARM_LEN) * 2
     if built < requested and built >= geo_cap:
         pad_word = "pad" if pads == 1 else "pads"
-        # At the pad ceiling "add a pad" is a dead end — say what the limit is.
+        # Au plafond des pads, « ajoutez-en un » est une impasse — autant dire
+        # où est la limite.
         tail = ("that's the most this planet holds" if pads >= MAX_LAUNCH_PADS
                 else "add a pad to place more")
         return f"{pads} {pad_word} hold {geo_cap} factories — {tail}"
@@ -537,6 +561,86 @@ def factory_coverage_note(coverage):
     return title, f"{subject} need {needs} hauled in."
 
 
+class FactoryBalance(NamedTuple):
+    """Le compte d'usines face à ce que le sol donne, dans les deux sens."""
+    supply_per_hour: float   # P0 que les têtes sortent, au rendement réglé
+    demand_per_hour: float   # P0 que les usines mangent
+    built: int               # usines mangeuses de P0 que la colonie possède
+    fed: int                 # usines que le sol sait réellement nourrir
+
+
+def factory_balance(analysis):
+    """Où en est le compte d'usines par rapport à ce que le sol lui donne.
+
+    L'écran Build équilibre les deux quand il *génère* : changer le rendement
+    sans rien avoir déplacé rebâtit simplement la colonie en conséquence. Une
+    fois qu'une structure a été déplacée, la carte est attachée et plus aucun
+    générateur ne tourne — les deux peuvent alors diverger, et un rendement
+    saisi deux jours plus tard est exactement la façon dont ça arrive. Rapporté :
+    *« il y aura trop ou pas assez de ressources si le nombre d'usines n'est pas
+    correct — il faut qu'on le voie CLAIREMENT, sur la planète. »*
+
+    None quand il n'y a rien à équilibrer : une colonie qui n'extrait rien fait
+    venir ses intrants par conception, et une sans mangeur de P0 n'a aucune
+    demande à satisfaire.
+
+    À distinguer de `factory_coverage`, qui répond à une autre question — « que
+    faut-il hauler » — et ne voit rien quand le sol est excédentaire, puisqu'il
+    part des imports.
+    """
+    built = analysis.get("structures", {}).get(P0_CONSUMER, 0)
+    supply = analysis.get("p0_supply_h", 0.0)
+    if supply <= 0 or built == 0:
+        return None
+    per_factory = analysis.get("p0_demand_h", 0.0) / built
+    if per_factory <= 0:
+        return None
+
+    return FactoryBalance(
+        supply_per_hour=supply,
+        demand_per_hour=analysis.get("p0_demand_h", 0.0),
+        built=built,
+        # Arrondi vers le bas : une usine nourrie aux neuf dixièmes de ce qu'elle
+        # mange est une usine qui cale, pas une qui tourne au ralenti. La même
+        # règle que celle par laquelle `factory_coverage` annonce son manque.
+        fed=int(math.floor(supply / per_factory)),
+    )
+
+
+def is_balanced(balance):
+    """Le compte vaut-il la peine qu'on en dise quelque chose."""
+    return balance.fed == balance.built
+
+
+# Les chaînes qu'une longueur de bras atteint vraiment.
+#
+# Seul le générateur mono-étage lit `arm_length`. Les deux générateurs
+# d'extraction ne le mentionnent pas, donc sur P0 → P1 et P0 → P2 chaque valeur
+# de 1 à 8 construisait une colonie identique au bit près pendant que le champ
+# invitait à choisir. Même objection que pour « Heads », qu'on garde déjà hors
+# d'une chaîne qui n'extrait rien : un cadran branché sur rien est pire que pas
+# de cadran, parce que le lecteur y dépense une décision et n'obtient rien en
+# retour.
+#
+# P3 → P4 y figure bien que sa colonie cesse de changer au-delà de 2 : il lit la
+# valeur et c'est le budget CPU qui borne le résultat — un contrôle qui travaille
+# contre une limite, pas un contrôle branché sur rien.
+#
+# La liste est vérifiée contre les générateurs plutôt que crue sur parole, par
+# `tests/test_arm_length_chains.py` : mesurée sur les 796 cas produit × planète,
+# la géométrie ne bouge que sur ces trois-là.
+_ARM_LENGTH_CHAINS = frozenset((
+    "P1 → P2 (Factory)",
+    "P2 → P3 (Factory)",
+    "P3 → P4 (Factory)",
+))
+
+
+def supports_arm_length(chain_name):
+    """La longueur de bras change-t-elle quelque chose sur cette chaîne."""
+    return chain_name in _ARM_LENGTH_CHAINS
+
+
 # Compteurs manuels, dans l'ordre où la note d'échec les accuse. « Heads » vient
 # en tête : c'est le champ qui coûte le plus d'énergie par point (550 MW × un
 # par extracteur) et donc le coupable habituel d'un budget dépassé.
@@ -575,8 +679,8 @@ def infeasible_note(product_name, chain_name, planet_type, cc_level,
 
     asked = {key: (layout or {}).get(key) for key, _, _ in _MANUAL_FIELDS}
     asked = {k: v for k, v in asked.items() if v}
-    # Nothing manual to blame, or the colony fails even wide open: the command
-    # center really is too small for this chain.
+    # Rien de manuel à incriminer, ou bien la colonie échoue même grande ouverte :
+    # le command center est réellement trop petit pour cette chaîne.
     if not asked or not _fits({k: None for k in asked}):
         return f"Does not fit a level {cc_level} command center"
 
@@ -584,8 +688,9 @@ def infeasible_note(product_name, chain_name, planet_type, cc_level,
         want = asked.get(key)
         if not want or not _fits({key: None}):
             continue
-        # Every other count stays as asked, so the ceiling reported is the one
-        # that applies to *this* colony, not to a hypothetical empty planet.
+        # Tous les autres compteurs restent tels que demandés, donc le plafond
+        # annoncé est celui qui vaut pour *cette* colonie, pas pour une planète
+        # vide hypothétique.
         best = max((n for n in range(1, want) if _fits({key: n})), default=0)
         where = f" {unit}" if unit else ""
         if best:
@@ -595,9 +700,9 @@ def infeasible_note(product_name, chain_name, planet_type, cc_level,
     return f"These counts do not fit a level {cc_level} command center"
 
 
-# Tier(s) at which each chain's bill of materials stops decomposing.
-# P4 recipes can require P1 directly (e.g. Reactive Metals in Nano-Factory),
-# so P4 chains also stop at P1.
+# Palier(s) auxquels la nomenclature de chaque chaîne cesse de se décomposer.
+# Une recette P4 peut exiger du P1 directement (p. ex. les Reactive Metals du
+# Nano-Factory), donc les chaînes P4 s'arrêtent aussi à P1.
 _BOM_STOP_TIERS = {
     "P0 → P1 (Extraction)": ("P0",),
     "P0 → P2 (Extraction)": ("P0",),
@@ -644,22 +749,23 @@ def get_full_supply_chain(product_name, target_chain):
     return bom
 
 # =============================================================================
-# JSON TEMPLATE GENERATION
+# GÉNÉRATION DES TEMPLATES JSON
 # =============================================================================
 
-# Angular spacing between structures — deliberately constant, independent of
-# planet diameter (matches the original Razkin spreadsheet layouts).
+# Écart angulaire entre structures — volontairement constant, indépendant du
+# diamètre de la planète (conforme aux implantations du tableur Razkin d'origine).
 BASE_SPACING = 0.012
 CENTER_LAT = 1.57079
 MAX_ARM_LEN = 4
-# The game itself has no arm-length rule — only link capacity: a level-0 link
-# moves 1250 m³/h and a P1→P2 factory pushes ~38 m³/h through its arm, so an
-# arm saturates past 30 factories. 8 keeps ample headroom; it is the ceiling
-# for the manual arm_length override and for what the editor agrees to parse,
-# while MAX_ARM_LEN stays the compact default the generator picks on its own.
+# Le jeu lui-même n'a aucune règle de longueur de bras — seulement une capacité
+# de lien : un lien de niveau 0 déplace 1250 m³/h et une usine P1→P2 pousse
+# ~38 m³/h dans son bras, donc un bras ne sature qu'au-delà de 30 usines. 8 laisse
+# une marge confortable ; c'est le plafond de la surcharge manuelle arm_length et
+# de ce que l'éditeur accepte d'analyser, tandis que MAX_ARM_LEN reste le défaut
+# compact que le générateur choisit de lui-même.
 MAX_ARM_LEN_HARD = 8
 MAX_LAUNCH_PADS = 4
-LINK_CAPACITY_M3H = 1250   # level-0 link throughput, from the game
+LINK_CAPACITY_M3H = 1250   # débit d'un lien de niveau 0, valeur du jeu
 
 def _make_pin(lat, lon, structure_type_id, schematic_id=None, heads=0):
     """Crée un dict représentant une structure (pin) dans le template JSON EVE."""
@@ -797,8 +903,8 @@ def generate_template_json(product_name, chain_name, planet_type, cc_level, plan
                                   include_p2_factories=True,
                                   comment=f"P1→P4 {product_name}")
     elif chain_name == "P3 → P4 (Factory)":
-        # HTIF only exists on Barren/Temperate, so the facility lookup would
-        # come back empty anywhere else.
+        # Les HTIF n'existent que sur Barren/Temperate : ailleurs, la recherche du
+        # bâtiment reviendrait vide.
         if planet_type not in HTIF_PLANET_TYPES:
             return None
         recipe = RECIPES_P3_P4.get(product_name)
@@ -808,15 +914,15 @@ def generate_template_json(product_name, chain_name, planet_type, cc_level, plan
     return None
 
 
-# Chains whose layout is fixed by geometry and cannot honour manual counts or
-# extra pads — the UI greys those controls out for them.
+# Chaînes dont l'implantation est figée par la géométrie et qui ne peuvent honorer
+# ni compteurs manuels ni pads supplémentaires — l'UI grise ces contrôles pour elles.
 CONFIGURABLE_CHAINS = frozenset({
     "P0 → P1 (Extraction)", "P0 → P2 (Extraction)",
     "P1 → P2 (Factory)", "P2 → P3 (Factory)", "P3 → P4 (Factory)",
 })
 
 # =====================================================================
-# P0 -> P1 EXTRACTION
+# EXTRACTION P0 -> P1
 # =====================================================================
 
 def _gen_extraction_template(product_name, planet_type, cc_level, diameter, options=None):
@@ -850,8 +956,9 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, opti
     ecu_pw  = (STRUCTURES["Extractor Control Unit"]["power"]
                + num_heads * STRUCTURES["Extractor Head"]["power"])
 
-    # How many factories the extractors can actually keep running, and how many
-    # launch pads it takes to hold the output between collection trips.
+    # Combien d'usines les extracteurs arrivent réellement à faire tourner, et
+    # combien de Launch Pads il faut pour retenir la production entre deux
+    # ramassages.
     p0_supply = num_ecu * num_heads * opts.yield_per_head
     p0_per_bif = hourly_rate(recipe["input"][0][1], "Basic Industry Facility")
     p1_m3_per_bif = (hourly_rate(recipe["output"], "Basic Industry Facility")
@@ -862,7 +969,8 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, opti
     num_lp = _clamp(opts.launch_pads, 1, 4,
                     default=pads_for_buffer(num_bif * p1_m3_per_bif, opts.collection_hours))
 
-    # Trim to whatever the command centre can actually power, factories first.
+    # On rogne jusqu'à ce que le command center peut vraiment alimenter, les
+    # usines en premier.
     link_cpu, link_pw = link_cost_per_spacing(diameter)
 
     def _fixed(lps, ecus, sfs):
@@ -883,7 +991,7 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, opti
         if room >= 1:
             num_bif = min(num_bif, room)
             break
-        # Shed the least essential structure and retry.
+        # On sacrifie la structure la moins essentielle et on réessaie.
         if num_sf > 0:
             num_sf -= 1
         elif num_lp > 1:
@@ -914,23 +1022,44 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, opti
     sf_1b = None
     sf_pins = []
     if use_sf:
-        # Stacked away from the hub row, not along it: the first storage becomes
-        # the hub, and the factories fill that same row at +/- step * sp, so a
-        # second storage placed at i * sp would land exactly on a factory.
+        # Une rangée entière au-dessus du pad, et non 0,6 : à 0,6 le premier
+        # stockage se posait à 0,0072 rad du pad, sous les 0,012 que le jeu
+        # exige, et EVE refuse la colonie à l'import. Le décalage fractionnaire
+        # cherchait à éviter les usines de la rangée du hub — ce n'est plus son
+        # travail depuis que `_free_slot` écarte une usine de tout emplacement
+        # déjà pris.
         for i in range(num_sf):
-            pins.append(_make_pin(CENTER_LAT + sp * (0.6 + i), 0.0, sf_type))
+            pins.append(_make_pin(CENTER_LAT + sp * (1 + i), 0.0, sf_type))
             sf_pins.append(len(pins))
         sf_1b = sf_pins[0]
 
     hub_1b = sf_1b if use_sf else lp_1b
     hub_lat = pins[hub_1b - 1]["La"]
 
+    # Ce qui est déjà posé. Les pads supplémentaires se rangent sur la rangée
+    # CENTER_LAT - sp, et la première rangée de repli des usines est exactement
+    # celle-là : sans cette mémoire, le second pad et la neuvième usine
+    # atterrissaient sur la même coordonnée, l'un sous l'autre. Rapporté depuis
+    # l'écran, sur une colonie à 10 usines et 2 pads.
+    taken = {(round(pin["La"], 6), round(pin["Lo"], 6)) for pin in pins}
+
+    def _free_slot(lat, lon, outward):
+        """La position demandée, ou la première libre en s'écartant du centre.
+
+        `outward` porte le signe du côté : on pousse vers l'extérieur de la
+        rangée, jamais vers le hub, pour ne pas traverser ce qui est déjà là.
+        """
+        while (round(lat, 6), round(lon, 6)) in taken:
+            lon += outward * sp
+        taken.add((round(lat, 6), round(lon, 6)))
+        return lat, lon
+
     main_count = min(num_bif, 8)
     bif_positions = []
     for i in range(main_count):
         side = -1 if i % 2 == 0 else 1
         step = (i // 2) + 1
-        bif_positions.append((hub_lat, side * step * sp))
+        bif_positions.append(_free_slot(hub_lat, side * step * sp, side))
 
     placed = main_count
 
@@ -938,14 +1067,15 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, opti
         sub_below = min(num_bif - placed, 2)
         for k in range(sub_below):
             side = -1 if k % 2 == 0 else 1
-            bif_positions.append((hub_lat - sp, side * sp))
+            bif_positions.append(_free_slot(hub_lat - sp, side * sp, side))
         placed += sub_below
 
     if placed < num_bif:
         sub_above = min(num_bif - placed, 2)
         for k in range(sub_above):
             side = -1 if k % 2 == 0 else 1
-            bif_positions.append((hub_lat + sp * 1.17, side * 2 * sp))
+            bif_positions.append(_free_slot(hub_lat + sp * 1.17,
+                                            side * 2 * sp, side))
         placed += sub_above
 
     row = 2
@@ -953,7 +1083,7 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, opti
         batch = min(num_bif - placed, 2)
         for k in range(batch):
             side = -1 if k % 2 == 0 else 1
-            bif_positions.append((hub_lat - sp * row, side * sp))
+            bif_positions.append(_free_slot(hub_lat - sp * row, side * sp, side))
         placed += batch
         row += 1
 
@@ -1011,9 +1141,10 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, opti
     for extra_lp in lp_pins[1:]:
         links.append({"D": lp_1b, "Lv": 0, "S": extra_lp})
     if use_sf:
-        # Chained, so every storage link stays one spacing long — the budget
-        # above charges one spacing per storage, and a star back to the pad
-        # would run a long link straight through the storages below it.
+        # Chaînés, pour que chaque lien de stockage ne fasse qu'un espacement — le
+        # budget ci-dessus facture un espacement par stockage, et une étoile qui
+        # reviendrait au pad tirerait un long lien droit à travers les stockages
+        # situés en dessous.
         for i, sf_pin in enumerate(sf_pins):
             links.append({"D": lp_1b if i == 0 else sf_pins[i - 1],
                           "Lv": 0, "S": sf_pin})
@@ -1033,8 +1164,8 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, opti
         if path:
             routes.append({"P": path, "Q": recipe["input"][0][1], "T": p0_tid})
 
-    # Spread the output across the pads so the buffer is actually usable —
-    # a single pad would fill up while the others sat empty.
+    # On répartit la production sur les pads pour que le tampon serve vraiment —
+    # un pad unique se remplirait pendant que les autres resteraient vides.
     for i in range(num_bif):
         bif_pin = first_bif_1b + i
         dest_lp = lp_pins[i % len(lp_pins)]
@@ -1056,13 +1187,12 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, opti
     }
 
 # =====================================================================
-# P0 -> P2 SELF-SUFFICIENT PLANET
+# PLANÈTE AUTOSUFFISANTE P0 -> P2
 # =====================================================================
 
-# An extractor with fewer heads than this cannot keep even one BIF fed, so the
-# sizing search never trades heads below it for extra factories.
-# Widest P2 stage this layout can place. High yields can feed more than the
-# power budget allows anyway, so this only ever binds on rich deposits.
+# Étage P2 le plus large que cette implantation sait poser. De toute façon, un bon
+# rendement nourrit plus que ce que le budget d'énergie autorise, donc ça ne mord
+# que sur les gisements riches.
 _MAX_P2_FACTORIES = 8
 
 def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, options=None):
@@ -1079,16 +1209,25 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, option
         if not recipe:
             return None
 
-        available_p0 = PLANET_RESOURCES.get(planet_type, [])
+        # Le sol tranche tout seul sauf si l'utilisateur a dit autrement :
+        # `imported_inputs` nomme les P1 à faire entrer même quand le P0 est
+        # sous les pieds, ce qui échange un extracteur et ses usines basiques
+        # contre du trafic de launch pad. `material_legs` est le seul endroit où
+        # ce partage se décide, pour que l'indice de comptage à côté du champ
+        # « Factories » ne puisse pas contredire ce qui est réellement bâti ici.
+        forced = {name: IMPORT for name in (opts.imported_inputs or ())}
+        legs = material_legs(recipe["input"], planet_type, forced)
         local, imported = [], []
-        for p1_name, p1_qty in recipe["input"]:
-            p0_name = P1_TO_P0.get(p1_name)
-            if p0_name and p0_name in available_p0:
-                local.append((p1_name, p1_qty, p0_name))
+        for leg in legs:
+            if leg.source == EXTRACT and leg.p0_name:
+                local.append((leg.p1_name, leg.p1_quantity, leg.p0_name))
             else:
-                imported.append((p1_name, p1_qty))
+                imported.append((leg.p1_name, leg.p1_quantity))
 
-        # Nothing extracted here means this is really a P1→P2 factory planet.
+        # Ne rien extraire ici, c'est qu'on a affaire en réalité à une
+        # planète-usine P1→P2. L'écran bascule la chaîne plutôt que de laisser
+        # la demande arriver jusqu'ici ; ceci reste la dernière ligne de défense
+        # pour une colonie bâtie à la main.
         if not local:
             return None
 
@@ -1098,16 +1237,16 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, option
         lp_type  = STRUCTURE_IDS["Launch Pad"][planet_type]
         sp = BASE_SPACING
 
-        # ── Sizing ───────────────────────────────────────────────────
-        # One BIF makes 40 P1/h and one P2 AIF eats 40 of each P1/h, so the
-        # balanced ratio is one BIF per local P1 per AIF. The extractors cap
-        # the whole thing: a chain is only worth building as wide as the raw
-        # material actually arriving.
+        # ── Dimensionnement ──────────────────────────────────────────
+        # Un BIF sort 40 P1/h et un AIF P2 avale 40 de chaque P1/h, donc le ratio
+        # équilibré est d'un BIF par P1 local et par AIF. Les extracteurs plafonnent
+        # l'ensemble : une chaîne ne vaut la peine d'être bâtie qu'à la largeur de
+        # la matière première qui arrive réellement.
         n_ecu = len(local)
 
         def _cost(n_aif, heads):
             n_bif = n_aif * len(local)
-            n_links = n_ecu + n_bif + n_aif          # star topology on the LP
+            n_links = n_ecu + n_bif + n_aif          # topologie en étoile sur le LP
             cpu = (STRUCTURES["Launch Pad"]["cpu"]
                    + n_ecu * (STRUCTURES["Extractor Control Unit"]["cpu"]
                               + heads * STRUCTURES["Extractor Head"]["cpu"])
@@ -1125,9 +1264,10 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, option
         cc = CC_LEVELS[cc_level]
         p0_per_bif = hourly_rate(RECIPES_P0_P1[local[0][0]]["input"][0][1],
                                  "Basic Industry Facility")
-        # Work down from the widest chain the extractors could ever feed, and
-        # for each width run the extractors no harder than that width needs —
-        # spare heads are pure wasted power on a planet this tight.
+        # On part de la chaîne la plus large que les extracteurs pourraient nourrir
+        # et on redescend ; pour chaque largeur, on ne fait pas tourner les
+        # extracteurs plus fort que cette largeur ne l'exige — les têtes en trop
+        # sont de l'énergie pure perdue sur une planète aussi serrée.
         ceiling = factories_supported(MAX_EXTRACTOR_HEADS * opts.yield_per_head, p0_per_bif)
         ceiling = _clamp(opts.factories, 1, _MAX_P2_FACTORIES, default=ceiling)
         best = None
@@ -1146,9 +1286,9 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, option
         num_aif, num_heads = best
         bif_per_p1 = num_aif
 
-        # Pads have to hold the P2 coming out, the P1 lines hauled in for
-        # whatever this planet cannot mine, and the raw surplus the factories
-        # do not keep up with.
+        # Les pads doivent retenir le P2 qui sort, les lignes de P1 importées pour
+        # ce que cette planète ne sait pas miner, et le surplus brut que les usines
+        # n'absorbent pas.
         flow_m3_h = hourly_rate(recipe["output"], "Advanced Industry Facility") * num_aif \
             * COMMODITY_SIZE.get(get_tier(product_name), 0)
         for p1_name, p1_qty in imported:
@@ -1161,8 +1301,8 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, option
                         default=pads_for_buffer(flow_m3_h, opts.collection_hours))
 
         # ── Pins ─────────────────────────────────────────────────────
-        # Launch Pad hub in the middle, AIFs below it, one BIF row per local
-        # P1 above it, extractors furthest out.
+        # Le hub Launch Pad au milieu, les AIFs en dessous, une rangée de BIFs par
+        # P1 local au-dessus, les extracteurs tout au bord.
         pins = []
         pins.append(_make_pin(CENTER_LAT, 0.0, lp_type))
         lp_1b = 1
@@ -1180,7 +1320,7 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, option
                                   schematic_id=NAME_TO_ID[product_name]))
             aif_pins.append(len(pins))
 
-        bif_pins = {}      # p1 name -> [pin, ...]
+        bif_pins = {}      # nom p1 -> [pin, ...]
         for row, (p1_name, _, _) in enumerate(local):
             row_lat = CENTER_LAT + sp * (row + 1)
             chain = []
@@ -1192,7 +1332,7 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, option
                 chain.append(len(pins))
             bif_pins[p1_name] = chain
 
-        ecu_pins = {}      # p0 name -> pin
+        ecu_pins = {}      # nom p0 -> pin
         ecu_lat = CENTER_LAT + sp * (len(local) + 3)
         for i, (_, _, p0_name) in enumerate(local):
             lon = 0.0 if len(local) == 1 else (-2 * sp if i == 0 else 2 * sp)
@@ -1200,9 +1340,9 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, option
                                   schematic_id=NAME_TO_ID[p0_name], heads=num_heads))
             ecu_pins[p0_name] = len(pins)
 
-        # ── Links: everything hangs off the Launch Pad ────────────────
-        # The LP is both the P0/P1 buffer and the export pad, so every route
-        # below is a single hop and the topology stays trivially valid.
+        # ── Liens : tout est accroché au Launch Pad ───────────────────
+        # Le LP est à la fois le tampon P0/P1 et le pad d'export, donc chaque route
+        # ci-dessous tient en un seul saut et la topologie reste trivialement valide.
         links = []
         for extra_lp in lp_pins[1:]:
             links.append({"D": lp_1b, "Lv": 0, "S": extra_lp})
@@ -1217,7 +1357,7 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, option
         num_pins = len(pins)
         routes = []
 
-        # Extractors → LP, then LP → BIFs (P0), BIFs → LP (P1)
+        # Extracteurs → LP, puis LP → BIFs (P0), BIFs → LP (P1)
         for p1_name, _, p0_name in local:
             p0_tid = NAME_TO_ID[p0_name]
             p0_recipe_qty = RECIPES_P0_P1[p1_name]["input"][0][1]
@@ -1233,8 +1373,8 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, option
                     routes.append({"P": path, "Q": RECIPES_P0_P1[p1_name]["output"],
                                    "T": NAME_TO_ID[p1_name]})
 
-        # LP → AIFs for every P1 (locally made or hauled in), AIFs → LP (P2),
-        # output spread across the pads so the buffer is usable.
+        # LP → AIFs pour chaque P1 (produit sur place ou importé), AIFs → LP (P2),
+        # la production répartie sur les pads pour que le tampon serve.
         for idx, aif_pin in enumerate(aif_pins):
             path = _bfs_path(links, lp_1b, aif_pin, num_pins)
             if path:
@@ -1258,7 +1398,7 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, option
         return None
 
 # =====================================================================
-# FACTORIZED TEMPLATE GENERATOR FOR P1->P2, P2->P3, P1->P3
+# GÉNÉRATEUR DE TEMPLATE FACTORISÉ POUR P1->P2, P2->P3, P1->P3
 # =====================================================================
 
 def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
@@ -1277,23 +1417,24 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
         lp_type = STRUCTURE_IDS["Launch Pad"][planet_type]
         sp = BASE_SPACING
 
-        # Arm length is a convention, not a game rule: longer arms only cost
-        # link headroom (a level-0 link feeds 30+ P1→P2 factories), so a
-        # manual arm_length may stretch rows up to MAX_ARM_LEN_HARD —
-        # e.g. 2 pads × 2 arms of 6 = the 24-factory dual-P2 layout.
+        # La longueur de bras est une convention, pas une règle du jeu : des bras
+        # plus longs ne coûtent que de la marge de lien (un lien de niveau 0 nourrit
+        # 30 usines P1→P2 et plus), donc un arm_length manuel peut étirer les rangées
+        # jusqu'à MAX_ARM_LEN_HARD — p. ex. 2 pads × 2 bras de 6 = l'implantation
+        # double-P2 à 24 usines.
         arm_len = _clamp(opts.arm_length, 1, MAX_ARM_LEN_HARD, default=MAX_ARM_LEN)
 
-        # Volume one factory moves per hour, in and out. Both sides sit in the
-        # pads between visits, so both count against how long the colony runs
-        # unattended.
+        # Volume qu'une usine déplace par heure, entrée et sortie confondues. Les
+        # deux côtés séjournent dans les pads entre deux visites, donc les deux
+        # pèsent sur l'autonomie de la colonie.
         flow_m3_per_factory = (
             sum(hourly_rate(q, facility) * COMMODITY_SIZE.get(get_tier(n), 0)
                 for n, q in recipe["input"])
             + hourly_rate(recipe["output"], facility)
             * COMMODITY_SIZE.get(get_tier(product_name), 0))
 
-        # One link per extra factory, one spacing long (arms are chained), so
-        # its price is fixed by the planet's radius.
+        # Un lien par usine supplémentaire, long d'un espacement (les bras sont
+        # chaînés) : son prix est donc fixé par le rayon de la planète.
         link_cpu, link_pw = link_cost_per_spacing(diameter)
 
         def _max_factories(lps):
@@ -1315,10 +1456,10 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
                 return float("inf")
             return capacity / (n * flow_m3_per_factory)
 
-        # More pads buys buffer at the cost of factories, and past a point the
-        # only way to last a full day is to build fewer factories. Take the
-        # widest colony that still survives the requested interval; if none
-        # can, take the one that lasts longest.
+        # Plus de pads, c'est du tampon acheté au prix d'usines, et passé un certain
+        # point le seul moyen de tenir une journée entière est d'en bâtir moins. On
+        # prend la colonie la plus large qui survive encore à l'intervalle demandé ;
+        # si aucune n'y arrive, celle qui tient le plus longtemps.
         meets, longest = None, None
         for try_lps in range(1, MAX_LAUNCH_PADS + 1):
             room = _max_factories(try_lps)
@@ -1340,8 +1481,8 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
             return None
         num_lps, num_factories = chosen
 
-        # A manual count is an instruction, not a suggestion: place it as asked
-        # and let the validation panel report what it costs.
+        # Un compteur manuel est une consigne, pas une suggestion : on le place tel
+        # quel et on laisse le bandeau de validation dire ce qu'il coûte.
         if opts.launch_pads:
             num_lps = _clamp(opts.launch_pads, 1, MAX_LAUNCH_PADS, default=num_lps)
             num_factories = min(num_factories, _max_factories(num_lps)) or 1
@@ -1351,7 +1492,7 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
         if num_factories < 1:
             return None
 
-        # Distributing factory quantities across the determined amount of LPs
+        # Répartition des usines sur le nombre de LPs retenu
         per_lp = [0] * num_lps
         for i in range(num_factories):
             per_lp[i % num_lps] += 1
@@ -1362,7 +1503,7 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
         pins = []
         lp_arms = []
 
-        # Placing the factory pins first (Razkin standard)
+        # On pose d'abord les pins des usines (standard Razkin)
         for lp_idx in range(num_lps):
             row_lat = lp_lats[lp_idx]
             positions, arms_local = _place_factory_row(row_lat, 0.0, per_lp[lp_idx],
@@ -1372,13 +1513,13 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
                 pins.append(_make_pin(lat, lon, facility_type_id, schematic_id=NAME_TO_ID[product_name]))
             lp_arms.append([[pin_base + a for a in arm] for arm in arms_local])
 
-        # Placing the Launch Pad pins at the end
+        # Les pins des Launch Pads viennent en dernier
         lp_pin_1b = []
         for lp_idx in range(num_lps):
             pins.append(_make_pin(lp_lats[lp_idx], 0.0, lp_type))
             lp_pin_1b.append(len(pins))
 
-        # Creating Link topology (Backbone + Arms of 4)
+        # Construction de la topologie de liens (dorsale + bras de 4)
         links = []
         for i in range(1, num_lps):
             links.append({"D": lp_pin_1b[0], "Lv": 0, "S": lp_pin_1b[i]})
@@ -1394,7 +1535,7 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
         num_pins = len(pins)
         routes = []
 
-        # Generating Output routing path (Factories to local LP)
+        # Routes de sortie (usines → LP local)
         for lp_idx in range(num_lps):
             local_lp = lp_pin_1b[lp_idx]
             for arm in lp_arms[lp_idx]:
@@ -1403,9 +1544,9 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
                     if path:
                         routes.append({"P": path, "Q": recipe["output"], "T": NAME_TO_ID[product_name]})
 
-        # Generating Input routing path (LP to Factories). In game a factory
-        # drains its input routes in creation order, so the local pad must come
-        # first — the cross-pad routes then only kick in once it runs dry.
+        # Routes d'entrée (LP → usines). En jeu, une usine vide ses routes d'entrée
+        # dans l'ordre de création : le pad local doit donc venir en premier, les
+        # routes inter-pads ne prenant le relais qu'une fois celui-ci à sec.
         for lp_idx in range(num_lps):
             src_order = [lp_idx] + [i for i in range(num_lps) if i != lp_idx]
             for arm in lp_arms[lp_idx]:
@@ -1434,10 +1575,10 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
 
 def _gen_p1_to_p3_template(product_name, planet_type, cc_level, diameter):
     """
-    True P1→P2→P3 two-stage factory chain.
-    Stage 1 AIFs convert P1 inputs into P2 intermediates.
-    Stage 2 AIFs convert P2 intermediates into the final P3 product.
-    Uses 4 Launch Pads for Two-P2-input products, 3 for Three-P2-input.
+    Véritable chaîne d'usine à deux étages P1→P2→P3.
+    Les AIFs de l'étage 1 convertissent les intrants P1 en intermédiaires P2.
+    Les AIFs de l'étage 2 convertissent ces P2 en produit P3 final.
+    Utilise 4 Launch Pads pour les produits à deux P2 en entrée, 3 pour ceux à trois.
     """
     try:
         p3_recipe = RECIPES_P2_P3.get(product_name)
@@ -1447,7 +1588,7 @@ def _gen_p1_to_p3_template(product_name, planet_type, cc_level, diameter):
         p2_inputs = p3_recipe["input"]   # [(p2_name, qty), ...]
         num_p2 = len(p2_inputs)
 
-        # Verify each P2 intermediate can be produced from P1
+        # On vérifie que chaque intermédiaire P2 est bien productible depuis du P1
         p1_recipes = {}
         for p2_name, _ in p2_inputs:
             r = RECIPES_P1_P2.get(p2_name)
@@ -1459,17 +1600,17 @@ def _gen_p1_to_p3_template(product_name, planet_type, cc_level, diameter):
         lp_type  = STRUCTURE_IDS["Launch Pad"][planet_type]
         sp = BASE_SPACING
 
-        # Balanced factory ratio: how many P1→P2 AIFs per P3 AIF
+        # Ratio d'usines équilibré : combien d'AIFs P1→P2 par AIF P3
         p2_ratios = [
             max(1, math.ceil(qty / p1_recipes[name]["output"]))
             for name, qty in p2_inputs
         ]
 
-        # Find max n_p3 that fits in budget.
-        # Placement capacity: each P2 group and the P3 group can hold up to a
-        # full row (2*MAX_ARM_LEN). In the Three-P2 layout the third P2 group
-        # and the P3 group share the center row as single chains that extend
-        # left/right as far as needed.
+        # On cherche le plus grand n_p3 qui tienne dans le budget.
+        # Capacité de placement : chaque groupe P2 et le groupe P3 peuvent occuper
+        # jusqu'à une rangée entière (2*MAX_ARM_LEN). Dans l'implantation à trois P2,
+        # le troisième groupe P2 et le groupe P3 se partagent la rangée centrale sous
+        # forme de chaînes simples qui s'étendent à gauche/droite autant qu'il faut.
         p2_caps = [2 * MAX_ARM_LEN, 2 * MAX_ARM_LEN, 2 * MAX_ARM_LEN]
         p3_cap  = 2 * MAX_ARM_LEN
         num_lps = 4 if num_p2 == 2 else 3
@@ -1503,10 +1644,10 @@ def _gen_p1_to_p3_template(product_name, planet_type, cc_level, diameter):
         n_p3 = best_n_p3
         n_p2_each = [n_p3 * r for r in p2_ratios]
 
-        # ── LAYOUT ──────────────────────────────────────────────────────
-        # Two-P2  (4 LPs): P2a row @ +sp, P2b row @ -sp, P3 row @ 0
-        #                   hub LP @ 0, LP_A @ +sp, LP_B @ -sp, LP_D @ -2sp
-        # Three-P2 (3 LPs): P2a @ +sp, P2b @ -sp, P2c/P3 split @ 0
+        # ── IMPLANTATION ────────────────────────────────────────────────
+        # Deux P2  (4 LPs) : rangée P2a @ +sp, rangée P2b @ -sp, rangée P3 @ 0
+        #                    hub LP @ 0, LP_A @ +sp, LP_B @ -sp, LP_D @ -2sp
+        # Trois P2 (3 LPs) : P2a @ +sp, P2b @ -sp, P2c/P3 partagés @ 0
         #                    hub LP @ 0, LP_A @ +sp, LP_B @ -sp
         if num_p2 == 2:
             p2_row_lats = [CENTER_LAT + sp, CENTER_LAT - sp]
@@ -1516,16 +1657,16 @@ def _gen_p1_to_p3_template(product_name, planet_type, cc_level, diameter):
             p2_row_lats = [CENTER_LAT + sp, CENTER_LAT - sp]  # P2a, P2b
             p3_row_lat  = CENTER_LAT
             lp_lats     = [CENTER_LAT, CENTER_LAT + sp, CENTER_LAT - sp]
-            # P2c (index 2) will share the center row using left/right arm split
+            # P2c (indice 2) partagera la rangée centrale via une coupe en bras gauche/droit
 
         pins = []
 
-        # Place P2 AIF groups
+        # Pose des groupes d'AIFs P2
         p2_arms = []
         for i, (p2_name, _) in enumerate(p2_inputs):
             count = n_p2_each[i]
             if i < 2:
-                # Standard row
+                # Rangée standard
                 row_lat = p2_row_lats[i]
                 positions, arms_local = _place_factory_row(row_lat, 0.0, count, sp)
                 base = len(pins) + 1
@@ -1533,16 +1674,16 @@ def _gen_p1_to_p3_template(product_name, planet_type, cc_level, diameter):
                     pins.append(_make_pin(lat, lon, aif_type, schematic_id=NAME_TO_ID[p2_name]))
                 p2_arms.append([[base + a for a in arm] for arm in arms_local])
             else:
-                # Third P2 group (Three-P2 only): chain extending left on the
-                # center row (up to a full row's worth of pins)
+                # Troisième groupe P2 (cas trois-P2 uniquement) : chaîne s'étendant
+                # vers la gauche sur la rangée centrale (jusqu'à une rangée pleine)
                 local_indices = []
                 for j in range(min(count, 2 * MAX_ARM_LEN)):
                     pins.append(_make_pin(CENTER_LAT, -(j + 1) * sp, aif_type,
                                          schematic_id=NAME_TO_ID[p2_name]))
                     local_indices.append(len(pins))
-                p2_arms.append([local_indices, []])  # left arm only
+                p2_arms.append([local_indices, []])  # bras gauche uniquement
 
-        # Place P3 AIFs
+        # Pose des AIFs P3
         if num_p2 == 2:
             p3_positions, p3_arms_local = _place_factory_row(p3_row_lat, 0.0, n_p3, sp)
             p3_base = len(pins) + 1
@@ -1550,7 +1691,7 @@ def _gen_p1_to_p3_template(product_name, planet_type, cc_level, diameter):
                 pins.append(_make_pin(lat, lon, aif_type, schematic_id=NAME_TO_ID[product_name]))
             p3_arms = [[p3_base + a for a in arm] for arm in p3_arms_local]
         else:
-            # Three-P2: P3 chain extending right on the center row
+            # Trois-P2 : chaîne P3 s'étendant vers la droite sur la rangée centrale
             right_indices = []
             for j in range(min(n_p3, 2 * MAX_ARM_LEN)):
                 pins.append(_make_pin(CENTER_LAT, (j + 1) * sp, aif_type,
@@ -1558,30 +1699,33 @@ def _gen_p1_to_p3_template(product_name, planet_type, cc_level, diameter):
                 right_indices.append(len(pins))
             p3_arms = [[], right_indices]
 
-        # Place LPs (Razkin standard: at end of pin list)
+        # Pose des LPs (standard Razkin : en fin de liste de pins)
         lp_pin_1b = []
         for lat in lp_lats[:num_lps]:
             pins.append(_make_pin(lat, 0.0, lp_type))
             lp_pin_1b.append(len(pins))
 
-        lp_hub   = lp_pin_1b[0]   # center hub: P2 collection + P3 export
+        lp_hub   = lp_pin_1b[0]   # hub central : collecte des P2 + export du P3
         num_pins = len(pins)
 
-        # ── LINKS ────────────────────────────────────────────────────────
+        # ── LIENS ────────────────────────────────────────────────────────
         links = []
 
-        # LP backbone: hub connects to all other LPs
+        # Dorsale des LPs : le hub relie tous les autres LPs. En 4 LPs, LP_D est
+        # rattaché à LP_B et non au hub (c'est par LP_B qu'il relaie le P1d vers
+        # les AIFs RF) : le brancher aussi sur le hub fermait une boucle dont le
+        # brin hub↔LP_D ne portait aucune route — du CPU et de l'énergie payés
+        # pour rien, et un graphe que l'éditeur refusait faute d'être un arbre.
+        relay_lp = lp_pin_1b[2] if num_lps == 4 else None
         for i in range(1, num_lps):
-            links.append({"D": lp_hub, "Lv": 0, "S": lp_pin_1b[i]})
-        # Extra backbone for 4-LP: LP_B <-> LP_D (so LP_D can relay P1d to RF AIFs)
-        if num_lps == 4:
-            links.append({"D": lp_pin_1b[2], "Lv": 0, "S": lp_pin_1b[3]})
+            parent = relay_lp if (relay_lp is not None and i == 3) else lp_hub
+            links.append({"D": parent, "Lv": 0, "S": lp_pin_1b[i]})
 
-        # LP serving each P2 group (for arm connections)
+        # LP desservant chaque groupe P2 (pour les raccords de bras)
         p2_row_lps = [
             lp_pin_1b[1] if num_lps >= 2 else lp_hub,   # P2a -> LP_A
             lp_pin_1b[2] if num_lps >= 3 else lp_hub,   # P2b -> LP_B
-            lp_hub,                                       # P2c (Three-P2) -> hub
+            lp_hub,                                       # P2c (trois-P2) -> hub
         ]
 
         for i, arms in enumerate(p2_arms):
@@ -1593,7 +1737,7 @@ def _gen_p1_to_p3_template(product_name, planet_type, cc_level, diameter):
                 for k in range(1, len(arm)):
                     links.append({"D": arm[k - 1], "Lv": 0, "S": arm[k]})
 
-        # P3 AIFs connect to hub
+        # Les AIFs P3 se raccordent au hub
         for arm in p3_arms:
             if not arm:
                 continue
@@ -1604,24 +1748,24 @@ def _gen_p1_to_p3_template(product_name, planet_type, cc_level, diameter):
         # ── ROUTES ───────────────────────────────────────────────────────
         routes = []
 
-        # 1) P1 inputs from LPs → P2 AIFs
+        # 1) Entrées P1 depuis les LPs → AIFs P2
         for p2_idx, (p2_name, _) in enumerate(p2_inputs):
             p1_ins = p1_recipes[p2_name]["input"]  # [(p1_name, qty), ...]
 
             if num_lps == 4 and p2_idx == 0:
-                # P2a: LP_A imports P1[0] (Silicon), hub imports P1[1] (OxComp)
+                # P2a : LP_A importe P1[0] (Silicon), le hub importe P1[1] (OxComp)
                 import_map = [
                     (lp_pin_1b[1], p1_ins[0]),
                     (lp_hub,       p1_ins[1]),
                 ]
             elif num_lps == 4 and p2_idx == 1:
-                # P2b: LP_B imports P1[0] (Electrolytes), LP_D imports P1[1] (Plasmoids)
+                # P2b : LP_B importe P1[0] (Electrolytes), LP_D importe P1[1] (Plasmoids)
                 import_map = [
                     (lp_pin_1b[2], p1_ins[0]),
                     (lp_pin_1b[3], p1_ins[1]),
                 ]
             else:
-                # 3-LP: each group LP imports both P1s
+                # 3 LPs : chaque LP de groupe importe les deux P1
                 serving_idx = min(p2_idx + 1, num_lps - 1)
                 import_map  = [(lp_pin_1b[serving_idx], inp) for inp in p1_ins]
 
@@ -1632,7 +1776,7 @@ def _gen_p1_to_p3_template(product_name, planet_type, cc_level, diameter):
                         if path:
                             routes.append({"P": path, "Q": p1_qty, "T": NAME_TO_ID[p1_name]})
 
-        # 2) P2 outputs from P2 AIFs → hub LP
+        # 2) Sorties P2 des AIFs P2 → LP hub
         for p2_idx, (p2_name, _) in enumerate(p2_inputs):
             p2_qty = p1_recipes[p2_name]["output"]
             for arm in p2_arms[p2_idx]:
@@ -1641,7 +1785,7 @@ def _gen_p1_to_p3_template(product_name, planet_type, cc_level, diameter):
                     if path:
                         routes.append({"P": path, "Q": p2_qty, "T": NAME_TO_ID[p2_name]})
 
-        # 3) P2 inputs from hub LP → P3 AIFs
+        # 3) Entrées P2 depuis le LP hub → AIFs P3
         for p2_name, p2_qty in p2_inputs:
             for arm in p3_arms:
                 for f_pin in arm:
@@ -1649,7 +1793,7 @@ def _gen_p1_to_p3_template(product_name, planet_type, cc_level, diameter):
                     if path:
                         routes.append({"P": path, "Q": p2_qty, "T": NAME_TO_ID[p2_name]})
 
-        # 4) P3 output from P3 AIFs → hub LP (export)
+        # 4) Sortie P3 des AIFs P3 → LP hub (export)
         for arm in p3_arms:
             for f_pin in arm:
                 path = _bfs_path(links, f_pin, lp_hub, num_pins)
@@ -1672,7 +1816,7 @@ def _gen_p1_to_p3_template(product_name, planet_type, cc_level, diameter):
         return None
 
 # =====================================================================
-# MULTI-TIER P4 BUILDERS
+# CONSTRUCTEURS P4 MULTI-PALIERS
 # =====================================================================
 
 def _build_p4_template(product_name, planet_type, cc_level, diameter, include_p2_factories, comment=None):
@@ -1737,9 +1881,10 @@ def _build_p4_template(product_name, planet_type, cc_level, diameter, include_p2
             continue
         return None
 
-    # Greedily add P1→P2 AIFs while budget remains (max out the CC). P2
-    # supply is the chain's bottleneck, so every spare structure slot goes
-    # to another P2 factory (round-robin across the P2 types).
+    # On ajoute gloutonnement des AIFs P1→P2 tant qu'il reste du budget (on sature
+    # le CC). L'approvisionnement en P2 est le goulot de la chaîne, donc chaque
+    # emplacement de structure libre va à une usine P2 de plus (en tourniquet sur
+    # les types de P2).
     if include_p2_factories and p2_counts:
         added = True
         while added:
@@ -1769,7 +1914,7 @@ def _build_p4_template(product_name, planet_type, cc_level, diameter, include_p2
 
         for lp_idx in range(num_lps):
             row_lat = lp_lats[lp_idx]
-            next_lon_idx = {-1: 1, 1: 1}   # next free slot on each side of the LP
+            next_lon_idx = {-1: 1, 1: 1}   # prochain emplacement libre de chaque côté du LP
             for slot, p2n in enumerate(lp_p2[lp_idx]):
                 p2_id = NAME_TO_ID[p2n]
                 cnt = p2_counts.get(p2n, 1)
@@ -1849,8 +1994,9 @@ def _build_p4_template(product_name, planet_type, cc_level, diameter, include_p2
             p2_recipe = RECIPES_P1_P2.get(p2n)
             if not p2_recipe:
                 continue
-            # In game a factory drains its input routes in creation order, so
-            # the row's own pad must come first; other pads are overflow.
+            # En jeu, une usine vide ses routes d'entrée dans l'ordre de création :
+            # le pad de sa propre rangée doit donc venir en premier, les autres ne
+            # servent que de débordement.
             home = info["lp_idx"]
             src_order = [home] + [i for i in range(num_lps) if i != home]
             for f_pin in chain:
@@ -1881,9 +2027,10 @@ def _build_p4_template(product_name, planet_type, cc_level, diameter, include_p2
         for f_pin in p3_info["chain"]:
             for p2n, p2_qty in p3_recipe["input"]:
                 p2_tid = NAME_TO_ID[p2n]
-                # Route priority is creation order in game: drain the pad where
-                # this P2 actually lands (its producer row's pad, or the P3 hub
-                # pad when imported) before falling back to the others.
+                # La priorité des routes, c'est l'ordre de création en jeu : on vide
+                # d'abord le pad où ce P2 atterrit réellement (celui de la rangée qui
+                # le produit, ou le pad du hub P3 s'il est importé) avant de se
+                # rabattre sur les autres.
                 home = p2_factory_info.get(p2n, {}).get("lp_idx", p3_hub_lp_idx)
                 for src_lp_idx in [home] + [i for i in range(num_lps) if i != home]:
                     src_lp = lp_pin_1b[src_lp_idx]
@@ -1899,8 +2046,9 @@ def _build_p4_template(product_name, planet_type, cc_level, diameter, include_p2
             if path:
                 routes.append({"P": path, "Q": p3_out, "T": NAME_TO_ID[p3_name]})
 
-    # P3 outputs land on the hub pad, so the HTF must drain that one first
-    # (in-game route priority is creation order); other pads are overflow.
+    # Les sorties P3 atterrissent sur le pad du hub : le HTF doit donc vider
+    # celui-là en premier (en jeu, la priorité des routes est l'ordre de
+    # création) ; les autres pads servent de débordement.
     htf_src = [p3_hub_lp_idx] + [i for i in range(num_lps) if i != p3_hub_lp_idx]
     for inp_name, inp_qty in recipe_p4["input"]:
         inp_tid = NAME_TO_ID[inp_name]
@@ -1925,27 +2073,29 @@ def _build_p4_template(product_name, planet_type, cc_level, diameter, include_p2
 def _gen_p2_to_p4_template(product_name, planet_type, cc_level, diameter):
     """Template P2→P4 basé sur la géométrie Razkin, dimensionné au budget du CC.
 
-    Architecture (full-size layout):
-      - up to 3 LP columns in a horizontal row at CENTER_LAT, Lo = +sp / 0 / -sp
-      - 1 HTF per active column directly below (La - sp)
-      - up to 6 AIFs per P3 input, each arm belonging to one LP:
-          arm_idx=0 (right):  flat fan, Lo = +2sp / +3sp, 3 rows
-          arm_idx=1 (center): upward cross, La+sp / La+2sp, 3 Lo columns
-          arm_idx=2 (left):   flat fan, Lo = -2sp / -3sp, 3 rows
-      - P3 inputs with 3 P3 components use arm order [input[1], input[2], input[0]]
-        to match Razkin's exact pin placement
+    Architecture (implantation pleine taille) :
+      - jusqu'à 3 colonnes de LP en rangée horizontale à CENTER_LAT, Lo = +sp / 0 / -sp
+      - 1 HTF par colonne active, juste en dessous (La - sp)
+      - jusqu'à 6 AIFs par intrant P3, chaque bras appartenant à un LP :
+          arm_idx=0 (droite) : éventail plat, Lo = +2sp / +3sp, 3 rangées
+          arm_idx=1 (centre) : croix vers le haut, La+sp / La+2sp, 3 colonnes de Lo
+          arm_idx=2 (gauche) : éventail plat, Lo = -2sp / -3sp, 3 rangées
+      - les recettes à 3 composants P3 utilisent l'ordre de bras
+        [input[1], input[2], input[0]], pour coller au placement de pins exact de Razkin
 
-    Sizing: one HTF consumes 6/hr of each P3; one AIF produces 3/hr, so a
-    balanced layout needs arm_size >= 2*n_htf. The search maximises P4
-    throughput first (n_htf), then fills the arms with any spare budget.
-    At CC5 with a 3-P3 product this reproduces Razkin's full 3/6 layout.
+    Dimensionnement : un HTF consomme 6/h de chaque P3 et un AIF en produit 3/h,
+    donc une implantation équilibrée demande arm_size >= 2*n_htf. La recherche
+    maximise d'abord le débit P4 (n_htf), puis remplit les bras avec le budget
+    qui reste. En CC5 sur un produit à 3 P3, cela reproduit l'implantation 3/6
+    complète de Razkin.
 
-    Routing:
-      - P2 → AIF: from ALL LPs via BFS, the arm's own LP first (in-game route
-        priority follows creation order, so cross-pad routes act as overflow)
-      - P3 output (AIF → local LP): local LP only
-      - P3 → HTF: from LOCAL LP of that P3 arm to ALL HTFs
-      - P4 output (HTF → paired LP): each HTF to its own LP
+    Routage :
+      - P2 → AIF : depuis TOUS les LPs via BFS, celui du bras en premier (en jeu
+        la priorité des routes suit l'ordre de création, donc les routes
+        inter-pads ne servent que de débordement)
+      - sortie P3 (AIF → LP local) : le LP local uniquement
+      - P3 → HTF : depuis le LP LOCAL de ce bras P3 vers TOUS les HTFs
+      - sortie P4 (HTF → LP apparié) : chaque HTF vers son propre LP
     """
     if planet_type not in HTIF_PLANET_TYPES:
         return None
@@ -1962,17 +2112,18 @@ def _gen_p2_to_p4_template(product_name, planet_type, cc_level, diameter):
     p1_direct = [(n, q) for n, q in recipe_p4["input"] if q == 40]
     num_p3    = len(all_p3)
 
-    # Razkin arm assignment: for 3-P3 products reorder [input[1], input[2], input[0]]
-    # so right arm = input[1], center arm = input[2], left arm = input[0]
+    # Affectation des bras à la Razkin : pour les produits à trois P3, on réordonne
+    # en [input[1], input[2], input[0]] pour que bras droit = input[1], bras central
+    # = input[2] et bras gauche = input[0]
     if num_p3 == 3:
         arm_p3 = [all_p3[1], all_p3[2], all_p3[0]]
     else:
-        arm_p3 = list(all_p3)  # right then left for 2-P3 products
+        arm_p3 = list(all_p3)  # droite puis gauche pour les produits à deux P3
 
-    # ── Scale the layout to the CC budget ────────────────────────────
-    # n_htf = HTF/LP columns used (max 3), arm_size = AIFs per P3 arm (max 6,
-    # min 2*n_htf so the HTFs are fully supplied). More budget → more HTFs
-    # (P4 throughput), then fuller arms (P3 surplus for export).
+    # ── Mise à l'échelle de l'implantation sur le budget du CC ───────
+    # n_htf = colonnes HTF/LP utilisées (max 3), arm_size = AIFs par bras P3 (max 6,
+    # min 2*n_htf pour que les HTFs soient pleinement approvisionnés). Plus de budget
+    # → plus de HTFs (débit P4), puis des bras mieux remplis (surplus de P3 à exporter).
     best = None
     for u in range(3, 0, -1):
         lps_try = max(num_p3, u)
@@ -1988,34 +2139,36 @@ def _gen_p2_to_p4_template(product_name, planet_type, cc_level, diameter):
         return None
     n_htf, arm_size, num_lps = best
 
-    # LP column longitudes: right=+sp, center=0, left=-sp
+    # Longitudes des colonnes de LP : droite=+sp, centre=0, gauche=-sp
     lp_lons = [sp, 0.0, -sp][:num_lps]
 
     pins = []
-    arm_pins = {}   # arm_idx -> list of 1-based pin indices
-    arm_keep = {}   # arm_idx -> original-position indices kept (center arm)
+    arm_pins = {}   # arm_idx -> liste d'indices de pins (base 1)
+    arm_keep = {}   # arm_idx -> indices de positions d'origine conservés (bras central)
 
     for arm_idx, (p3_name, _) in enumerate(arm_p3):
         p3_tid = NAME_TO_ID[p3_name]
 
         if num_p3 == 3 and arm_idx == 1:
-            # CENTER arm: extends upward; pin order matches Excel pins 7-12
-            # upper_right, higher_right, upper_center(ROOT), higher_center, upper_left, higher_left
+            # Bras CENTRAL : s'étend vers le haut ; l'ordre des pins colle aux pins
+            # 7 à 12 du tableur — upper_right, higher_right, upper_center (ROOT),
+            # higher_center, upper_left, higher_left
             all_positions = [
                 (CENTER_LAT + sp,   sp),
                 (CENTER_LAT + 2*sp, sp),
-                (CENTER_LAT + sp,   0.0),   # ROOT — connected directly to LP
+                (CENTER_LAT + sp,   0.0),   # ROOT — relié directement au LP
                 (CENTER_LAT + 2*sp, 0.0),
                 (CENTER_LAT + sp,  -sp),
                 (CENTER_LAT + 2*sp,-sp),
             ]
-            # When truncated, keep the LP-connected ROOT pair first, then the
-            # right pair, then the left pair — preserving original pin order.
+            # En cas de troncature, on garde d'abord la paire ROOT reliée au LP,
+            # puis celle de droite, puis celle de gauche — l'ordre des pins
+            # d'origine est ainsi préservé.
             keep = sorted((2, 3, 0, 1, 4, 5)[:arm_size])
             positions = [all_positions[i] for i in keep]
             arm_keep[arm_idx] = keep
         elif arm_idx == 0:
-            # RIGHT arm: flat fan at Lo = +2sp / +3sp, rows = center / lower / upper
+            # Bras DROIT : éventail plat à Lo = +2sp / +3sp, rangées = centre / bas / haut
             positions = [
                 (CENTER_LAT,       2*sp),   # ROOT
                 (CENTER_LAT,       3*sp),
@@ -2025,7 +2178,7 @@ def _gen_p2_to_p4_template(product_name, planet_type, cc_level, diameter):
                 (CENTER_LAT + sp,  3*sp),
             ][:arm_size]
         else:
-            # LEFT arm: flat fan at Lo = -2sp / -3sp, rows = center / upper / lower
+            # Bras GAUCHE : éventail plat à Lo = -2sp / -3sp, rangées = centre / haut / bas
             positions = [
                 (CENTER_LAT,       -2*sp),  # ROOT
                 (CENTER_LAT,       -3*sp),
@@ -2041,13 +2194,13 @@ def _gen_p2_to_p4_template(product_name, planet_type, cc_level, diameter):
             this_arm.append(len(pins))
         arm_pins[arm_idx] = this_arm
 
-    # HTF pins: one per active column, directly below the LP (La - sp)
+    # Pins HTF : un par colonne active, juste sous le LP (La - sp)
     htf_1b = []
     for col in range(n_htf):
         pins.append(_make_pin(CENTER_LAT - sp, lp_lons[col], htf_type, schematic_id=p4_tid))
         htf_1b.append(len(pins))
 
-    # LP pins: one per column, at CENTER_LAT
+    # Pins LP : un par colonne, à CENTER_LAT
     lp_1b = []
     for col in range(num_lps):
         pins.append(_make_pin(CENTER_LAT, lp_lons[col], lp_type))
@@ -2055,21 +2208,21 @@ def _gen_p2_to_p4_template(product_name, planet_type, cc_level, diameter):
 
     num_pins = len(pins)
 
-    # --- Links (S=source, D=destination, matching Razkin's conventions) ---
+    # --- Liens (S=source, D=destination, conformément aux conventions Razkin) ---
     links = []
 
-    # Backbone chain: LP0 -> LP1 -> LP2
+    # Chaîne dorsale : LP0 -> LP1 -> LP2
     for i in range(num_lps - 1):
         links.append({"D": lp_1b[i + 1], "Lv": 0, "S": lp_1b[i]})
 
-    # HTF paired links: LP -> HTF (each LP to its own HTF directly below)
+    # Liens HTF appariés : LP -> HTF (chaque LP vers son propre HTF juste en dessous)
     for col in range(n_htf):
         links.append({"D": htf_1b[col], "Lv": 0, "S": lp_1b[col]})
 
     def _link_side_arm(lp_pin, arm):
         # arm = [root, center_far, side1_near, side1_far, side2_near, side2_far]
-        # (possibly truncated): root ← LP; far pins chain off their near pin;
-        # near pins branch off the root.
+        # (éventuellement tronqué) : root ← LP ; les pins lointains se chaînent sur
+        # leur pin proche ; les pins proches partent en dérivation du root.
         for i, pin in enumerate(arm):
             if i == 0:
                 links.append({"D": pin, "Lv": 0, "S": lp_pin})
@@ -2079,10 +2232,10 @@ def _gen_p2_to_p4_template(product_name, planet_type, cc_level, diameter):
                 links.append({"D": pin, "Lv": 0, "S": arm[0]})
 
     def _link_center_arm(lp_pin, arm, keep):
-        # Full arm = [upper_right, higher_right, root(upper_center),
-        # higher_center, upper_left, higher_left]; `keep` says which of those
-        # positions are present. upper_right links TOWARD root (matches
-        # Razkin: S=ur, D=root), then ur->hr.
+        # Bras complet = [upper_right, higher_right, root(upper_center),
+        # higher_center, upper_left, higher_left] ; `keep` dit lesquelles de ces
+        # positions sont présentes. upper_right pointe VERS le root (conforme à
+        # Razkin : S=ur, D=root), puis ur->hr.
         by_pos = dict(zip(keep, arm))
         root = by_pos[2]
         links.append({"D": root, "Lv": 0, "S": lp_pin})
@@ -2106,8 +2259,9 @@ def _gen_p2_to_p4_template(product_name, planet_type, cc_level, diameter):
     # --- Routes ---
     routes = []
 
-    # P2 inputs to each AIF (from ALL LPs, the arm's own LP first — in-game
-    # route priority is creation order); P3 output from AIF to LOCAL LP only
+    # Entrées P2 de chaque AIF (depuis TOUS les LPs, celui du bras en premier — en
+    # jeu la priorité des routes suit l'ordre de création) ; sortie P3 de l'AIF vers
+    # le LP LOCAL uniquement
     for arm_idx, (p3_name, _) in enumerate(arm_p3):
         p3_recipe = RECIPES_P2_P3[p3_name]
         local_lp  = lp_1b[arm_idx]
@@ -2122,7 +2276,7 @@ def _gen_p2_to_p4_template(product_name, planet_type, cc_level, diameter):
             if path:
                 routes.append({"P": path, "Q": p3_recipe["output"], "T": NAME_TO_ID[p3_name]})
 
-    # P3 inputs to HTFs: from LOCAL LP of that P3 arm to ALL HTFs
+    # Entrées P3 des HTFs : depuis le LP LOCAL de ce bras P3 vers TOUS les HTFs
     for arm_idx, (p3_name, p3_qty) in enumerate(arm_p3):
         p3_tid   = NAME_TO_ID[p3_name]
         local_lp = lp_1b[arm_idx]
@@ -2131,19 +2285,19 @@ def _gen_p2_to_p4_template(product_name, planet_type, cc_level, diameter):
             if path:
                 routes.append({"P": list(path), "Q": p3_qty, "T": p3_tid})
 
-    # P1 direct inputs to HTFs (Nano-Factory, Organic Mortar Applicators, Sterile Conduits)
+    # Entrées P1 directes des HTFs (Nano-Factory, Organic Mortar Applicators, Sterile Conduits)
     for p1_name, p1_qty in p1_direct:
         p1_tid = NAME_TO_ID[p1_name]
         for col, htf_pin in enumerate(htf_1b):
-            # Each HTF drains its own paired pad first (route priority is
-            # creation order in game); the other pads are overflow.
+            # Chaque HTF vide d'abord son propre pad apparié (en jeu, la priorité
+            # des routes est l'ordre de création) ; les autres pads débordent.
             paired = lp_1b[col]
             for src_lp in [paired] + [lp for lp in lp_1b if lp != paired]:
                 path = _bfs_path(links, src_lp, htf_pin, num_pins)
                 if path:
                     routes.append({"P": list(path), "Q": p1_qty, "T": p1_tid})
 
-    # P4 output: each HTF routes to its own paired LP
+    # Sortie P4 : chaque HTF route vers son propre LP apparié
     for col in range(n_htf):
         path = _bfs_path(links, htf_1b[col], lp_1b[col], num_pins)
         if path:
@@ -2161,7 +2315,7 @@ def _gen_p2_to_p4_template(product_name, planet_type, cc_level, diameter):
 
 
 class TemplateService:
-    """Validates config and delegates to template generation functions."""
+    """Valide la configuration et délègue aux fonctions de génération de template."""
 
     REQUIRED_KEYS = (
         "product_name",
