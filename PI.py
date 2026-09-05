@@ -1224,29 +1224,36 @@ class SettingsWindow:
             new_theme = self._theme_var.get()
             theme_changed = (new_theme != app._current_theme)
 
-            # Les deux réglages sont figés dans les widgets à la construction, donc
-            # les deux exigent la même reconstruction — on ne restyle pas un tuple
-            # de police en place.
-            if theme_changed or scale_changed:
+            before = dict(EVE)
+            if theme_changed:
                 app._current_theme = new_theme
                 _update_window_config("theme", new_theme)
                 apply_theme_colors(new_theme)
+
+            # Les deux réglages ne coûtent pas la même chose. Une couleur se
+            # repose sur les widgets en place ; une taille de texte est figée
+            # dans des tuples de police à la construction, et on ne restyle pas
+            # un tuple de police. Seule la seconde reconstruit donc, et la
+            # session est mise de côté puis reposée autour d'elle.
+            if scale_changed:
                 self._save_geo()
                 if self.w is not None:
                     self.w.destroy()
                 app._sw = None
-                
+
                 scanner_was_open = hasattr(app, '_scanner_popup') and app._scanner_popup and app._scanner_popup.winfo_exists()
                 if scanner_was_open:
                     app._scanner_popup.destroy()
-                
+
                 app._rebuild_ui()
-                
+
                 if scanner_was_open:
                     app._open_region_scanner()
             else:
+                if theme_changed:
+                    app._restyle_ui(before)
                 self._close()
-                
+
         except Exception as e:
             _debug(f"[{datetime.datetime.now().isoformat()}] SettingsWindow._apply - Failed to apply theme: {e}")
 
@@ -2267,6 +2274,15 @@ class PIGeneratorApp:
 
     def _rebuild_ui(self):
         """Détruit et reconstruit toute l'UI (utilisé lors d'un changement de thème)."""
+        # Ce qu'on était en train de faire, mis de côté avant que les widgets
+        # qui le portent soient détruits. Un thème et une taille de texte sont
+        # figés dans les widgets à la construction : les changer coûte
+        # forcément une reconstruction complète, et sans cette mise de côté
+        # APPLY se lisait comme un redémarrage — « everything i was doing is
+        # lost and it reset like if i just opened the app ». Rien n'était
+        # détruit par un choix de couleur ; le travail restait simplement dans
+        # les widgets qu'on venait de jeter.
+        session = self._snapshot_session()
         # Changer la taille du texte change ce que « tenir dans la fenêtre »
         # veut dire : la demande est à remesurer de zéro après la reconstruction.
         self._fit_last_demand = None
@@ -2275,6 +2291,266 @@ class PIGeneratorApp:
         self._setup_styles()
         self.root.configure(bg=EVE["bg_deep"])
         self._build_ui()
+        self._restore_session(session)
+
+    # Les options de couleur d'un widget Tk classique. Aucune n'est sur tous
+    # les widgets : chacune est essayée là où elle existe, et ignorée ailleurs.
+    _COLOR_OPTIONS = ("background", "foreground", "activebackground",
+                      "activeforeground", "disabledforeground",
+                      "highlightbackground", "highlightcolor",
+                      "insertbackground", "selectbackground",
+                      "selectforeground", "readonlybackground", "troughcolor")
+
+    # Ce qu'un objet de canvas peut porter. La moitié droite de la fenêtre est
+    # entièrement dessinée — la planète, la nomenclature, le panneau
+    # d'implantation — et ces couleurs-là ne sont sur aucun widget.
+    _CANVAS_ITEM_COLORS = ("fill", "outline", "activefill", "activeoutline")
+
+    def _restyle_ui(self, before):
+        """Repeint l'interface en place, sans rien reconstruire.
+
+        Un changement de couleur ne change pas *ce que* porte l'interface,
+        seulement de quoi elle est peinte. La reconstruire pour ça vidait le
+        panneau et la scène — « everything i was doing is lost and it reset
+        like if i just opened the app ». La taille du texte n'a pas ce luxe :
+        elle est figée dans des tuples de police à la construction, et reste le
+        seul réglage qui reconstruise.
+
+        `before` est la palette d'avant le changement. Les widgets portent des
+        couleurs littérales, posées à la construction depuis EVE : on les
+        retrouve donc par leur valeur. Aucun rôle ne partage sa valeur avec un
+        autre dans aucun des 22 thèmes, donc la correspondance est sans
+        ambiguïté. Et ce qui n'est pas dans la palette — le liseré de fenêtre,
+        le noir de l'espace, les blancs — est laissé tel quel, ce qui est
+        exactement ce qu'on veut de couleurs délibérément hors thème.
+
+        Même méthode que le tableau de bord Mining, qui recolore ainsi sa
+        fenêtre de configuration. Deux choses en plus ici : les objets de
+        canvas, parce que la planète et la nomenclature sont dessinées et non
+        assemblées, et la liste déroulante des combos, qui est une fenêtre à
+        part que `option_add` n'atteint plus une fois née.
+        """
+        remap = {str(old).lower(): EVE[key]
+                 for key, old in before.items()
+                 if key in EVE and str(old).lower() != str(EVE[key]).lower()}
+        if not remap:
+            return
+        # Les widgets ttk ne portent pas leurs couleurs : elles vivent dans les
+        # styles, qui se reconfigurent d'un coup pour tous.
+        self._setup_styles()
+        self._recolor_tree(self.root, remap)
+
+    def _recolor_tree(self, widget, remap):
+        """Échange, sur ce widget et sa descendance, toute couleur de l'ancienne palette."""
+        for option in self._COLOR_OPTIONS:
+            try:
+                new = remap.get(str(widget.cget(option)).lower())
+            except (tk.TclError, AttributeError):
+                continue          # option absente de ce widget
+            if new:
+                try:
+                    widget.configure({option: new})
+                except tk.TclError:
+                    pass
+        if isinstance(widget, tk.Canvas):
+            for item in widget.find_all():
+                for option in self._CANVAS_ITEM_COLORS:
+                    try:
+                        new = remap.get(str(widget.itemcget(item, option)).lower())
+                    except tk.TclError:
+                        continue
+                    if new:
+                        try:
+                            widget.itemconfigure(item, {option: new})
+                        except tk.TclError:
+                            pass
+        if isinstance(widget, ttk.Combobox):
+            self._recolor_popdown(widget)
+        for child in widget.winfo_children():
+            self._recolor_tree(child, remap)
+
+    def _recolor_popdown(self, combo):
+        """Repeint la liste déroulante d'une combo ttk, qui est une fenêtre à part.
+
+        Elle naît à la première ouverture puis se garde, avec les couleurs que
+        `option_add` lui a données à ce moment-là ; re-poser ces options ne
+        touche que les listes pas encore nées. Sans ce passage, une liste déjà
+        déroulée une fois s'ouvrait encore dans l'ancienne palette.
+        """
+        try:
+            popdown = combo.tk.call("ttk::combobox::PopdownWindow", combo)
+            listbox = f"{popdown}.f.l"
+            for option, key in (("-background", "bg_input"),
+                                ("-foreground", "fg_bright"),
+                                ("-selectbackground", "accent_dim")):
+                combo.tk.call(listbox, "configure", option, EVE[key])
+        except tk.TclError:
+            pass
+
+    def _snapshot_session(self):
+        """Tout ce que porte l'interface et qui ne vit nulle part ailleurs.
+
+        Les six étapes se relisent de leurs widgets, la colonie de la scène est
+        celle qu'on regarde — structures déplacées à la main comprises — et
+        l'écran du rail dit où on travaillait. Rien de tout ça n'est sur le
+        disque : rien ne le retrouverait après la reconstruction.
+
+        Renvoie None tant qu'il n'y a rien à mettre de côté. `_rebuild_ui` part
+        aussi du chemin d'ajustement de la taille du texte, qui court dès le
+        démarrage, et une interface pas encore bâtie n'a pas ces widgets.
+        """
+        if getattr(self, "_screen", None) is None:
+            return None
+        try:
+            panel = {
+                "product": self.product_var.get(),
+                "product_display": self._product_display_var.get(),
+                "chain": self.chain_var.get(),
+                "planet": self.planet_var.get(),
+                "radius": self.diameter_var.get(),
+                "cc": self.cc_var.get(),
+                "use_sf": bool(self.sf_var.get()),
+                "interval": self.interval_var.get(),
+                "yield": self.yield_var.get(),
+                "manual": bool(self.manual_var.get()),
+                "manual_counts": {key: var.get()
+                                  for key, var in self.manual_vars.items()},
+                "sourcing": {name: bool(var.get())
+                             for name, var in self.sourcing_vars.items()},
+            }
+        except (AttributeError, tk.TclError) as exc:
+            _debug(f"_snapshot_session - panel not readable: {exc}")
+            return None
+
+        state = getattr(self, "_stage_state", None) or {}
+        doc = state.get("doc")
+        stage = None
+        if doc is not None:
+            # Le dict `doc` part avec la scène qu'on démonte ; on garde ce
+            # qu'il dit, pour le retamponner sur celui que `_show_popup` crée.
+            stage = {"template": doc.get("template"),
+                     "config": doc.get("config"),
+                     "hand_edited": bool(doc.get("hand_edited")),
+                     "filed": bool(doc.get("filed"))}
+        return {
+            "screen": self._screen,
+            "panel": panel,
+            "stage": stage,
+            # Le cadrage aussi : après un zoom et un panoramique posés à la
+            # main, revenir à la vue par défaut se lit comme une colonie qui a
+            # bougé.
+            "view": {key: state.get(key)
+                     for key in ("zoom", "pan_x", "pan_y", "fit")},
+        }
+
+    def _restore_session(self, session):
+        """Repose sur l'interface neuve ce que `_snapshot_session` a mis de côté.
+
+        L'ordre des trois premières étapes est celui de
+        `_apply_template_to_panel`, et pour la même raison : choisir un produit
+        repeuple ②, choisir une chaîne refiltre ③, donc les poser dans le
+        désordre ne laisserait rien.
+
+        `_filling_panel` tient pendant tout le trajet. Sans lui, la deuxième
+        liste renseignée ouvrirait sur la scène la colonie que le panneau
+        décrit — celle du générateur — par-dessus celle qu'on est en train de
+        reposer, arrangement à la main compris.
+        """
+        if not session:
+            return
+        panel = session.get("panel") or {}
+        self._filling_panel = True
+        try:
+            product = panel.get("product")
+            if product:
+                display = panel.get("product_display")
+                if display:
+                    self.product_combo.set(display)
+                    self._product_display_var.set(display)
+                self.product_var.set(product)
+                # Repeuple ② ; il y choisit aussi une chaîne, qu'on remplace
+                # juste après.
+                self._update_chain_list()
+
+            chain = panel.get("chain")
+            if chain and chain in (self.chain_combo["values"] or ()):
+                self._set_chain(chain)
+                # Refiltre ③ selon ce que la chaîne autorise.
+                self._on_chain_changed()
+
+            planet = panel.get("planet")
+            if planet and planet in (self.planet_combo["values"] or ()):
+                self._set_planet(planet)
+
+            if panel.get("radius"):
+                self.diameter_var.set(panel["radius"])
+            if panel.get("cc") is not None:
+                self.cc_var.set(panel["cc"])
+                self._refresh_cc_buttons()
+            self.sf_var.set(panel.get("use_sf", False))
+            if panel.get("interval") is not None:
+                self.interval_var.set(panel["interval"])
+            if panel.get("yield"):
+                self.yield_var.set(panel["yield"])
+
+            if panel.get("manual"):
+                self.manual_var.set(True)
+                # Cocher la case pré-remplit les compteurs depuis la colonie
+                # automatique : les valeurs choisies se posent donc après, ou
+                # elles seraient écrasées par ce pré-remplissage.
+                self._toggle_manual_layout()
+                for key, value in (panel.get("manual_counts") or {}).items():
+                    var = self.manual_vars.get(key)
+                    if var is not None:
+                        var.set(value)
+
+            # Un seul recalcul, une fois tout posé : un par champ ferait
+            # clignoter la nomenclature huit fois pour le même résultat.
+            self._update_bom()
+
+            # Les cases de sourçage n'existent qu'une fois ⑥ redessiné par ce
+            # recalcul — elles se reposent donc en dernier, et seulement si
+            # elles diffèrent : `_rebuild_sources_rows` coche par défaut ce que
+            # le sol ne porte pas, et c'est souvent déjà la bonne réponse.
+            saved = panel.get("sourcing") or {}
+            changed = False
+            for name, var in self.sourcing_vars.items():
+                if name in saved and bool(var.get()) != saved[name]:
+                    var.set(saved[name])
+                    changed = True
+            if changed:
+                self._update_bom()
+        except (AttributeError, tk.TclError) as exc:
+            _debug(f"_restore_session - panel: {exc}")
+        finally:
+            self._filling_panel = False
+
+        stage = session.get("stage")
+        if stage and stage.get("template") is not None:
+            try:
+                # La colonie *telle qu'on la regardait*, et non celle que le
+                # panneau vient de recalculer : entre les deux il peut y avoir
+                # des structures déplacées à la main, qui ne vivent nulle part
+                # ailleurs.
+                self.current_template = stage["template"]
+                self._show_popup(stage["template"])
+                doc = (self._stage_state or {}).get("doc")
+                if doc is not None:
+                    doc["hand_edited"] = stage["hand_edited"]
+                    doc["filed"] = stage["filed"]
+                    # Sans elle, `stage_plan` n'a rien à comparer et retombe
+                    # sur REBUILD : le premier réglage touché après un
+                    # changement de thème effacerait l'arrangement.
+                    doc["config"] = stage.get("config") or self._stage_config()
+                self._stage_state.update(
+                    {key: value for key, value in (session.get("view") or {}).items()
+                     if value is not None})
+            except (AttributeError, tk.TclError) as exc:
+                _debug(f"_restore_session - stage: {exc}")
+
+        screen = session.get("screen")
+        if screen and screen != self._screen:
+            self._show_screen(screen)
 
     def _build_title_bar(self, window, title_text, close_cmd, show_about=False, show_minimize=False, show_settings=False, window_to_toggle=None, toggle_cmd=None):
         """Crée la barre de titre personnalisée avec boutons fermer, minimiser, paramètres et À propos."""

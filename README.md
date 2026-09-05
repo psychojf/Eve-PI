@@ -93,13 +93,19 @@ them would add 8 MB to the executable for code that does not run.
 
 ```
 python -m pytest -q                 # unit and golden tests
-python tests/build_flow_smoke.py    # one of the UI smoke scripts
+python tests/build_flow_smoke.py    # one UI smoke script
+for f in tests/*_smoke.py; do python "$f"; done   # all of them, back to back
 ```
 
 The suite has two halves. `pytest` covers pure logic and holds golden baselines
-for generated colonies. The `*_smoke.py` scripts drive the real Tk application
-and are run individually; they cover what a running window does — the rail, the
-unsaved-work guard, the window fit, the map, the wheel scope.
+for generated colonies. The `*_smoke.py` scripts drive the real Tk application;
+they cover what a running window does — the rail, the unsaved-work guard, the
+window fit, the map, the wheel scope, the settings.
+
+Run them back to back as well as singly. Each opens a real window, so a run of
+the whole set is slower and more contended than any one script, and that is
+where timing-sensitive behaviour shows up — `fit_smoke` steps the text size
+back one notch per rebuild and used to fail only under that load.
 
 ## Project Structure
 

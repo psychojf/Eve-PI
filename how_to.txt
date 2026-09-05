@@ -631,12 +631,20 @@ Click the gear icon in the title bar, from any screen.
   Text size — 80% to 200%, for every font in the app
   Theme     — 23 EVE faction colour schemes
 
-Click APPLY to confirm. Text size and theme both rebuild the
-window, so it will blink once.
+Click APPLY to confirm.
 
-Text size scales the panels as well as the text, so nothing
-overlaps or gets cut off. The window then re-fits itself
-around the new size.
+A theme repaints the window where it stands. Nothing is
+rebuilt and nothing is lost: the colony on the stage, the
+six steps, anything you dragged by hand, and the screen you
+were on all stay exactly as they were.
+
+Text size is the one setting that has to rebuild the window,
+because every font is fixed when its panel is built — it
+will blink once. Your work is put aside and set back down on
+the new window, so that costs nothing either. Text size
+scales the panels as well as the text, so nothing overlaps
+or gets cut off, and the window then re-fits itself around
+the new size.
 
 The "?" button opens the About panel.
 
