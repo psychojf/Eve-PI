@@ -1,6 +1,6 @@
 # EVE PI Template Generator
 
-A desktop tool for EVE Online players that generates ready-to-import Planetary Interaction (PI) installation templates. Based on the original spreadsheet by Razkin (Pandemic Horde).
+A desktop tool for EVE Online players that generates ready-to-import Planetary Interaction (PI) installation templates. Based on the original spreadsheet by Razkin.
 
 ## Features
 
@@ -165,4 +165,4 @@ See `how_to.txt` for a step-by-step walkthrough.
 - Systems, stargates and planets: [EVE Swagger Interface (ESI)](https://esi.evetech.net)
 - Planet radii: `mapDenormalize.csv` from the [Fuzzwork SDE dump](https://www.fuzzwork.co.uk/dump/latest/csv/), downloaded once and cached in `data/planet_radii.json`
 - PI recipes and resource tables: EVE Online SDE / community data
-- Original template math: *Planetary_Interaction_PI_Template_Generator* by Razkin, Pandemic Horde
+- Original template math: *Planetary_Interaction_PI_Template_Generator* by Razkin

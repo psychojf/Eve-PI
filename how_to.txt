@@ -37,6 +37,17 @@ not instead of it.
 Settings live behind the gear icon at the top right, from
 every screen.
 
+At the foot of the rail:
+
+  More tools        the other EVE tools, and one worth a look
+                    that somebody else built
+  Bug report        opens Discord in your browser
+  Terms of use      the terms, kept in the app
+  EVE time          the game clock, in UTC, running
+
+The arrow on Bug report means it leaves the app. The other
+two open a window here and do not.
+
 THE WINDOW SIZES ITSELF
 
   You should never have to scroll to see your own colony, so

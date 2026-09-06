@@ -13,6 +13,7 @@ import sys
 import platform
 import threading
 import urllib.request
+import webbrowser
 import concurrent.futures
 import time
 import datetime
@@ -75,8 +76,11 @@ from src.services.template_service import (
     get_tier,
     throughput_rows,
 )
+from src.services.eve_time import eve_clock_text
 from src.ui.collect_bar import CollectBar
 from src.ui.factory_timer import FactoryTimer
+from src.ui.more_tools import (BUG_REPORT_URL, COPYRIGHT_LINES,
+                               MY_TOOLS, RECOMMENDED_TOOLS, TERMS_SECTIONS)
 from src.ui.screens import (DESKTOP_RAIL, DESKTOP_SCREENS, RAIL_ITEMS,
                             RAIL_SCREENS, SCREEN_MODE_LABELS)
 from src.ui.stage_notice import StageNotice
@@ -468,7 +472,12 @@ FIT_SCALE = 1.0
 # Ce que l'ajustement s'autorise.
 FIT_SCALE_FLOOR = 0.80   # jamais plus petit, même si ça déborde encore
 FIT_SCALE_STEP = 0.05    # « de très petits ajustements », comme demandé
-FIT_STAGE_MIN_H = 600    # sous quoi la planète cesse d'être une planète
+# FIT_STAGE_MIN_H a vécu ici : 600 px sous lesquels « la planète cesse d'être
+# une planète ». Il mesurait le viewport, pas la fenêtre, et servait de plancher
+# à Build seul — d'où un Build qui s'ouvrait 296 px plus court que la
+# bibliothèque. Les trois écrans partagent FIT_ROOMY_H maintenant, qui est plus
+# haut que ce que ce plancher-là pouvait produire : il ne pouvait plus se
+# déclencher, et un `max()` qu'on ne peut pas atteindre ment au lecteur suivant.
 FIT_SCREEN_MARGIN = 90   # ce qu'on laisse au bureau autour de la fenêtre
 # En dessous, on ne bouge pas : une fenêtre qui se recale de quelques pixels à
 # chaque frappe est plus fatigante que deux lignes à faire défiler.
@@ -818,6 +827,90 @@ def _dim(hx, factor=0.6):
     b = int(int(h[4:6], 16) * factor)
     return f"#{r:02x}{g:02x}{b:02x}"
 
+# Le plancher de contraste du texte secondaire. WCAG demande 4.5 pour du texte
+# courant ; on monte à 6, choisi sur pièces devant une échelle rendue par
+# l'application elle-même. Même raison que l'ordre du fitter, qui fait grandir
+# la fenêtre avant de rapetisser le texte : cette application est écrite pour
+# quelqu'un qui voit mal, et « ça tient » n'est pas « ça se lit ».
+FG_DIM_MIN_CONTRAST = 6.0
+
+
+def _relative_luminance(hx):
+    """Luminance relative WCAG d'une couleur hex, de 0 (noir) à 1 (blanc)."""
+    h = hx.lstrip('#')
+    channels = []
+    for i in (0, 2, 4):
+        c = int(h[i:i + 2], 16) / 255
+        channels.append(c / 12.92 if c <= 0.03928
+                        else ((c + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def _contrast(fg, bg):
+    """Rapport de contraste WCAG entre deux couleurs hex, de 1 à 21.
+
+    1 veut dire « exactement la même luminance » — invisible. C'est ce que
+    valait Sisters of EVE, dont le texte secondaire (#7f0000) et la carte
+    (#3c3c3c) se lisaient à 1.00:1.
+    """
+    a, b = _relative_luminance(fg), _relative_luminance(bg)
+    return (max(a, b) + 0.05) / (min(a, b) + 0.05)
+
+
+def _readable(fg, bg, target):
+    """`fg` éclairci juste assez pour se lire sur `bg`.
+
+    Rendu tel quel s'il passe déjà : un thème dont le texte secondaire est
+    lisible garde exactement la teinte de sa faction, et seuls ceux qui en
+    avaient besoin bougent.
+    """
+    if _contrast(fg, bg) >= target:
+        return fg
+    for step in range(1, 256):
+        candidate = _lighten(fg, step)
+        if _contrast(candidate, bg) >= target:
+            return candidate
+    return "#ffffff"
+
+
+# Les couleurs qui servent de *texte*, et sous quel nom leur version lisible est
+# rangée. `fg_dim` se relève sur place : il ne sert qu'à écrire. `accent` et
+# `red` gardent leur valeur d'origine et gagnent une variante à côté, parce
+# qu'ils servent aussi d'aplat — la sélection du rail, le filet des notices, le
+# fond du bouton de fermeture au survol — où un plancher de contraste de texte
+# ne veut rien dire et ne ferait que délaver l'identité du thème.
+READABLE_TEXT_ROLES = (
+    ("fg_dim", "fg_dim"),
+    ("accent", "accent_text"),
+    ("red", "red_text"),
+)
+
+
+def _enforce_readable_dim(themes):
+    """Relève le texte secondaire de chaque thème jusqu'au plancher.
+
+    `fg_dim` est dérivé de l'accent (`_dim(accent, 0.7)`), donc ce n'est pas un
+    premier plan atténué mais un accent assombri : pour toute faction dont
+    l'accent est déjà sombre, il tombait au niveau du fond. Dix-sept thèmes sur
+    vingt-trois sous 3:1, douze sous 2:1. Rapporté sur l'écran JSON, celui qui
+    s'en remet le plus au texte secondaire — « we barely see the text in the
+    JSON tab » — mais le défaut était partout : l'indication de rayon, les
+    débits de la nomenclature, la légende de la carte, les étiquettes CPU/PWR.
+
+    Mesuré contre `bg_card`, le plus clair des quatre fonds (`_lighten(base,
+    22)` contre 18, 10 et 0) : ce qui se lit là se lit sur les trois autres.
+
+    Posé ici, sur le dict complet, plutôt que dans `_gen_theme` : le thème par
+    défaut est écrit à la main et ne passe pas par le générateur, et un
+    plancher qui ne couvre pas tous les thèmes n'en est pas un.
+    """
+    for theme in themes.values():
+        for source, target in READABLE_TEXT_ROLES:
+            theme[target] = _readable(theme[source], theme["bg_card"],
+                                      FG_DIM_MIN_CONTRAST)
+    return themes
+
+
 def _blend(h1, h2, t=0.5):
     """Mélange linéaire de deux couleurs hex ; t=0 → h1, t=1 → h2."""
     a = h1.lstrip('#')
@@ -856,7 +949,7 @@ def _gen_theme(base, accent):
 
 THEME_DEFAULT = "EVE Online (Default)"
 
-THEMES = {
+THEMES = _enforce_readable_dim({
     THEME_DEFAULT: {
         "bg_deep":      "#0b0e13",
         "bg_panel":     "#11151c",
@@ -903,7 +996,7 @@ THEMES = {
     "Thukker Tribe":                _gen_theme("#1F1A17", "#B35900"),
     "CONCORD":                      _gen_theme("#0A1428", "#0088FF"),
     "Society of Conscious Thought": _gen_theme("#0A111A", "#00E8FF"),
-}
+})
 
 THEME_NAMES = list(THEMES.keys())
 
@@ -991,6 +1084,70 @@ def _attach_placeholder(entry, text):
     # un champ vide et muet jusqu'au prochain passage de focus.
     state["restore"] = show
     return state
+
+
+# Le rappel d'import, en trois morceaux : ce qui précède, ce qui est mis en
+# avant, ce qui suit. Il vivait recopié à deux endroits — la scène et l'écran
+# JSON — avec des retours à la ligne différents, donc deux prose à maintenir
+# pour une seule phrase.
+IMPORT_NOTICE = (
+    "Importing in EVE: leave ",
+    "Compress Pins",
+    " unticked. Ticked, the game repacks the colony to its own spacing and the "
+    "layout you drew is lost without a word. Unticked, it names any structure "
+    "sitting too close and refuses, which is the answer worth having.",
+)
+
+
+def _import_notice(parent, bg):
+    """Le rappel d'import, avec le nom de la case en évidence.
+
+    C'était un `tk.Label`, donc une seule couleur pour toute la phrase : la
+    seule chose que le lecteur doit en retenir — le nom exact de la case à ne
+    pas cocher — se lisait comme le reste. Les deux espaces qui l'entouraient
+    étaient la seule emphase qu'un Label permette. Le webtool le met en gras,
+    et c'est ce qu'on veut ici aussi.
+
+    Un `tk.Text` plutôt qu'un Label parce que c'est le seul widget Tk qui
+    accepte deux styles dans un même paragraphe qui s'enroule. En lecture
+    seule, sans relief ni curseur de saisie, il se lit comme l'étiquette qu'il
+    remplace.
+    """
+    frame = tk.Frame(parent, bg=bg)
+    tk.Frame(frame, bg=EVE["accent"], width=3).pack(side=tk.LEFT, fill="y")
+
+    body = tk.Text(frame, bg=bg, fg=EVE["fg_dim"], relief=tk.FLAT, bd=0,
+                   highlightthickness=0, wrap="word", cursor="arrow",
+                   takefocus=0, height=1, font=("Segoe UI", _fs(8)))
+    body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(_px(10), 0))
+    body.tag_configure("strong", foreground=EVE["fg_bright"],
+                       font=("Segoe UI", _fs(8), "bold"))
+
+    before, strong, after = IMPORT_NOTICE
+    body.insert("1.0", before)
+    body.insert("end", strong, "strong")
+    body.insert("end", after)
+    body.configure(state="disabled")
+
+    # Un Text ne se dimensionne pas sur son contenu : sans ça il réclamerait ses
+    # 24 lignes par défaut. On compte les lignes *affichées*, donc après
+    # enroulement, et seulement quand la largeur change — régler la hauteur
+    # redéclenche <Configure>, et y répondre bouclerait.
+    state = {"width": 0}
+
+    def _fit(event):
+        if event.width == state["width"]:
+            return
+        state["width"] = event.width
+        try:
+            shown = int(body.tk.call(body._w, "count", "-displaylines",
+                                     "1.0", "end"))
+        except (tk.TclError, ValueError):
+            return
+        body.configure(height=max(1, shown))
+
+    body.bind("<Configure>", _fit)
+    return frame
 
 
 def apply_window_border(window):
@@ -1114,7 +1271,7 @@ class SettingsWindow:
         
         self.opacity_lbl = tk.Label(opacity_frame, text=f"{int(app.alpha * 100)}%",
                                      font=("Segoe UI", _fs(10), "bold"), bg=EVE["bg_deep"],
-                                     fg=EVE["accent"], width=5)
+                                     fg=EVE["accent_text"], width=5)
         self.opacity_lbl.pack(side="right", padx=(8, 0))
         
         tk.Label(body, text="TEXT SIZE %", font=lf, bg=EVE["bg_deep"],
@@ -1138,7 +1295,7 @@ class SettingsWindow:
 
         self.scale_lbl = tk.Label(scale_frame, text=f"{int(round(UI_SCALE * 100))}%",
                                   font=("Segoe UI", _fs(10), "bold"),
-                                  bg=EVE["bg_deep"], fg=EVE["accent"], width=5)
+                                  bg=EVE["bg_deep"], fg=EVE["accent_text"], width=5)
         self.scale_lbl.pack(side="right", padx=(8, 0))
 
         tk.Label(body, text="THEME", font=lf, bg=EVE["bg_deep"],
@@ -1375,9 +1532,9 @@ class PIGeneratorApp:
         style.theme_use("clam")
         style.configure("TFrame",           background=EVE["bg_deep"])
         style.configure("TLabel",           background=EVE["bg_deep"],  foreground=EVE["fg"],       font=("Segoe UI", _fs(10)))
-        style.configure("TLabelframe",      background=EVE["bg_deep"],  foreground=EVE["accent"],   font=("Segoe UI", _fs(10), "bold"))
-        style.configure("TLabelframe.Label",background=EVE["bg_deep"],  foreground=EVE["accent"],   font=("Segoe UI", _fs(10), "bold"))
-        style.configure("Header.TLabel",    background=EVE["bg_deep"],  foreground=EVE["accent"],   font=("Segoe UI", _fs(14), "bold"))
+        style.configure("TLabelframe",      background=EVE["bg_deep"],  foreground=EVE["accent_text"],   font=("Segoe UI", _fs(10), "bold"))
+        style.configure("TLabelframe.Label",background=EVE["bg_deep"],  foreground=EVE["accent_text"],   font=("Segoe UI", _fs(10), "bold"))
+        style.configure("Header.TLabel",    background=EVE["bg_deep"],  foreground=EVE["accent_text"],   font=("Segoe UI", _fs(14), "bold"))
         style.configure("Sub.TLabel",       background=EVE["bg_deep"],  foreground=EVE["fg_dim"],   font=("Segoe UI", _fs(9)))
         style.configure("TButton",          font=("Segoe UI", _fs(10), "bold"))
         style.configure("Accent.TButton",   font=("Segoe UI", _fs(11), "bold"))
@@ -1972,6 +2129,169 @@ class PIGeneratorApp:
                 btn.bind("<Button-1>", lambda _e: self._open_scout_from_build())
             self._rail_buttons[name] = btn
 
+        # Le pied se pose apres les destinations : il s'ancre au plancher, donc
+        # il ne depend pas de leur nombre.
+        self._build_rail_footer(rail)
+
+    def _build_rail_footer(self, rail):
+        """Le pied du rail : les autres outils, le bug, les conditions, l'heure.
+
+        Porté de `WEBTOOL/src/app/LegalSupport.tsx`, où ce bloc vit depuis le
+        début. Le rail du bureau s'arrêtait à JSON et laissait le reste de sa
+        hauteur vide.
+
+        Empaqueté par le bas, et dans l'ordre inverse de la lecture : `BOTTOM`
+        empile du sol vers le haut, donc l'horloge se pose d'abord et le
+        premier bouton en dernier. C'est ce qui ancre le bloc au plancher quelle
+        que soit la hauteur de la fenêtre — laquelle change à chaque colonie.
+
+        La flèche n'est que sur « Bug report », et c'est la règle du webtool :
+        elle marque un lien qui *part*. Les deux autres ouvrent une fenêtre et
+        ne la portent pas.
+        """
+        footer = tk.Frame(rail, bg=EVE["bg_panel"])
+        footer.pack(side=tk.BOTTOM, fill=tk.X, pady=(_px(10), _px(8)))
+
+        # ── L'heure du jeu ────────────────────────────────────────────
+        clock_box = tk.Frame(footer, bg=EVE["bg_panel"],
+                             highlightbackground=EVE["border"],
+                             highlightthickness=1)
+        clock_box.pack(side=tk.BOTTOM, fill=tk.X, padx=_px(8), pady=(_px(8), 0))
+        tk.Label(clock_box, text="EVE TIME", bg=EVE["bg_panel"],
+                 fg=EVE["fg_dim"], font=("Segoe UI", _fs(7), "bold")).pack(
+                     pady=(_px(3), 0))
+        clock = tk.Label(clock_box, text=eve_clock_text(), bg=EVE["bg_panel"],
+                         fg=EVE["accent_text"], font=("Consolas", _fs(10), "bold"))
+        clock.pack(pady=(0, _px(3)))
+
+        def tick():
+            # S'arrête de lui-même quand son étiquette a disparu, comme la
+            # boucle d'animation de la carte : un changement de taille de texte
+            # reconstruit toute l'interface, et un `after` qui survit à son
+            # widget lèverait une TclError à chaque seconde.
+            try:
+                clock.config(text=eve_clock_text())
+            except tk.TclError:
+                return
+            self._clock_job = self.root.after(1000, tick)
+
+        self._clock_job = self.root.after(1000, tick)
+
+        # ── Le copyright ──────────────────────────────────────────────
+        for line in reversed(COPYRIGHT_LINES):
+            tk.Label(footer, text=line, bg=EVE["bg_panel"], fg=EVE["fg_dim"],
+                     font=("Segoe UI", _fs(7)), wraplength=_px(88),
+                     justify=tk.CENTER).pack(side=tk.BOTTOM, fill=tk.X)
+
+        # ── Les trois actions ─────────────────────────────────────────
+        terms = tk.Label(footer, text="TERMS OF\nUSE", bg=EVE["bg_panel"],
+                         fg=EVE["fg_dim"], font=("Segoe UI", _fs(8)),
+                         cursor="hand2", justify=tk.CENTER)
+        terms.pack(side=tk.BOTTOM, fill=tk.X, pady=(_px(10), _px(6)))
+        terms.bind("<Button-1>", lambda _e: self._show_terms())
+        _attach_tooltip(terms, "Terms of use")
+
+        self._rail_action(footer, "BUG\nREPORT ↗", EVE["red_text"],
+                          lambda: webbrowser.open(BUG_REPORT_URL),
+                          "Report a bug on Discord — opens your browser")
+        self._rail_action(footer, "MORE\nTOOLS", EVE["accent_text"],
+                          self._show_more_tools,
+                          "Other EVE tools worth a look")
+
+    def _rail_action(self, parent, label, colour, command, spoken):
+        """Un des boutons encadrés du pied de rail."""
+        box = tk.Frame(parent, bg=EVE["bg_panel"],
+                       highlightbackground=EVE["border"], highlightthickness=1,
+                       cursor="hand2")
+        box.pack(side=tk.BOTTOM, fill=tk.X, padx=_px(8), pady=(_px(6), 0))
+        text = tk.Label(box, text=label, bg=EVE["bg_panel"], fg=colour,
+                        font=("Segoe UI", _fs(8), "bold"), cursor="hand2",
+                        justify=tk.CENTER)
+        text.pack(fill=tk.X, pady=_px(6))
+        for widget in (box, text):
+            widget.bind("<Button-1>", lambda _e: command())
+            widget.bind("<Enter>", lambda _e: box.config(
+                highlightbackground=EVE["border_hi"]))
+            widget.bind("<Leave>", lambda _e: box.config(
+                highlightbackground=EVE["border"]))
+        _attach_tooltip(text, spoken)
+        return box
+
+    def _shell_dialog(self, title, build_body, width=_px(430)):
+        """La fenêtre que partagent « More tools » et « Terms of use ».
+
+        `WEBTOOL/src/app/ShellModal.tsx` le dit de ses deux boîtes : ce sont la
+        même, avec des contenus différents. Une seule ici pour que ça reste
+        vrai — deux quasi-copies finiraient par diverger sur la marge, le
+        titre ou la façon de se fermer.
+
+        Même forme que la fenêtre À propos : sans décor, bordée, centrée sur la
+        principale, et dimensionnée sur son contenu une fois celui-ci posé.
+        """
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        try:
+            win.attributes("-alpha", self.alpha)
+        except tk.TclError:
+            pass
+        win.configure(bg=EVE["bg_deep"])
+        apply_window_border(win)
+        self._build_title_bar(win, title, win.destroy)
+
+        body = tk.Frame(win, bg=EVE["bg_deep"])
+        body.pack(fill=tk.BOTH, expand=True, padx=_px(16), pady=_px(14))
+        build_body(body, width - _px(40))
+
+        win.update_idletasks()
+        win.geometry(f"{max(width, win.winfo_reqwidth())}x{win.winfo_reqheight()}")
+        _centre_on_parent(win, self.root)
+        win.lift()
+        win.focus_force()
+        return win
+
+    def _show_more_tools(self):
+        """Les autres outils, chacun avec ce qu'il fait et un lien qui part."""
+        def body(parent, wrap):
+            tk.Label(parent, text="Other EVE Online tools I have built.",
+                     bg=EVE["bg_deep"], fg=EVE["fg"],
+                     font=("Segoe UI", _fs(9)), wraplength=wrap,
+                     justify=tk.LEFT).pack(anchor=tk.W, pady=(0, _px(10)))
+            for name, url, blurb in MY_TOOLS:
+                self._tool_entry(parent, name, url, blurb, wrap)
+            tk.Label(parent, text="Worth a look, built by someone else.",
+                     bg=EVE["bg_deep"], fg=EVE["fg"],
+                     font=("Segoe UI", _fs(9)), wraplength=wrap,
+                     justify=tk.LEFT).pack(anchor=tk.W, pady=(_px(12), _px(10)))
+            for name, url, blurb in RECOMMENDED_TOOLS:
+                self._tool_entry(parent, name, url, blurb, wrap)
+
+        return self._shell_dialog("More EVE tools", body)
+
+    def _tool_entry(self, parent, name, url, blurb, wrap):
+        """Un outil : son nom qui part, et ce qu'il fait en dessous."""
+        link = tk.Label(parent, text=f"{name} ↗", bg=EVE["bg_deep"],
+                        fg=EVE["accent_text"], cursor="hand2",
+                        font=("Segoe UI", _fs(10), "bold", "underline"))
+        link.pack(anchor=tk.W)
+        link.bind("<Button-1>", lambda _e, u=url: webbrowser.open(u))
+        tk.Label(parent, text=blurb, bg=EVE["bg_deep"], fg=EVE["fg_dim"],
+                 font=("Segoe UI", _fs(8)), wraplength=wrap,
+                 justify=tk.LEFT).pack(anchor=tk.W, pady=(_px(2), _px(10)))
+
+    def _show_terms(self):
+        """Les conditions d'utilisation, en clair et sans réseau."""
+        def body(parent, wrap):
+            for heading, text in TERMS_SECTIONS:
+                tk.Label(parent, text=heading, bg=EVE["bg_deep"],
+                         fg=EVE["accent_text"],
+                         font=("Segoe UI", _fs(9), "bold")).pack(anchor=tk.W)
+                tk.Label(parent, text=text, bg=EVE["bg_deep"], fg=EVE["fg_dim"],
+                         font=("Segoe UI", _fs(8)), wraplength=wrap,
+                         justify=tk.LEFT).pack(anchor=tk.W, pady=(_px(2), _px(10)))
+
+        return self._shell_dialog("Terms of Use", body)
+
     def _refresh_rail(self):
         """Met en surbrillance la destination où l'on se trouve."""
         for name, btn in getattr(self, "_rail_buttons", {}).items():
@@ -2107,7 +2427,7 @@ class PIGeneratorApp:
         # pas lire le presse-papiers quand il veut. Le bureau, si : ce raccourci
         # remplit le champ en un clic plutot que de le retirer.
         tk.Button(label_row, text="from clipboard", font=("Segoe UI", _fs(8)),
-                  bg=EVE["bg_card"], fg=EVE["accent"],
+                  bg=EVE["bg_card"], fg=EVE["accent_text"],
                   activebackground=EVE["bg_card"], activeforeground=EVE["fg_bright"],
                   relief=tk.FLAT, cursor="hand2", bd=0,
                   command=self._json_fill_from_clipboard).pack(side=tk.RIGHT)
@@ -2134,18 +2454,8 @@ class PIGeneratorApp:
 
         # La meme notice que sur la scene, et pour la meme raison : c'est ici
         # aussi qu'on part vers le jeu.
-        notice = tk.Frame(right, bg=EVE["bg_card"])
-        notice.pack(fill=tk.BOTH, expand=True, pady=(_px(12), 0))
-        tk.Frame(notice, bg=EVE["accent"], width=3).pack(side=tk.LEFT, fill="y")
-        tk.Label(notice,
-                 text=("Importing in EVE: leave  Compress Pins  unticked. Ticked, "
-                       "the game repacks the colony to its own spacing and the "
-                       "layout you drew is lost without a word. Unticked, it names "
-                       "any structure sitting too close and refuses, which is the "
-                       "answer worth having."),
-                 bg=EVE["bg_card"], fg=EVE["fg_dim"], font=("Segoe UI", _fs(8)),
-                 justify=tk.LEFT, anchor=tk.NW, wraplength=_px(520)).pack(
-                     side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(_px(10), 0))
+        _import_notice(right, EVE["bg_card"]).pack(
+            fill=tk.BOTH, expand=True, pady=(_px(12), 0))
 
         # ── Ce qu'il y a sur la scene ────────────────────────────────────
         self._json_heading = tk.StringVar(value="NOTHING BUILT YET")
@@ -2364,6 +2674,21 @@ class PIGeneratorApp:
                             widget.itemconfigure(item, {option: new})
                         except tk.TclError:
                             pass
+        if isinstance(widget, tk.Text):
+            # Les couleurs d'un tag ne sont pas des options du widget : le
+            # parcours ci-dessus ne les voit pas, et la portion mise en avant
+            # du rappel d'import serait restée dans l'ancienne palette.
+            for tag in widget.tag_names():
+                for option in ("foreground", "background"):
+                    try:
+                        new = remap.get(str(widget.tag_cget(tag, option)).lower())
+                    except tk.TclError:
+                        continue
+                    if new:
+                        try:
+                            widget.tag_configure(tag, **{option: new})
+                        except tk.TclError:
+                            pass
         if isinstance(widget, ttk.Combobox):
             self._recolor_popdown(widget)
         for child in widget.winfo_children():
@@ -2575,7 +2900,7 @@ class PIGeneratorApp:
             mb = tk.Label(title_bar, text=" — ", bg=EVE["bg_panel"], fg=EVE["fg_dim"],
                           font=("Segoe UI", _fs(11), "bold"), cursor="hand2")
             mb.pack(side=tk.RIGHT, padx=(0, 4))
-            mb.bind("<Enter>", lambda e: mb.config(fg=EVE["accent"]))
+            mb.bind("<Enter>", lambda e: mb.config(fg=EVE["accent_text"]))
             mb.bind("<Leave>", lambda e: mb.config(fg=EVE["fg_dim"]))
             mb.bind("<Button-1>", lambda e: self._minimize_to_tray())
 
@@ -2748,7 +3073,7 @@ class PIGeneratorApp:
 
         ttk.Label(content, text="EVE Online — PI Template Generator", style="Header.TLabel").pack(anchor=tk.W, pady=(0,5))
         ttk.Label(content, text="Version 2.7", style="Sub.TLabel").pack(anchor=tk.W)
-        ttk.Label(content, text="\nBased on the Planetary Interaction Template\nGenerator spreadsheet by Razkin\n(Pandemic Horde).").pack(anchor=tk.W)
+        ttk.Label(content, text="\nBased on the Planetary Interaction Template\nGenerator spreadsheet by Razkin.").pack(anchor=tk.W)
         # Le crédit de la bibliothèque livrée a été retiré le 12/08/2026 : la
         # bibliothèque ne contient plus que les colonies bâties par l'utilisateur, donc
         # créditer des templates qui ne sont plus livrés serait affirmer une contrevérité.
@@ -2761,13 +3086,13 @@ class PIGeneratorApp:
                   text="Planets in Space — web tool for managing\n"
                        "your PI across all your characters").pack(anchor=tk.W)
         pis_link = tk.Label(content, text="planetsin.space",
-                            bg=EVE["bg_deep"], fg=EVE["accent"],
+                            bg=EVE["bg_deep"], fg=EVE["accent_text"],
                             font=("Segoe UI", _fs(9), "underline"), cursor="hand2")
         pis_link.pack(anchor=tk.W)
-        pis_link.bind("<Button-1>", lambda e: __import__("webbrowser").open(
-            "https://planetsin.space/"))
+        pis_link.bind("<Button-1>",
+                      lambda e: webbrowser.open("https://planetsin.space/"))
 
-        ttk.Label(content, text="\nFly Safe o7", foreground=EVE["accent"]).pack(anchor=tk.W)
+        ttk.Label(content, text="\nFly Safe o7", foreground=EVE["accent_text"]).pack(anchor=tk.W)
 
         # Dimensionnée une fois tout empaqueté, pour que la fenêtre fasse exactement
         # son contenu plus la marge autour.
@@ -2924,7 +3249,7 @@ class PIGeneratorApp:
                         highlightbackground=EVE["border"], highlightthickness=1)
         grp1.pack(fill=tk.X, padx=8, pady=(8, 3))
 
-        tk.Label(grp1, text="① PRODUCT", bg=EVE["bg_card"], fg=EVE["accent"],
+        tk.Label(grp1, text="① PRODUCT", bg=EVE["bg_card"], fg=EVE["accent_text"],
                  font=("Segoe UI", _fs(8), "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
 
         self.product_var = tk.StringVar()      # nom brut, sans crochets
@@ -2941,7 +3266,7 @@ class PIGeneratorApp:
                         highlightbackground=EVE["border"], highlightthickness=1)
         grp2.pack(fill=tk.X, padx=8, pady=3)
 
-        tk.Label(grp2, text="② CHAIN", bg=EVE["bg_card"], fg=EVE["accent"],
+        tk.Label(grp2, text="② CHAIN", bg=EVE["bg_card"], fg=EVE["accent_text"],
                  font=("Segoe UI", _fs(8), "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
 
         self.chain_var = tk.StringVar()             # la chaîne réellement choisie
@@ -2958,7 +3283,7 @@ class PIGeneratorApp:
                         highlightbackground=EVE["border"], highlightthickness=1)
         grp3.pack(fill=tk.X, padx=8, pady=3)
 
-        tk.Label(grp3, text="③ PLANET TYPE", bg=EVE["bg_card"], fg=EVE["accent"],
+        tk.Label(grp3, text="③ PLANET TYPE", bg=EVE["bg_card"], fg=EVE["accent_text"],
                  font=("Segoe UI", _fs(8), "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
 
         self.planet_var = tk.StringVar()
@@ -2974,7 +3299,7 @@ class PIGeneratorApp:
                         highlightbackground=EVE["border"], highlightthickness=1)
         grp4.pack(fill=tk.X, padx=8, pady=3)
 
-        tk.Label(grp4, text="④ PLANET RADIUS (km)", bg=EVE["bg_card"], fg=EVE["accent"],
+        tk.Label(grp4, text="④ PLANET RADIUS (km)", bg=EVE["bg_card"], fg=EVE["accent_text"],
                  font=("Segoe UI", _fs(8), "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
 
         radius_row = tk.Frame(grp4, bg=EVE["bg_card"])
@@ -3006,7 +3331,7 @@ class PIGeneratorApp:
                         highlightbackground=EVE["border"], highlightthickness=1)
         grp5.pack(fill=tk.X, padx=8, pady=3)
 
-        tk.Label(grp5, text="⑤ COMMAND CENTER LEVEL", bg=EVE["bg_card"], fg=EVE["accent"],
+        tk.Label(grp5, text="⑤ COMMAND CENTER LEVEL", bg=EVE["bg_card"], fg=EVE["accent_text"],
                  font=("Segoe UI", _fs(8), "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
 
         self.cc_var = tk.IntVar(value=5)
@@ -3035,7 +3360,7 @@ class PIGeneratorApp:
                                    highlightbackground=EVE["border"], highlightthickness=1)
         self.grp_layout.pack(fill=tk.X, padx=8, pady=3)
 
-        tk.Label(self.grp_layout, text="⑥ LAYOUT", bg=EVE["bg_card"], fg=EVE["accent"],
+        tk.Label(self.grp_layout, text="⑥ LAYOUT", bg=EVE["bg_card"], fg=EVE["accent_text"],
                  font=("Segoe UI", _fs(8), "bold")).pack(anchor=tk.W, padx=8, pady=(6, 0))
 
         # Intervalle de ramassage — le bouton « j'ai horreur de ramasser »
@@ -3147,7 +3472,7 @@ class PIGeneratorApp:
         bom_header = tk.Frame(self.grp_bom, bg=EVE["bg_card"])
         bom_header.pack(fill=tk.X, padx=8, pady=(6, 0))
         tk.Label(bom_header, text="⬡  BILL OF MATERIALS", bg=EVE["bg_card"],
-                 fg=EVE["accent"], font=("Segoe UI", _fs(8), "bold")).pack(side=tk.LEFT)
+                 fg=EVE["accent_text"], font=("Segoe UI", _fs(8), "bold")).pack(side=tk.LEFT)
         self.bom_product_lbl = tk.Label(bom_header, text="", bg=EVE["bg_card"],
                                         fg=EVE["fg_bright"], font=("Segoe UI", _fs(8), "bold"))
         self.bom_product_lbl.pack(side=tk.RIGHT)
@@ -3276,9 +3601,18 @@ class PIGeneratorApp:
         # séparateur, marges. Mesuré plutôt que constant, parce qu'il suit
         # lui-même la taille du texte.
         chrome = max(0, self.root.winfo_height() - viewport.winfo_height())
-        # La planète a droit à sa place même quand le panneau est court, sinon
-        # une colonie vide replierait la fenêtre sur une vignette.
-        return max(needed, _px(FIT_STAGE_MIN_H)) + chrome
+        # Le même plancher que la bibliothèque et le JSON, et sur la même
+        # mesure : une hauteur de *fenêtre*.
+        #
+        # Il y en avait un ici aussi, mais il valait 600 px de *viewport*, le
+        # chrome s'ajoutant ensuite — de sorte que Build s'ouvrait à 654 px là
+        # où les deux autres écrans en prenaient 950. Rapporté comme un écart
+        # entre les onglets, et c'en était un : les deux nombres ne mesuraient
+        # pas la même chose, donc les comparer n'avait jamais eu de sens.
+        #
+        # Le plancher ne borne que vers le bas : une colonie qui réclame plus
+        # que FIT_ROOMY_H fait toujours grandir la fenêtre, comme avant.
+        return max(needed + chrome, _px(FIT_ROOMY_H))
 
     def _fit_window_to_content(self):
         """Ajuste la fenêtre — et, en dernier recours, la taille du texte.
@@ -3942,7 +4276,7 @@ class PIGeneratorApp:
 
         TIER_CLR = {
             "P0": "#7a7a9a", "P1": "#88c0d0", "P2": "#a3be8c",
-            "P3": "#ebcb8b", "P4": EVE["accent"],
+            "P3": "#ebcb8b", "P4": EVE["accent_text"],
         }
         y = 6
         lh = _px(18)
@@ -3984,7 +4318,7 @@ class PIGeneratorApp:
         c.create_line(8, y, right_x, y, fill=EVE["border"], width=1)
         y += 4
 
-        draw_row("INPUTS · one factory, per cycle", "", EVE["accent"])
+        draw_row("INPUTS · one factory, per cycle", "", EVE["accent_text"])
         for inp_name, inp_qty in recipe["input"]:
             tier = get_tier(inp_name)
             clr  = TIER_CLR.get(tier, EVE["fg"])
@@ -4100,7 +4434,7 @@ class PIGeneratorApp:
 
             if rows["collect"] or rows["surplus"]:
                 draw_flow_header("⬇ COLLECT · whole colony, per trip",
-                                 EVE["accent"])
+                                 EVE["accent_text"])
                 draw_flows(rows["collect"])
                 if rows["surplus"]:
                     # La matière brute que les usines n'arrivent pas à suivre : elle
@@ -4712,7 +5046,7 @@ class PIGeneratorApp:
 
         head = tk.Label(body, text=f"{factory_count} Advanced Industry Facilities",
                         font=("Segoe UI", _fs(10), "bold"),
-                        bg=EVE["bg_deep"], fg=EVE["accent"], anchor=tk.W)
+                        bg=EVE["bg_deep"], fg=EVE["accent_text"], anchor=tk.W)
         head.pack(fill=tk.X)
 
         sel_frame = tk.Frame(body, bg=EVE["bg_card"])
@@ -4749,7 +5083,7 @@ class PIGeneratorApp:
                                         fill=color or EVE["fg"], font=("Consolas", _fs(9)))
                 y[0] += 17
 
-            row("FACTORY ALLOCATION", "", EVE["accent"], bold=True)
+            row("FACTORY ALLOCATION", "", EVE["accent_text"], bold=True)
             for name, count in sorted(batch.assignments):
                 row(f"  {name}", f"×{count}", EVE["fg_dim"], indent=4)
             y[0] += 4
@@ -4771,7 +5105,7 @@ class PIGeneratorApp:
             # Cycles entiers uniquement : un cycle partiel en fin de course ne produit
             # rien, donc arrondir au-dessus promettrait une production que le pad ne nourrit pas.
             row("RUNS FOR", f"{batch.cycles:,} h   ({batch.days:,.1f} d)",
-                EVE["accent"], bold=True)
+                EVE["accent_text"], bold=True)
             summary.config(height=max(120, y[0] + 10))
 
         for i in range(factory_count):
@@ -5024,17 +5358,7 @@ class PIGeneratorApp:
         # Le filet porte le poids pour que la phrase reste de la prose : plus
         # fort que l'astuce voisine, plus discret qu'une erreur, parce que rien
         # n'est encore allé de travers.
-        import_row = tk.Frame(top_frame, bg=EVE["bg_deep"])
-        import_row.pack(fill=tk.X, pady=(0, 6))
-        tk.Frame(import_row, bg=EVE["accent"], width=3).pack(side=tk.LEFT, fill="y")
-        tk.Label(import_row,
-                 text=("Importing in EVE: leave  Compress Pins  unticked. Ticked, the game "
-                       "repacks the colony to its own spacing and the layout you drew is "
-                       "lost without a word. Unticked, it names any structure sitting too "
-                       "close and refuses, which is the answer worth having."),
-                 bg=EVE["bg_deep"], fg=EVE["fg_dim"], font=("Segoe UI", _fs(8)),
-                 justify=tk.LEFT, anchor=tk.W, wraplength=_px(760)).pack(
-                     side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        _import_notice(top_frame, EVE["bg_deep"]).pack(fill=tk.X, pady=(0, 6))
 
         # Deux chiffres plutôt qu'un verdict. À 0,2 CPU par km, même le plus grand
         # déplacement possible sur une petite colonie ne peut pas franchir la ligne du
@@ -5077,7 +5401,7 @@ class PIGeneratorApp:
             budget_var.set(f"CPU {a['cpu_used']:,}/{a['cpu_max']:,}   "
                            f"PWR {a['power_used']:,}/{a['power_max']:,}")
             budget_lbl.config(fg=EVE["red"] if over
-                              else (EVE["accent"] if moving else EVE["fg_dim"]))
+                              else (EVE["accent_text"] if moving else EVE["fg_dim"]))
             # La minuterie lit *cette* analyse, celle de la colonie réellement
             # sur la carte, jamais celle de l'aperçu du panneau de configuration.
             # Partager une seule analyse avec la jauge est ce qui les rend
@@ -6181,7 +6505,7 @@ class PIGeneratorApp:
         canvas.create_rectangle(lx - 4, ly - 8, lx + _px(155),
                                 ly + len(legend_items) * row + 8,
                                 fill=EVE["bg_panel"], outline=EVE["border"], width=1)
-        canvas.create_text(lx + 2, ly, text="Legend", fill=EVE["accent"],
+        canvas.create_text(lx + 2, ly, text="Legend", fill=EVE["accent_text"],
                            font=("Segoe UI", _fs(9), "bold"), anchor=tk.NW)
         
         for j, (name, icon_type) in enumerate(legend_items):
@@ -6307,7 +6631,7 @@ class PIGeneratorApp:
                        highlightbackground=EVE["border"], highlightthickness=1)
         top.pack(fill=tk.X, pady=(0, 6))
 
-        tk.Label(top, text="SYSTEM", bg=EVE["bg_card"], fg=EVE["accent"],
+        tk.Label(top, text="SYSTEM", bg=EVE["bg_card"], fg=EVE["accent_text"],
                  font=("Segoe UI", _fs(8), "bold")).pack(side=tk.LEFT, padx=(10, 4), pady=8)
 
         sys_var = tk.StringVar(value=_last_system)
@@ -6317,7 +6641,7 @@ class PIGeneratorApp:
                              font=("Segoe UI", _fs(11)), width=16)
         sys_entry.pack(side=tk.LEFT, pady=6)
 
-        tk.Label(top, text="JUMPS", bg=EVE["bg_card"], fg=EVE["accent"],
+        tk.Label(top, text="JUMPS", bg=EVE["bg_card"], fg=EVE["accent_text"],
                  font=("Segoe UI", _fs(8), "bold")).pack(side=tk.LEFT, padx=(14, 4))
         jumps_var = tk.IntVar(value=_last_jumps)
         jumps_spin = ttk.Spinbox(top, from_=0, to=10, textvariable=jumps_var,
@@ -6423,7 +6747,7 @@ class PIGeneratorApp:
         want = tk.Frame(body, bg=EVE["bg_card"],
                         highlightbackground=EVE["border"], highlightthickness=1)
         want.pack(fill=tk.X, pady=(0, 6))
-        tk.Label(want, text="EXTRACT", bg=EVE["bg_card"], fg=EVE["accent"],
+        tk.Label(want, text="EXTRACT", bg=EVE["bg_card"], fg=EVE["accent_text"],
                  font=("Segoe UI", _fs(8), "bold")).pack(side=tk.LEFT,
                                                          padx=(10, 6), pady=6)
         ANY_P1 = "anything — show every planet"
@@ -6437,7 +6761,7 @@ class PIGeneratorApp:
                         highlightbackground=EVE["border"], highlightthickness=1)
         filt.pack(fill=tk.X, pady=(0, 6))
 
-        tk.Label(filt, text="SHOW", bg=EVE["bg_card"], fg=EVE["accent"],
+        tk.Label(filt, text="SHOW", bg=EVE["bg_card"], fg=EVE["accent_text"],
                  font=("Segoe UI", _fs(8), "bold")).pack(side=tk.LEFT, padx=(10, 6), pady=6)
 
         type_btns = {}
@@ -6512,7 +6836,7 @@ class PIGeneratorApp:
             type_btns[t] = b
 
         tk.Button(filt, text="ALL", font=("Segoe UI", _fs(8), "bold"),
-                  bg=EVE["bg_input"], fg=EVE["accent"], relief=tk.FLAT,
+                  bg=EVE["bg_input"], fg=EVE["accent_text"], relief=tk.FLAT,
                   cursor="hand2", padx=8, pady=1, borderwidth=0,
                   highlightthickness=0, command=_all_types).pack(side=tk.RIGHT, padx=(4, 10))
 
@@ -6629,7 +6953,7 @@ class PIGeneratorApp:
                 if state["hovered"]:
                     card.create_text(w - 12, h // 2, anchor=tk.E,
                                      text="▶  BUILD HERE",
-                                     fill=EVE["accent"], font=("Segoe UI", _fs(9), "bold"))
+                                     fill=EVE["accent_text"], font=("Segoe UI", _fs(9), "bold"))
                 else:
                     card.create_text(w - 12, h // 2, anchor=tk.E, text=r_text,
                                      fill="#e8d48a" if pradius else EVE["fg_dim"],
@@ -6707,7 +7031,7 @@ class PIGeneratorApp:
 
                 arrow_var = tk.StringVar(value="▼" if filtering else "▶")
                 arrow_lbl = tk.Label(hdr, textvariable=arrow_var,
-                                     bg=EVE["bg_card"], fg=EVE["accent"],
+                                     bg=EVE["bg_card"], fg=EVE["accent_text"],
                                      font=("Segoe UI", _fs(9), "bold"), width=2)
                 arrow_lbl.pack(side=tk.LEFT, padx=(8, 2), pady=6)
 
