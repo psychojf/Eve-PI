@@ -137,6 +137,10 @@ Work down the numbered panels:
          Import finished P3, assemble P4. Highest P4 output,
          most hauling.
 
+     These are the two ends of a range. For a P3 or P4
+     there are colonies in between — see WAYS TO BUILD
+     THIS below.
+
   3. PLANET TYPE
      Only valid planet types are offered:
        - P4 chains are limited to Barren and Temperate,
@@ -602,16 +606,73 @@ the factory allocation, and how many whole hourly cycles a
 full launch-pad load runs.
 
 -----------------------------------------------------------
+WAYS TO BUILD THIS
+-----------------------------------------------------------
+
+Shown for any chain that makes a P3 or a P4, because those
+are the only products whose inputs the planet can choose to
+make or have hauled in.
+
+The chain you picked is one way to build the product. There
+are more. Data Chips is made from Supertensile Plastics and
+Microfiber Shielding, and a planet can make both, make
+either one and haul the other, or haul both. P1 → P3 and
+P2 → P3 are the two ends; the two in the middle had no
+chain at all.
+
+For a P4, each P3 input has three choices — hauled in whole,
+built here from hauled P2s, or built here from hauled P1s —
+so Broadcast Node has 27 ways. A P1 input of a P4 is always
+hauled: making it would mean extractors, a different colony.
+
+Click "WAYS TO BUILD THIS" in the Build panel. Every way is
+generated and costed, most output first:
+
+  VARIANT          what the colony makes; anything it does
+                   not name arrives by hauler. Underneath:
+                   factories, pads, and the chain it equals
+  CPU · POWER      how full the Command Center is
+  OUTPUT /H        product units leaving the colony per hour
+  HAUL IN M³/H     what you bring in, per hour
+  M³ / UNIT        hauled volume per unit produced
+  RUNS FOR         how long a full load of the pads lasts
+
+Click a row to build it on the planet. The window stays
+open, so you can click down the rows and watch the colony
+change. The row now on the planet stays highlighted in the
+table, and each pick is recorded in HISTORY.
+
+The Build panel follows the pick: the budget bars and the
+Bill of Materials describe the row on the planet, not the
+chain. A row an existing chain already builds sets that
+chain in step 2. A row no chain builds shows "Mixed" there
+instead — choose any chain from the list to go back to it.
+
+A red row does not fit this Command Center, planet and
+radius. It stays in the list with its reason rather than
+disappearing.
+
+Reading the table: making an input on the planet costs MORE
+hauling per unit, not less. A P1 is bulkier per P3 than the
+P2 it becomes — 80 units at 0.38 m³ make 5 at 1.5 m³ — and
+the factories that make it are factories the product does
+not get. On Data Chips at CC5: 10 m³ per unit hauling both
+P2s, 25 making one, 41 making both. What the deeper colony
+buys is needing nothing but P1s, which your extraction
+planets already produce.
+
+-----------------------------------------------------------
 HISTORY
 -----------------------------------------------------------
 
 Always on. There is nothing to switch on and nothing to
 remember to press.
 
-Every colony you build, every mixed plan and every structure
-you drag is recorded. That last one is the point: a colony
-you arranged by hand used to live only in the window that
-drew it, so closing it threw the work away.
+Every colony you build, every mixed plan, every way to build
+you pick and every structure you drag is recorded. That last
+one is the point: a colony you arranged by hand used to live
+only in the window that drew it, so closing it threw the
+work away.
 
 Click "HISTORY" in the Build panel to see the list, newest
 first, with the time, what you were doing, the planet, and
@@ -760,6 +821,16 @@ All factories drain the same launch pad
     ROUTES ARE ORDERED above: regenerate and rebuild the
     input routes, since EVE keeps the order a route was
     created in.
+
+"WAYS TO BUILD THIS" is not in the Build panel
+  — It is only shown for a chain that makes a P3 or a P4.
+    Lower tiers have no input the planet could choose to
+    make rather than haul.
+
+A row in WAYS TO BUILD THIS is red
+  — No layout of that shape fits this Command Center level,
+    planet type and radius. Raise the Command Center, pick
+    a smaller planet, or choose a row that hauls more.
 
 The layout panel is greyed out
   — Manual counts are only available for the extraction and

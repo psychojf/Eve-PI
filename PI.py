@@ -51,6 +51,7 @@ from src.services.mixed_p2 import (MIXED_CHAIN, MixedP2Error,
                                    generate_mixed_p2_template,
                                    normalize_assignments,
                                    summarize_mixed_p2_batch)
+from src.services.variants import enumerate_recipe_variants
 from src.services.scout_universe import PLANET_TYPE_NAMES, load_universe
 from src.services.template_describe import describe as describe_template
 from src.services.library_cards import (card_for, chain_of, matches,
@@ -493,6 +494,11 @@ CHOOSE_PRODUCT = "Choose a product…"
 # case vide, qui ne se lit pas comme une question : la liste porte donc son
 # invite, comme ① le faisait déjà.
 CHOOSE_CHAIN = "Choose a chain…"
+# Ce que ② affiche quand la planète porte une ligne mixte de « Ways to build
+# this » : aucune chaîne ne bâtit cette colonie, en nommer une serait faux.
+# Affichage seulement — `chain_var` garde la chaîne, et tout ce qui la lit
+# continue de marcher.
+MIXED_CHAIN_LABEL = "Mixed"
 CHOOSE_PLANET = "Choose a planet type…"
 
 # La seule chaîne dont le type de planète décide vraiment : elle mine son P0
@@ -1448,6 +1454,13 @@ class PIGeneratorApp:
         # La fenêtre de résultats ouverte, s'il y en a une, et son redessin en attente.
         self._live_popup = None
         self._live_sync_job = None
+        # La ligne choisie dans « Ways to build this », tant qu'elle décrit
+        # encore la colonie : produit et chaîne, l'id de la variante et son
+        # template. Voir `_picked_variant`.
+        self._variant_pick = None
+        # Posé par la fenêtre des variantes tant qu'elle est ouverte, pour que
+        # ses chiffres suivent les réglages au lieu de figer ceux de l'ouverture.
+        self._variants_refresh = None
         # Toujours actif. Le travail qu'on n'a pas délibérément nommé est
         # exactement celui qu'on perdait à la fermeture d'une fenêtre.
         self._history = History(os.path.join(get_base_path(), "data",
@@ -3124,6 +3137,7 @@ class PIGeneratorApp:
                 # L'invite est une entrée comme les autres : la choisir veut dire
                 # « rien », un état auquel l'outil doit pouvoir revenir.
                 picked = self._chain_display_var.get()
+                self._variant_pick = None
                 self._set_chain("" if picked == CHOOSE_CHAIN else picked)
                 # Chaîne changée → on redérive la liste des planètes et on rafraîchit la BOM
                 self._on_chain_changed()
@@ -3520,6 +3534,17 @@ class PIGeneratorApp:
                                    activeforeground=EVE["fg_bright"],
                                    relief=tk.FLAT, cursor="hand2",
                                    command=self._open_mixed_p2_planner)
+
+        # Proposé pour toute chaîne qui vise un P3 ou un P4 : ce sont les seuls
+        # produits dont les intrants directs peuvent être fabriqués ici ou amenés,
+        # donc les seuls qui aient plus d'une façon d'être bâtis.
+        self.variants_btn = tk.Button(btn_frame, text="⚖  WAYS TO BUILD THIS",
+                                      font=("Segoe UI", _fs(10), "bold"),
+                                      bg=EVE["bg_card"], fg=EVE["fg"],
+                                      activebackground=EVE["border_hi"],
+                                      activeforeground=EVE["fg_bright"],
+                                      relief=tk.FLAT, cursor="hand2",
+                                      command=self._open_recipe_variants)
 
         # La bibliothèque, le JSON et le scanner sont des destinations du rail
         # maintenant : les garder aussi ici donnerait deux chemins vers le même
@@ -4120,6 +4145,15 @@ class PIGeneratorApp:
         else:
             self.mixed_btn.pack_forget()
 
+        # Les variantes de recette n'ont de sens que pour un P3 ou un P4 : un
+        # produit de palier inférieur n'a aucun intrant que la planète pourrait
+        # choisir de fabriquer plutôt que de faire venir.
+        if chain_info.get("target_tier") in ("P3", "P4"):
+            self.variants_btn.pack(fill=tk.X, ipady=5, pady=(0, 0),
+                                   before=self._first_action_btn)
+        else:
+            self.variants_btn.pack_forget()
+
         # Type de planète : le P4 exige une High-Tech Industry Facility, qui n'existe que
         # sur Barren/Temperate ; les chaînes qui extraient exigent les bonnes ressources.
         if chain_info.get("target_tier") == "P4":
@@ -4200,10 +4234,81 @@ class PIGeneratorApp:
         self.current_preview = None
         self.current_analysis = None
         self._preview_error = None
+        self._variant_pick = None
+        self._sync_chain_display()
         # Sans ça, le panneau d'implantation garde les compteurs de la colonie
         # d'avant : il décrirait une colonie qui n'existe plus.
         self._refresh_layout_panel()
+        self._refresh_variants_popup()
         self._schedule_fit()
+
+    def _bom_config(self):
+        """La config de la colonie que ce panneau décrit.
+
+        Une seule source pour le panneau et pour la fenêtre des variantes : le
+        rayon y est lu par `_planet_diameter`, et une fenêtre qui le lirait
+        autrement (un champ vide y valait 10 000 km, ici 0) bâtirait sur la
+        planète une colonie que le panneau ne regénère pas à l'identique.
+        """
+        return {
+            "product_name": self.product_var.get(),
+            "chain_name": self.chain_var.get(),
+            "planet_type": self.planet_var.get(),
+            "cc_level": self.cc_var.get(),
+            # Le coût des liens croît avec le rayon : l'aperçu doit donc mesurer la
+            # planète réellement choisie, sinon la jauge CPU ment.
+            "planet_diameter": self._planet_diameter(),
+            "layout": self._layout_options(),
+        }
+
+    def _picked_variant(self, config):
+        """La variante choisie, regénérée avec les réglages courants — ou None.
+
+        Portage de la règle du webtool : l'identité d'une ligne est son id, et
+        elle survit à une regénération. Changer le CC, le rayon ou le type de
+        planète rebâtit donc la même façon de faire à ces nouveaux réglages.
+        Changer de produit ou de chaîne, c'est demander autre chose : la ligne
+        est oubliée, comme celle que l'énumérateur n'émet plus ou qui ne tient
+        plus dans ce command center.
+        """
+        pick = self._variant_pick
+        if pick is None:
+            return None
+        if (pick["product"], pick["chain"]) != (config["product_name"],
+                                                config["chain_name"]):
+            self._variant_pick = None
+            return None
+        for variant in enumerate_recipe_variants(config):
+            if variant.id == pick["id"] and variant.template is not None:
+                pick["template"] = variant.template
+                return variant
+        self._variant_pick = None
+        return None
+
+    def _sync_chain_display(self):
+        """Ce que la liste ② affiche : « Mixed » sous une ligne mixte, sinon la chaîne.
+
+        Portage de la règle du webtool. Une ligne qui a une chaîne équivalente
+        pose cette chaîne pour de vrai au moment du clic ; seule une ligne sans
+        chaîne a besoin de ce libellé, puisque rien dans la liste ne la bâtit.
+        """
+        pick = self._variant_pick
+        if pick is not None and pick.get("mixed"):
+            self._chain_display_var.set(MIXED_CHAIN_LABEL)
+        else:
+            self._chain_display_var.set(self.chain_var.get() or CHOOSE_CHAIN)
+
+    def _refresh_variants_popup(self):
+        """Redessine la fenêtre des variantes si elle est ouverte."""
+        refresh = self._variants_refresh
+        if refresh is None:
+            return
+        try:
+            refresh()
+        except tk.TclError:
+            self._variants_refresh = None
+        except Exception as exc:
+            _debug(f"_refresh_variants_popup failed: {exc}")
 
     def _update_bom(self):
         """Affiche la nomenclature sur le canvas BOM avec des couleurs par palier (P0–P4)."""
@@ -4237,19 +4342,18 @@ class PIGeneratorApp:
 
         # On bâtit la colonie que décrivent les réglages courants pour que le panneau
         # d'implantation puisse la mesurer. Assez peu coûteux pour être refait à chaque frappe.
-        config = {
-            "product_name": product,
-            "chain_name": chain,
-            "planet_type": self.planet_var.get(),
-            "cc_level": self.cc_var.get(),
-            # Le coût des liens croît avec le rayon : l'aperçu doit donc mesurer la
-            # planète réellement choisie, sinon la jauge CPU ment.
-            "planet_diameter": self._planet_diameter(),
-            "layout": self._layout_options(),
-        }
+        config = self._bom_config()
         self._preview_error = None
         try:
-            self.current_preview = self._template_service.generate(config)
+            picked = self._picked_variant(config)
+            if picked is not None:
+                # La ligne choisie dans « Ways to build this » EST la colonie.
+                # Sans ça, la scène montrait la variante pendant que ce panneau
+                # décrivait la chaîne : CPU, pads et liste de courses d'une
+                # colonie qui n'était pas sur la planète.
+                self.current_preview = picked.template
+            else:
+                self.current_preview = self._template_service.generate(config)
             # Une colonie qui ne tient pas ne laisse rien à dessiner au panneau ; autant
             # dire quel compteur a fait exploser le budget plutôt que de rester vide.
             if self.current_preview is None:
@@ -4263,7 +4367,9 @@ class PIGeneratorApp:
         self.current_analysis = (analyze_template(self.current_preview,
                                                   self._layout_options())
                                  if self.current_preview is not None else None)
+        self._sync_chain_display()
         self._refresh_layout_panel()
+        self._refresh_variants_popup()
         # Une fenêtre de résultats laissée ouverte suit les réglages…
         self._sync_live_popup()
         # …et s'il n'y en a pas encore, les trois premiers choix suffisent à en
@@ -4992,6 +5098,291 @@ class PIGeneratorApp:
         flat.update(config.get("layout") or {})
         return flat
 
+    def _open_recipe_variants(self):
+        """Toutes les façons dont cette planète peut bâtir le produit, chiffrées.
+
+        Le sélecteur de chaîne n'offre que deux points d'un éventail et cache le
+        reste : pour Data Chips il produit « importer les deux P2 » ou
+        « fabriquer les deux », et rien entre les deux. La colonie qui fabrique
+        un P2 et fait venir l'autre est une conception légitime que l'outil ne
+        savait ni exprimer ni chiffrer.
+
+        Cliquer une ligne la bâtit sur la scène derrière : la fenêtre reste
+        ouverte, parce que la raison de l'avoir ouverte est de comparer, et
+        comparer demande de pouvoir revenir sur la ligne d'avant.
+        """
+        config = self._bom_config()
+        product_name = config["product_name"]
+        # Une liste qu'on remplit sur place : `_row_at`, le dessin et le clic la
+        # lisent tous, et chaque rafraîchissement doit leur parler de la même.
+        variants = list(enumerate_recipe_variants(config))
+        if not variants:
+            messagebox.showinfo(
+                "Nothing to compare",
+                f"{product_name} has only one way to be built here.\n\n"
+                "Recipe variants exist for P3 and P4 products, whose direct "
+                "inputs the planet can either make or have hauled in.")
+            return
+
+        popup = tk.Toplevel(self.root)
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        try:
+            popup.attributes("-alpha", self.alpha)
+        except Exception:
+            pass
+        popup.configure(bg=EVE["bg_deep"])
+        popup.geometry(_load_window_config().get("variants_geometry", "860x560"))
+        popup.minsize(660, 380)
+        apply_window_border(popup)
+
+        def close_popup():
+            self._variants_refresh = None
+            _update_window_config("variants_geometry", popup.geometry())
+            popup.destroy()
+
+        self._build_title_bar(popup, "Ways to build this", close_popup)
+        self._add_resize_handles(popup)
+
+        body = ttk.Frame(popup)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        head = tk.Label(body, text="",
+                        font=("Segoe UI", _fs(10), "bold"),
+                        bg=EVE["bg_deep"], fg=EVE["accent_text"], anchor=tk.W)
+        head.pack(fill=tk.X)
+
+        # Une ligne, et elle explique les libellés : une ligne nomme ce que la
+        # colonie bâtit, et le transporteur amène tout ce qu'elle ne bâtit pas.
+        tk.Label(body, text="Each row builds part of the recipe here; "
+                            "the rest is hauled in.",
+                 font=("Segoe UI", _fs(9)), bg=EVE["bg_deep"],
+                 fg=EVE["fg_dim"], anchor=tk.W).pack(fill=tk.X, pady=(2, 8))
+
+        # 27 façons pour un P4 à trois P3 : la table dépasse toujours la fenêtre,
+        # donc la barre est là dès le départ plutôt qu'une molette dont rien ne
+        # dit qu'elle existe.
+        table_host = tk.Frame(body, bg=EVE["bg_card"])
+        table_host.pack(fill=tk.BOTH, expand=True)
+        table = tk.Canvas(table_host, bg=EVE["bg_card"], highlightthickness=0)
+        scroll = ttk.Scrollbar(table_host, orient=tk.VERTICAL,
+                               command=table.yview)
+        table.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        table.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # La ligne actuellement posée sur la scène. Comparer veut dire savoir
+        # laquelle on regarde : sans ça, la troisième ligne cliquée ressemble à
+        # la première.
+        state = {"selected": None, "product": product_name}
+
+        ROW_H = 36
+        HEAD_H = 26
+
+        def _load(analysis):
+            """Le remplissage du command center, en deux pourcentages.
+
+            Les chiffres bruts sont ceux du bandeau de télémétrie, et il les
+            montre pour la colonie posée sur la scène. Ici la question est
+            autre — laquelle de ces colonies a encore de la place — et quatre
+            grands nombres par ligne y répondent moins bien que deux petits.
+            """
+            cpu = 0 if not analysis["cpu_max"] else \
+                analysis["cpu_used"] / analysis["cpu_max"] * 100
+            power = 0 if not analysis["power_max"] else \
+                analysis["power_used"] / analysis["power_max"] * 100
+            return f"{round(cpu)}% · {round(power)}%"
+
+        def _structures(analysis):
+            counts = analysis["structures"]
+            factories = (counts.get("Advanced Industry Facility", 0)
+                         + counts.get("High-Tech Industry Facility", 0))
+            return f"{factories} fac · {counts.get('Launch Pad', 0)} pad"
+
+        def _clip(text, font, max_px):
+            """Rogne un libellé pour qu'il ne déborde jamais sur les chiffres.
+
+            « Make Data Chips from P2 and High-Tech Transmitters from P2 » est
+            plus large que sa colonne, et un texte de canvas ne s'arrête pas
+            tout seul : sans ça il passait par-dessus la cellule CPU, qui est
+            précisément le nombre que la ligne existe pour montrer.
+            """
+            metrics = tkfont.Font(font=font)
+            if metrics.measure(text) <= max_px:
+                return text
+            while text and metrics.measure(text + "…") > max_px:
+                text = text[:-1]
+            return text.rstrip() + "…"
+
+        def _draw_table():
+            table.delete("all")
+            width = max(660, table.winfo_width())
+            right = width - 12
+            col_w = max(88, min(118, (width - 300) // 5))
+            cols = [right - 4 * col_w, right - 3 * col_w, right - 2 * col_w,
+                    right - col_w, right]
+            titles = ("CPU · power", "Output /h", "Haul in m³/h",
+                      "m³ / unit", "Runs for")
+            # Ce qui reste au libellé une fois les cinq colonnes de chiffres
+            # servies, moins une gouttière pour que rien ne se touche.
+            label_px = max(120, cols[0] - 10 - col_w - 12)
+            label_font = ("Segoe UI", _fs(9), "bold")
+            note_font = ("Segoe UI", _fs(8))
+
+            table.create_text(10, 8, anchor=tk.NW, text="VARIANT",
+                              fill=EVE["accent_text"],
+                              font=("Segoe UI", _fs(8), "bold"))
+            for x, title in zip(cols, titles):
+                table.create_text(x, 8, anchor=tk.NE, text=title.upper(),
+                                  fill=EVE["accent_text"],
+                                  font=("Segoe UI", _fs(8), "bold"))
+            table.create_line(8, HEAD_H - 3, right, HEAD_H - 3,
+                              fill=EVE["border_hi"])
+
+            for index, variant in enumerate(variants):
+                top = HEAD_H + index * ROW_H
+                tag = f"row{index}"
+                is_selected = state["selected"] == variant.id
+                if is_selected:
+                    table.create_rectangle(6, top, right + 4, top + ROW_H - 2,
+                                           fill=EVE["accent_dim"], width=0,
+                                           tags=tag)
+                elif index % 2:
+                    table.create_rectangle(6, top, right + 4, top + ROW_H - 2,
+                                           fill=EVE["bg_deep"], width=0,
+                                           tags=tag)
+
+                broken = variant.template is None
+                label_fg = EVE["red"] if broken else (
+                    EVE["fg_bright"] if is_selected else EVE["fg"])
+                table.create_text(10, top + 4, anchor=tk.NW,
+                                  text=_clip(variant.label, label_font,
+                                             label_px),
+                                  fill=label_fg, font=label_font, tags=tag)
+
+                if broken:
+                    # Une ligne qui ne se bâtit pas porte sa raison à la place
+                    # des chiffres : un clic sans effet n'est jamais un contrôle
+                    # qui a échoué en silence, la ligne a déjà dit pourquoi.
+                    table.create_text(10, top + 19, anchor=tk.NW,
+                                      text=_clip(variant.reason, note_font,
+                                                 label_px),
+                                      fill=EVE["fg_dim"], font=note_font,
+                                      tags=tag)
+                    continue
+
+                note = " · ".join(part for part in
+                                  (_structures(variant.analysis),
+                                   variant.equivalent_chain) if part)
+                table.create_text(10, top + 19, anchor=tk.NW,
+                                  text=_clip(note, note_font, label_px),
+                                  fill=EVE["fg_dim"], font=note_font, tags=tag)
+
+                runtime = variant.runtime
+                values = (
+                    _load(variant.analysis),
+                    f"{variant.output_per_hour:,.2f}",
+                    f"{variant.analysis['import_m3_h']:,.1f}",
+                    "-" if variant.haul_m3_per_unit is None
+                    else f"{variant.haul_m3_per_unit:,.2f}",
+                    f"{runtime.hours:,.1f} h" if runtime.applies else "-",
+                )
+                for x, value in zip(cols, values):
+                    table.create_text(x, top + 11, anchor=tk.NE, text=value,
+                                      fill=EVE["fg_bright"] if is_selected
+                                      else EVE["fg"],
+                                      font=("Consolas", _fs(9)), tags=tag)
+
+            table.config(scrollregion=(0, 0, width,
+                                       HEAD_H + len(variants) * ROW_H + 8))
+
+        def _row_at(event):
+            index = int((table.canvasy(event.y) - HEAD_H) // ROW_H)
+            if 0 <= index < len(variants):
+                return variants[index]
+            return None
+
+        def _on_click(event):
+            variant = _row_at(event)
+            if variant is None:
+                return
+            if variant.template is None:
+                messagebox.showinfo("Cannot build this way", variant.reason,
+                                    parent=popup)
+                return
+            if variant.equivalent_chain is not None:
+                # Une chaîne bâtit déjà cette colonie à l'identique — c'est le
+                # même générateur, gardé par la parité. On la pose donc pour de
+                # vrai : la liste ② dit la vérité, et le panneau n'a besoin
+                # d'aucune ligne retenue pour décrire la planète.
+                self._variant_pick = None
+                if self.chain_var.get() != variant.equivalent_chain:
+                    self._set_chain(variant.equivalent_chain)
+                    self._on_chain_changed()
+            else:
+                cfg = self._bom_config()
+                # Posée AVANT la scène : `_show_popup` oublie toute ligne dont
+                # le template n'est pas celui qu'il reçoit.
+                self._variant_pick = {"product": cfg["product_name"],
+                                      "chain": cfg["chain_name"],
+                                      "id": variant.id,
+                                      "template": variant.template,
+                                      "mixed": True}
+            self.current_template = variant.template
+            self._history.record(variant.template,
+                                 f"Variant · {variant.label}", kind="variant")
+            self._show_popup(variant.template)
+            # Le panneau décrit maintenant cette ligne ; il redessine aussi le
+            # tableau, surlignage compris.
+            self._update_bom()
+            # La scène reprend le focus en se dessinant ; la fenêtre de
+            # comparaison doit rester devant, sinon la ligne suivante se clique
+            # à l'aveugle.
+            popup.lift()
+
+        table.bind("<Button-1>", _on_click)
+        table.bind("<MouseWheel>",
+                   lambda e: table.yview_scroll(-1 * (e.delta // 120), "units"))
+        table.bind("<Configure>", lambda _e: _draw_table())
+
+        def _refresh():
+            """Relit les réglages : un CC ou un rayon changé change chaque ligne.
+
+            Sans ça, le tableau gardait les chiffres de l'ouverture, et cliquer
+            une ligne après avoir changé de CC posait sur la planète une colonie
+            calculée pour l'ancien.
+            """
+            if not popup.winfo_exists():
+                self._variants_refresh = None
+                return
+            cfg = self._bom_config()
+            fresh = (enumerate_recipe_variants(cfg)
+                     if cfg["product_name"] == state["product"] else [])
+            if not fresh:
+                # Autre produit, ou plus de produit du tout : ce tableau ne
+                # parle plus de rien qui soit à l'écran.
+                close_popup()
+                return
+            variants[:] = fresh
+            built = sum(1 for v in variants if v.template is not None)
+            head.config(text=f"{product_name} · {built} of {len(variants)} "
+                             f"ways fit this colony")
+            # Surligne ce qui est sur la planète : la ligne choisie, sinon celle
+            # que la chaîne bâtit déjà à l'identique.
+            pick = self._variant_pick
+            state["selected"] = pick["id"] if pick is not None else next(
+                (v.id for v in variants
+                 if v.template is not None
+                 and v.template == self.current_preview), None)
+            _draw_table()
+
+        self._variants_refresh = _refresh
+
+        popup.update_idletasks()
+        _refresh()
+        popup.lift()
+        popup.focus_force()
+
     def _open_mixed_p2_planner(self):
         """Un P2 par usine, sur la disposition que le générateur ordinaire produit.
 
@@ -5268,6 +5659,12 @@ class PIGeneratorApp:
         l'autre fenêtre. Le nom de la méthode est resté : quatre appelants la
         connaissent, et ce qu'elle fait n'a pas changé, seulement où.
         """
+        # Une colonie venue d'ailleurs — bibliothèque, JSON, historique — n'est
+        # pas la ligne choisie : le panneau revient à la chaîne plutôt que de
+        # continuer à décrire une variante qui a quitté la planète.
+        if (self._variant_pick is not None
+                and template != self._variant_pick.get("template")):
+            self._variant_pick = None
         self._clear_stage()
         container = ttk.Frame(self._stage_host)
         container.pack(fill=tk.BOTH, expand=True)

@@ -32,7 +32,7 @@ class Entry(NamedTuple):
     id: str
     at: float           # secondes epoch
     label: str
-    kind: str           # generate | edit | open | mixed
+    kind: str           # generate | edit | open | mixed | variant
     pins: int
     links: int
     planet: str
