@@ -3085,7 +3085,7 @@ class PIGeneratorApp:
         content.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
 
         ttk.Label(content, text="EVE Online — PI Template Generator", style="Header.TLabel").pack(anchor=tk.W, pady=(0,5))
-        ttk.Label(content, text="Version 2.7", style="Sub.TLabel").pack(anchor=tk.W)
+        ttk.Label(content, text="Version 4.2", style="Sub.TLabel").pack(anchor=tk.W)
         ttk.Label(content, text="\nBased on the Planetary Interaction Template\nGenerator spreadsheet by Razkin.").pack(anchor=tk.W)
         # Le crédit de la bibliothèque livrée a été retiré le 12/08/2026 : la
         # bibliothèque ne contient plus que les colonies bâties par l'utilisateur, donc
