@@ -239,6 +239,135 @@ def link_flows(template, options=None):
     return flows
 
 
+def _pin_rate(pin, commodity, side, yield_per_head):
+    """Ce qu'un pin fabrique (« out ») ou mange (« in ») d'une marchandise, par heure."""
+    sname = STRUCT_ID_TO_NAME.get(pin.get("T"))
+    product = ID_TO_NAME.get(pin.get("S"))
+    if sname is None or not product:
+        return 0
+    if sname == "Extractor Control Unit":
+        if side == "out" and product == commodity:
+            return (pin.get("H", 0) or 0) * yield_per_head
+        return 0
+    recipe = find_recipe(product)
+    if not recipe:
+        return 0
+    if side == "out":
+        return hourly_rate(recipe["output"], sname) if product == commodity else 0
+    for name, qty in recipe["input"]:
+        if name == commodity:
+            return hourly_rate(qty, sname)
+    return 0
+
+
+def _routed_storage(template, imports, exports, yield_per_head):
+    """Le stockage que les routes utilisent vraiment, et combien de temps il tient.
+
+    Un pad ou un entrepôt ne contient que ce qu'une route y charge ou en sort :
+    EVE ne partage pas le stock entre structures reliées. Un import attend donc
+    dans les structures d'où partent ses routes, un export dans celles où elles
+    arrivent, et une structure qu'aucune route n'utilise ne contient rien.
+    Additionner toutes les capacités, comme avant, comptait un entrepôt plein de
+    P2 intermédiaires comme de la place pour les P1, et un entrepôt sur aucune
+    route comme des heures en plus : trois entrepôts ajoutés faisaient passer
+    une colonie de 65,8 h à 139,8 h sans rien changer en jeu.
+
+    Les structures qui alimentent ou reçoivent la même usine forment un seul
+    réservoir, puisque l'usine puise dans celle qui a du stock. Chaque flux est
+    réparti entre les réservoirs au prorata de ce que chaque usine mange ou
+    fabrique, et la colonie tient jusqu'au premier réservoir vide ou plein.
+    Dans un réservoir, le côté le plus chargé décide, jamais la somme :
+    l'occupation à l'instant τ vaut I·(t−τ) + E·τ, maximale à une borne.
+
+    Un intrant qu'aucune route ne sort d'un stock n'a nulle part où être chargé :
+    la colonie ne tient alors pas une minute. Miroir de `routedStorage` dans
+    l'outil web.
+    """
+    pins = template.get("P", [])
+    capacity = [STORAGE_CAPACITY_M3.get(STRUCT_ID_TO_NAME.get(p.get("T")), 0)
+                for p in pins]
+    parent = {i: i for i, space in enumerate(capacity) if space > 0}
+
+    def find(index):
+        root = index
+        while parent[root] != root:
+            root = parent[root]
+        return root
+
+    def union(left, right):
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[max(left_root, right_root)] = min(left_root, right_root)
+
+    flows = []
+    unstored_input = False
+
+    def attribute(mapping, side):
+        nonlocal unstored_input
+        for commodity, quantity in mapping.items():
+            hubs_by_partner = {}
+            for route in template.get("R") or []:
+                path = route.get("P") or []
+                if len(path) < 2 or ID_TO_NAME.get(route.get("T")) != commodity:
+                    continue
+                first, last = path[0] - 1, path[-1] - 1
+                hub, partner = (first, last) if side == "in" else (last, first)
+                if (hub not in parent or not 0 <= partner < len(pins)
+                        or _pin_rate(pins[partner], commodity, side, yield_per_head) <= 0):
+                    continue
+                hubs = hubs_by_partner.setdefault(partner, [])
+                if hub not in hubs:
+                    hubs.append(hub)
+
+            total = 0
+            for partner in hubs_by_partner:
+                total += _pin_rate(pins[partner], commodity, side, yield_per_head)
+            size = COMMODITY_SIZE.get(get_tier(commodity), 0)
+            if side == "in" and total == 0 and quantity * size > 0:
+                unstored_input = True
+            for partner, hubs in hubs_by_partner.items():
+                for hub in hubs:
+                    union(hubs[0], hub)
+                rate = _pin_rate(pins[partner], commodity, side, yield_per_head)
+                flows.append((hubs[0], quantity * rate / total * size, side))
+
+    attribute(imports, "in")
+    attribute(exports, "out")
+
+    pools = {}
+    for hub, _m3_h, _side in flows:
+        pools.setdefault(find(hub), [0, 0, 0])
+    for index in parent:
+        pool = pools.get(find(index))
+        if pool is not None:
+            pool[0] += capacity[index]
+    for hub, m3_h, side in flows:
+        pool = pools[find(hub)]
+        if side == "in":
+            pool[1] += m3_h
+        else:
+            pool[2] += m3_h
+
+    buffer_m3 = 0
+    buffer_hours = float("inf")
+    for space, inbound, outbound in pools.values():
+        buffer_m3 += space
+        throughput = max(inbound, outbound)
+        if throughput > 0:
+            buffer_hours = min(buffer_hours, space / throughput)
+    if unstored_input:
+        buffer_hours = 0.0
+
+    endpoints = set()
+    for route in template.get("R") or []:
+        path = route.get("P") or []
+        if path:
+            endpoints.add(path[0] - 1)
+            endpoints.add(path[-1] - 1)
+    idle_hubs = sum(1 for index in parent if index not in endpoints)
+    return buffer_m3, buffer_hours, idle_hubs
+
+
 def analyze_template(template, options=None):
     """Mesure une colonie déjà générée : budget, flux horaires, autonomie.
 
@@ -310,15 +439,8 @@ def analyze_template(template, options=None):
 
     import_m3_h = _volume(imports)
     export_m3_h = _volume(exports)
-    buffer_m3 = sum(STORAGE_CAPACITY_M3.get(n, 0) * c for n, c in counts.items())
-    # Le côté le plus chargé, jamais la somme. Les entrées se vident à mesure
-    # que les sorties s'accumulent : l'occupation à l'instant τ d'un cycle de
-    # durée t vaut I·(t−τ) + E·τ, linéaire en τ, donc maximale à l'une des
-    # deux bornes — I·t à l'arrivée, pads pleins d'intrants, ou E·t à la fin,
-    # pleins de produit. Les additionner dimensionne le stockage pour un
-    # instant qui n'arrive jamais et sous-estime toute colonie qui importe.
-    throughput = max(import_m3_h, export_m3_h)
-    buffer_hours = (buffer_m3 / throughput) if throughput > 0 else float("inf")
+    buffer_m3, buffer_hours, idle_hubs = _routed_storage(
+        template, imports, exports, opts.yield_per_head)
 
     p0_demand = sum(q for n, q in consumed.items() if get_tier(n) == "P0")
     budget = CC_LEVELS.get(cc_level, CC_LEVELS[0])
@@ -334,6 +456,11 @@ def analyze_template(template, options=None):
     if buffer_hours < opts.collection_hours:
         warnings.append(f"Storage only lasts {buffer_hours:.0f}h, "
                         f"not the {opts.collection_hours}h asked for")
+    if idle_hubs == 1:
+        warnings.append("1 storage structure has no route in or out — it holds nothing")
+    elif idle_hubs > 1:
+        warnings.append(f"{idle_hubs} storage structures have no route in or out "
+                        "— they hold nothing")
 
     # Le lien le plus intérieur d'un bras porte toutes les usines situées derrière
     # lui : un bras long peut donc discrètement dépasser ce que le jeu autorise aux
@@ -438,6 +565,74 @@ def throughput_rows(analysis, product_name, primary_facility=None):
     }
 
 
+class RouteRow(NamedTuple):
+    """Une route telle que le template la stocke."""
+    number: int               # 1-based, aligné sur R[0], R[1]… du JSON
+    commodity: str
+    type_id: int
+    quantity: int
+    path: tuple               # numéros de pins 1-based, dans l'ordre de la route
+    waypoints: tuple          # « Launch Pad », « Basic Industry Facility »… par étape
+
+
+def route_rows(template):
+    """Les routes exactement comme le template les stocke — sans tri.
+
+    L'ordre est celui du document. Une liste triée par marchandise ou par
+    longueur ne s'alignerait plus sur R[0], R[1]… du JSON, et s'aligner sur le
+    JSON est la seule raison de montrer des routes brutes. Miroir de `routeRows`
+    dans l'outil web.
+    """
+    pins = template.get("P") or []
+    rows = []
+    for index, route in enumerate(template.get("R") or [], start=1):
+        type_id = route.get("T")
+        path = tuple(route.get("P") or [])
+        waypoints = []
+        for pin_number in path:
+            pin = pins[pin_number - 1] if isinstance(pin_number, int) and 1 <= pin_number <= len(pins) else None
+            name = STRUCT_ID_TO_NAME.get(pin.get("T")) if pin is not None else None
+            waypoints.append(name or f"Pin {pin_number}")
+        rows.append(RouteRow(index, ID_TO_NAME.get(type_id) or f"Type {type_id}",
+                             type_id, route.get("Q", 0), path, tuple(waypoints)))
+    return rows
+
+
+class IntermediateRow(NamedTuple):
+    """Une marchandise que la colonie fabrique et mange : elle ne quitte jamais la planète."""
+    name: str
+    tier: str
+    made_per_hour: float
+    used_per_hour: float
+
+
+_TIER_ORDER = ("P0", "P1", "P2", "P3", "P4")
+
+
+def intermediate_rows(analysis):
+    """Les étapes entre ce qui monte et ce qui redescend.
+
+    HAUL IN et COLLECT ne montrent que les deux bouts : une colonie P1 → P3 se
+    lisait quatre P1 en entrée et Data Chips en sortie, sans rien pour dire que
+    les seize usines du milieu fabriquaient quelque chose. Fabriqué et utilisé
+    côte à côte, parce qu'une paire qui diffère est celle qui mérite qu'on la
+    remarque : l'écart est ce que HAUL IN ou COLLECT transporte ensuite.
+
+    Le P0 est laissé de côté : les têtes le tirent du sol plutôt qu'une usine ne
+    le fabrique, et une colonie qui extrait le dit déjà. Palier le plus bas
+    d'abord, puis par nom. Miroir de `intermediateRows` dans l'outil web.
+    """
+    consumed = analysis.get("consumed", {})
+    rows = []
+    for name, made in analysis.get("produced", {}).items():
+        used = consumed.get(name, 0)
+        tier = get_tier(name)
+        if tier is None or tier == "P0" or made <= 0 or used <= 0:
+            continue
+        rows.append(IntermediateRow(name, tier, made, used))
+    return sorted(rows, key=lambda row: (_TIER_ORDER.index(row.tier), row.name))
+
+
 def factory_clamp_note(requested, built, pads, arm_len=None):
     """Explique un nombre d'usines manuel que la géométrie des pads a rogné.
 
@@ -460,6 +655,108 @@ def factory_clamp_note(requested, built, pads, arm_len=None):
                 else "add a pad to place more")
         return f"{pads} {pad_word} hold {geo_cap} factories — {tail}"
     return None
+
+
+# Les chaînes dont l'option « factories » ne compte que l'usine du dernier étage.
+#
+# P0 → P2 est la seule chaîne qui bâtit deux étages sur une planète : son option
+# plafonne les Advanced, et chacune amène une Basic par P1 extrait sur place.
+# C'est le sens du générateur, figé par la parité avec le webtool
+# (`extraction-p2.ts`) — c'est donc la relecture qui doit parler comme lui.
+# Relire le total ici est ce qui faisait de « Set counts myself » un
+# doublement : 3 + 3 relus « 6 », regénérés en 6 + 6. Rapporté 2026-09-10.
+TOP_TIER_FACTORY_CHAINS = frozenset({"P0 → P2 (Extraction)"})
+
+
+def counted_factory_kinds(chain_name):
+    """Les usines que l'option « factories » compte sur cette chaîne."""
+    if chain_name in TOP_TIER_FACTORY_CHAINS:
+        return ("Advanced Industry Facility",)
+    return PRODUCTION_FACILITIES
+
+
+def factories_label(chain_name):
+    """Le nom du champ, pour qu'il dise ce qu'il compte."""
+    return "Advanced" if chain_name in TOP_TIER_FACTORY_CHAINS else "Factories"
+
+
+def extractors_label(chain_name):
+    """Le nom du champ « extractors » : sur P0 → P2, il compte des jeux d'ECU."""
+    return "Ext sets" if chain_name in TOP_TIER_FACTORY_CHAINS else "Extractors"
+
+
+def observed_counts(analysis, chain_name):
+    """Les compteurs manuels relus sur une colonie, dans les unités du générateur.
+
+    Ce que le pré-remplissage recopie dans les champs : regénérer à ces
+    valeurs doit rebâtir la même colonie, sur toute chaîne configurable
+    (`tests/test_manual_counts.py`).
+
+    « extractors » compte les ECU par matière creusée. Le générateur P0 → P2 ne
+    lit pas ce champ — il pose un ECU par P0 extrait — mais la scène, elle, le
+    lit : sur une colonie déplacée à la main, `add_extractor` avance par paires,
+    et un total relu ici faisait de chaque flèche un ordre de deux paires.
+    """
+    counts = analysis.get("structures", {})
+    ecus = counts.get("Extractor Control Unit", 0)
+    raw_materials = sum(1 for name in analysis.get("produced", {})
+                        if get_tier(name) == "P0")
+    return {
+        "extractors": ecus // raw_materials if raw_materials > 1 else ecus,
+        # L'analyse rend le total des têtes ; le champ est par extracteur, et le
+        # générateur pose le même nombre sur chacun.
+        "heads": (analysis.get("heads", 0) // ecus) if ecus else 0,
+        "factories": sum(counts.get(kind, 0)
+                         for kind in counted_factory_kinds(chain_name)),
+        "launch_pads": counts.get("Launch Pad", 0),
+    }
+
+
+def factories_per_unit(chain_name, product_name, planet_type, imported_inputs=None):
+    """Combien de structures bâtit une unité du champ « factories ».
+
+    Une Advanced, plus la Basic que chaque P1 *extrait sur place* exige pour la
+    nourrir. Un P1 qui entre par le pad ne bâtit rien : c'est le partage
+    `local` / `imported` de `_gen_p0_to_p2_template`, lu dans le même
+    `material_legs`, pour que l'indice ne puisse pas contredire la colonie.
+    """
+    if chain_name not in TOP_TIER_FACTORY_CHAINS:
+        return 1
+    recipe = RECIPES_P1_P2.get(product_name)
+    if not recipe:
+        return 1
+    forced = {name: IMPORT for name in (imported_inputs or ())}
+    legs = material_legs(recipe["input"], planet_type, forced)
+    return 1 + sum(1 for leg in legs if leg.source == EXTRACT and leg.p0_name)
+
+
+class RejectedCount(NamedTuple):
+    """Un compteur manuel que la colonie bâtie n'a pas."""
+    field: str
+    requested: int
+    actual: int
+
+
+def rejected_counts(layout, analysis, chain_name):
+    """Les compteurs manuels que le générateur n'a pas honorés.
+
+    Chaque générateur borne un compteur manuel au budget du CC et à la
+    géométrie, puis se tait : 6 Advanced demandées sur Temperate avec 9 têtes
+    par extracteur en donnent 1, et le champ affiche toujours 6. Le champ n'est
+    jamais réécrit — une valeur qu'on est en train de taper doit rester — donc
+    le désaccord est dit plutôt que corrigé en douce. Portage de
+    `rejectedCounts` du webtool.
+    """
+    layout = layout or {}
+    built = observed_counts(analysis, chain_name)
+    rejected = []
+    for field in ("extractors", "heads", "factories", "launch_pads"):
+        requested = layout.get(field)
+        # None et 0 veulent tous deux dire « le générateur décide ».
+        if not requested or requested == built[field]:
+            continue
+        rejected.append(RejectedCount(field, requested, built[field]))
+    return rejected
 
 
 class Trip(NamedTuple):
@@ -565,11 +862,14 @@ class FactoryBalance(NamedTuple):
     """Le compte d'usines face à ce que le sol donne, dans les deux sens."""
     supply_per_hour: float   # P0 que les têtes sortent, au rendement réglé
     demand_per_hour: float   # P0 que les usines mangent
-    built: int               # usines mangeuses de P0 que la colonie possède
-    fed: int                 # usines que le sol sait réellement nourrir
+    built: int               # ce que la colonie possède, en `unit`
+    fed: int                 # ce que le sol sait réellement nourrir, en `unit`
+    # « factory » : usines mangeuses de P0. « set » : jeux entiers d'une colonie
+    # Basic→Advanced — le pas de `add_factory` là, pour qu'Apply le passe tel quel.
+    unit: str = "factory"
 
 
-def factory_balance(analysis):
+def factory_balance(analysis, pins=None):
     """Où en est le compte d'usines par rapport à ce que le sol lui donne.
 
     L'écran Build équilibre les deux quand il *génère* : changer le rendement
@@ -587,7 +887,17 @@ def factory_balance(analysis):
     À distinguer de `factory_coverage`, qui répond à une autre question — « que
     faut-il hauler » — et ne voit rien quand le sol est excédentaire, puisqu'il
     part des imports.
+
+    Avec les pins, une colonie Basic→Advanced se compte en jeux
+    (`_set_balance`). Sans eux, en usines, comme avant.
     """
+    if pins is not None:
+        # Tardif : colony_model importe ce module.
+        from src.services.colony_model import factory_set_count
+        sets = factory_set_count(pins)
+        if sets is not None:
+            return _set_balance(analysis, pins, sets)
+
     built = analysis.get("structures", {}).get(P0_CONSUMER, 0)
     supply = analysis.get("p0_supply_h", 0.0)
     if supply <= 0 or built == 0:
@@ -607,9 +917,54 @@ def factory_balance(analysis):
     )
 
 
+def _set_balance(analysis, pins, sets):
+    """L'écart en jeux entiers.
+
+    Un jeu porte une Basic par produit P1 et chaque P1 mange un seul P0 : les
+    jeux que le sol nourrit sont donc le moins de Basic qu'une ressource, prise
+    seule, sait nourrir. Ressource par ressource — un surplus de Carbon
+    Compounds ne nourrit aucune Basic qui attend des Noble Metals, et un total
+    dirait le contraire. Miroir de `setBalance` dans l'outil web.
+    """
+    supply = analysis.get("p0_supply_h", 0.0)
+    if supply <= 0 or sets == 0:
+        return None
+    basics_eating = {}
+    for pin in pins:
+        if STRUCT_ID_TO_NAME.get(pin.get("T")) != P0_CONSUMER or pin.get("S") is None:
+            continue
+        recipe = RECIPES_P0_P1.get(ID_TO_NAME.get(pin["S"]))
+        if recipe:
+            p0 = recipe["input"][0][0]
+            basics_eating[p0] = basics_eating.get(p0, 0) + 1
+    if not basics_eating:
+        return None
+
+    consumed, produced = analysis.get("consumed", {}), analysis.get("produced", {})
+    fed = []
+    for p0, basics in basics_eating.items():
+        per_basic = consumed.get(p0, 0) / basics
+        fed.append(0 if per_basic <= 0
+                   else int(math.floor(produced.get(p0, 0) / per_basic)))
+    return FactoryBalance(
+        supply_per_hour=supply,
+        demand_per_hour=analysis.get("p0_demand_h", 0.0),
+        built=sets,
+        fed=min(fed),
+        unit="set",
+    )
+
+
 def is_balanced(balance):
     """Le compte vaut-il la peine qu'on en dise quelque chose."""
     return balance.fed == balance.built
+
+
+def balance_noun(count, unit):
+    """Le nom à côté d'un compte dans la suggestion : usines, ou jeu(x) d'usines."""
+    if unit == "factory":
+        return "factories"
+    return "factory set" if count == 1 else "factory sets"
 
 
 # Les chaînes qu'une longueur de bras atteint vraiment.
@@ -1424,15 +1779,6 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
         # double-P2 à 24 usines.
         arm_len = _clamp(opts.arm_length, 1, MAX_ARM_LEN_HARD, default=MAX_ARM_LEN)
 
-        # Volume qu'une usine déplace par heure, entrée et sortie confondues. Les
-        # deux côtés séjournent dans les pads entre deux visites, donc les deux
-        # pèsent sur l'autonomie de la colonie.
-        flow_m3_per_factory = (
-            sum(hourly_rate(q, facility) * COMMODITY_SIZE.get(get_tier(n), 0)
-                for n, q in recipe["input"])
-            + hourly_rate(recipe["output"], facility)
-            * COMMODITY_SIZE.get(get_tier(product_name), 0))
-
         # Un lien par usine supplémentaire, long d'un espacement (les bras sont
         # chaînés) : son prix est donc fixé par le rayon de la planète.
         link_cpu, link_pw = link_cost_per_spacing(diameter)
@@ -1450,33 +1796,26 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
             n = max(0, min(avail_cpu // cost_cpu, avail_pw // cost_pw))
             return min(n, lps * arm_len * 2)
 
-        def _hours(lps, n):
-            capacity = lps * STORAGE_CAPACITY_M3["Launch Pad"]
-            if not flow_m3_per_factory or n <= 0:
-                return float("inf")
-            return capacity / (n * flow_m3_per_factory)
-
-        # Plus de pads, c'est du tampon acheté au prix d'usines, et passé un certain
-        # point le seul moyen de tenir une journée entière est d'en bâtir moins. On
-        # prend la colonie la plus large qui survive encore à l'intervalle demandé ;
-        # si aucune n'y arrive, celle qui tient le plus longtemps.
-        meets, longest = None, None
+        # Le plus d'usines que le command center tient, sur le moins de pads qui
+        # en tiennent autant : ce que cette recherche choisissait déjà quand
+        # aucun intervalle n'était demandé.
+        #
+        # Elle prenait le plus d'usines dont le stockage tenait l'intervalle de
+        # ramassage. Signalé sur Transcranial Microcontrollers, P2 → P3 sur Gas :
+        # 23 Advanced à 24 h, tenant 43,5 h ; choisir 48 h rebâtissait la colonie
+        # avec 17, tenant 78,4 h. Demander à ramasser moins souvent coupait donc
+        # la production d'un quart sans le dire, et 64 des 716 colonies étaient
+        # déjà coupées aux 24 h par défaut. L'intervalle est désormais ce contre
+        # quoi le stockage se mesure : une colonie trop courte le dit, et la
+        # suggestion de stockage offre plus de stockage, ou des jeux de
+        # production échangés contre lui, au choix de l'utilisateur. Miroir de
+        # `generateSingleStage` dans l'outil web (2026-09-14).
+        chosen = None
         for try_lps in range(1, MAX_LAUNCH_PADS + 1):
             room = _max_factories(try_lps)
-            if room < 1:
-                continue
-            capacity = try_lps * STORAGE_CAPACITY_M3["Launch Pad"]
-            if flow_m3_per_factory and opts.collection_hours:
-                affordable = int(capacity // (opts.collection_hours * flow_m3_per_factory))
-            else:
-                affordable = room
-            n_ok = min(room, affordable)
-            if n_ok >= 1 and (meets is None or n_ok > meets[1]):
-                meets = (try_lps, n_ok)
-            if longest is None or _hours(try_lps, room) > _hours(*longest):
-                longest = (try_lps, room)
+            if room >= 1 and (chosen is None or room > chosen[1]):
+                chosen = (try_lps, room)
 
-        chosen = meets or longest
         if chosen is None:
             return None
         num_lps, num_factories = chosen

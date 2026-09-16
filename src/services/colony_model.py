@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import math
 from collections import deque
 from dataclasses import dataclass, field
 
-from src.services.template_service import (MAX_ARM_LEN, MAX_ARM_LEN_HARD,
-                                           STRUCT_ID_TO_NAME)
+from src.pi_data import DEFAULT_YIELD_PER_HEAD, RECIPES_P1_P2
+from src.services.template_service import (ID_TO_NAME, MAX_ARM_LEN, MAX_ARM_LEN_HARD,
+                                           STRUCT_ID_TO_NAME, analyze_template,
+                                           get_tier)
 
 HUB_KINDS = ("Launch Pad", "Storage Facility")
 FACTORY_KINDS = ("Basic Industry Facility", "Advanced Industry Facility",
@@ -52,7 +55,39 @@ def template_shape_error(template):
         if val is not None and (not isinstance(val, list)
                                 or not all(isinstance(x, dict) for x in val)):
             return f"'{key}' is not a list of {label}"
+    # Fini ne suffit pas à être un endroit : deux angles proches du plus grand
+    # flottant se moyennent à l'infini, et la carte posait chaque structure à
+    # NaN. Bornes volontairement lâches — un tour entier de plus qu'une sphère
+    # n'en demande, et une planète entre un dixième de la plus petite d'EVE et
+    # sept fois Jupiter — parce qu'une borne ne vaut que si elle ne peut refuser
+    # le travail enregistré de personne. Miroir de `requireAngle` et
+    # `requirePlanetSize` dans le codec de l'outil web (2026-09-09).
+    for index, pin in enumerate(pins):
+        for key in ("La", "Lo"):
+            value = pin.get(key)
+            if value is None:
+                continue
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or abs(value) > MAX_ANGLE_RADIANS):
+                return (f"P[{index}].{key} must be within {MAX_ANGLE_RADIANS:.4f} "
+                        "radians of zero; a colony sits on a sphere")
+    diameter = template.get("Diam")
+    # 0 reste admis : c'est ce qu'écrit le bureau quand le champ du rayon est
+    # vide, et une colonie enregistrée ainsi doit encore s'ouvrir.
+    if diameter not in (None, 0, 0.0):
+        if (isinstance(diameter, bool) or not isinstance(diameter, (int, float))
+                or not math.isfinite(diameter)
+                or not PLANET_DIAMETER_KM[0] <= diameter <= PLANET_DIAMETER_KM[1]):
+            return (f"Diam must be between {PLANET_DIAMETER_KM[0]:,} and "
+                    f"{PLANET_DIAMETER_KM[1]:,} km")
     return None
+
+
+# Un tour entier : un tour de plus que ce qu'une sphère demande.
+MAX_ANGLE_RADIANS = 2 * math.pi
+
+# Une planète plutôt qu'un nombre de kilomètres, en DIAMÈTRE (min, max).
+PLANET_DIAMETER_KM = (100, 1_000_000)
 
 
 @dataclass
@@ -234,6 +269,155 @@ def mixed_schematics(model):
     return len(fac - {None}) > 1 or len(ecu - {None}) > 1
 
 
+ADVANCED_KIND = "Advanced Industry Facility"
+BASIC_KIND = "Basic Industry Facility"
+
+
+def factory_set_products(pins):
+    """Produits d'un jeu d'usines, ou None si la colonie n'est pas Basic→Advanced.
+
+    Une colonie P0 → P2 nourrit une usine avancée avec une usine de base par P1
+    qu'elle fabrique : c'est le ratio du générateur et celui des colonies de la
+    bibliothèque. « Ajouter une usine » n'a pas de réponse là-dessus — laquelle,
+    dans quel ratio — d'où le verrou ; « ajouter un jeu » en a une.
+
+    L'avancée d'abord, puis chaque produit de base dans l'ordre où il apparaît :
+    les deux moteurs placent et retirent dans la même séquence. Deux produits
+    avancés, une usine high-tech ou un produit de base que l'avancée ne mange
+    pas n'ont pas de ratio et restent verrouillés. Miroir de
+    `factorySetProducts` dans l'outil web.
+    """
+    advanced = None
+    basics = []
+    for pin in pins:
+        kind = kind_of(pin)
+        schematic = pin.get("S")
+        if kind not in FACTORY_KINDS or schematic is None:
+            continue
+        if kind == ADVANCED_KIND:
+            if advanced is not None and advanced != schematic:
+                return None
+            advanced = schematic
+        elif kind != BASIC_KIND:
+            return None
+        elif schematic not in basics:
+            basics.append(schematic)
+    if advanced is None or not basics:
+        return None
+    recipe = RECIPES_P1_P2.get(ID_TO_NAME.get(advanced))
+    if not recipe:
+        return None
+    inputs = {name for name, _qty in recipe["input"]}
+    if not all(ID_TO_NAME.get(s) in inputs for s in basics):
+        return None
+    return [advanced, *basics]
+
+
+def extractor_set_resources(pins):
+    """Ressources des extracteurs, dans l'ordre d'apparition, s'il y en a au moins deux.
+
+    « Ajouter un extracteur » n'a pas de réponse sur une telle colonie — sur
+    quelle ressource ? — d'où le verrou ; « ajouter une paire » en a une : un ECU
+    par ressource. Miroir de `extractorSetResources` dans l'outil web.
+    """
+    resources = []
+    for pin in pins:
+        schematic = pin.get("S")
+        if (kind_of(pin) == "Extractor Control Unit" and schematic is not None
+                and schematic not in resources):
+            resources.append(schematic)
+    return resources if len(resources) >= 2 else None
+
+
+def factory_set_count(pins):
+    """Jeux d'usines d'une colonie Basic→Advanced — une Advanced par jeu —, ou None."""
+    if factory_set_products(pins) is None:
+        return None
+    return sum(1 for pin in pins if kind_of(pin) == ADVANCED_KIND)
+
+
+def extractor_set_count(pins):
+    """Paires complètes d'une colonie à plusieurs ressources, ou None.
+
+    Le moins d'ECU sur une même ressource : une colonie inégale compte ses
+    paires entières, et rien ne la rééquilibre. Miroir de `extractorSetCount`.
+    """
+    resources = extractor_set_resources(pins)
+    if resources is None:
+        return None
+    return min(sum(1 for pin in pins
+                   if kind_of(pin) == "Extractor Control Unit" and pin.get("S") == resource)
+               for resource in resources)
+
+
+def counter_tally(model):
+    """Ce que montrent les compteurs, dans l'unité du pas que fait chaque édition.
+
+    En jeux sur une colonie Basic→Advanced et en paires sur plusieurs
+    ressources, parce que c'est le pas de `add_factory` et `add_extractor` là :
+    compter des structures une à une faisait qu'un clic en ajoutait deux ou
+    trois pendant que la case n'avançait que d'un. Miroir de `tallyOf`.
+    """
+    counts = structure_counts(model)
+    sets = factory_set_count(model.pins)
+    pairs = extractor_set_count(model.pins)
+    return {
+        "factories": sets if sets is not None
+        else sum(c for name, c in counts.items() if name in FACTORY_KINDS),
+        "extractors": pairs if pairs is not None
+        else counts.get("Extractor Control Unit", 0),
+        "heads": heads_per_extractor(model),
+        "launch_pads": counts.get("Launch Pad", 0),
+        "storage": counts.get("Storage Facility", 0),
+    }
+
+
+def _template_yield_per_head(template):
+    """Rendement par tête que les routes des extracteurs impliquent.
+
+    Q d'une route qui sort d'un ECU = têtes × rendement : c'est la seule trace
+    que le format garde de ce chiffre. Miroir de `templateYieldPerHead`.
+    """
+    pins = template.get("P", [])
+    for route in template.get("R", []):
+        path = route.get("P") or []
+        if not path:
+            continue
+        idx = path[0] - 1
+        if 0 <= idx < len(pins) and kind_of(pins[idx]) == "Extractor Control Unit":
+            heads = pins[idx].get("H", 0) or 0
+            if heads > 0:
+                return route["Q"] / heads
+    return DEFAULT_YIELD_PER_HEAD
+
+
+def _assert_extraction_feeds_itself(template):
+    """Refuse une usine que les extracteurs de la colonie ne peuvent pas nourrir.
+
+    Seulement sur une colonie qui extrait : une colonie d'usines importe ses
+    intrants par construction. Ressource par ressource, dans l'ordre des noms,
+    jamais au total — un surplus de Carbon Compounds ne nourrit pas les usines
+    qui attendent des Noble Metals. Miroir de `assertExtractionFeedsItself`.
+
+    Appliqué aux jeux seulement. L'outil web le fait aussi sur une usine seule.
+    Ici, `stage_edit` écrit le rendement dans le template avant de faire grandir
+    la colonie, mais `grow_to_supply` ne le fait pas lui-même : sur une usine
+    seule, le contrôle bloquerait la croissance de tout appelant qui l'oublie.
+    """
+    analysis = analyze_template(template,
+                                {"yield_per_head": _template_yield_per_head(template)})
+    if analysis["p0_supply_h"] <= 0:
+        return
+    consumed, produced = analysis["consumed"], analysis["produced"]
+    for name in sorted(n for n in consumed if get_tier(n) == "P0"):
+        short = consumed[name] - produced.get(name, 0)
+        if short > 1e-9:
+            raise EditError(
+                f"the extractors would be {math.floor(short + 0.5):,}/h short of what "
+                "the factories eat — raise the yield per head, or add heads or an "
+                "extractor, before adding this factory")
+
+
 # ── Chirurgie ────────────────────────────────────────────────────────────
 # Chaque opération copie le template, patch les listes P/L/R, puis repasse
 # par parse_colony : tout invariant structurel est revalidé à chaque coup.
@@ -254,9 +438,23 @@ def _median_spacing(model):
 
 
 def _too_close(model, la, lo, sp):
+    """Une position que l'éditeur choisit *pour* l'utilisateur est-elle prise ?
+
+    Prise sous la règle de la colonie, une fraction de son espacement médian,
+    et aussi sous celle d'EVE : la règle relative seule laissait passer une
+    position entre 0,6 et 1 espacement d'une structure, que le jeu écarte à
+    l'import et que la planète marque encombrée. Trouvé par la suggestion de
+    stockage sur Transcranial Microcontrollers, P2 → P3 sur Oceanic, où chaque
+    Storage Facility tombait sur la diagonale entre deux usines, à 0,707
+    espacement de chacune ; add_hub faisait pareil sur 68 des 89 templates de
+    la bibliothèque. Quelqu'un qui glisse une structure la pose toujours où il
+    veut, marquée ; une position choisie à sa place n'a jamais besoin de la
+    marque. Miroir de `tooClose` dans l'outil web (2026-09-14).
+    """
     from src.services.template_service import pin_angle
     probe = {"La": la, "Lo": lo}
-    return any(pin_angle(probe, p) < 0.6 * sp for p in model.pins)
+    limit = max(0.6 * sp, MIN_SEPARATION - SEPARATION_TOLERANCE)
+    return any(pin_angle(probe, p) < limit for p in model.pins)
 
 
 # Distance en deçà de laquelle la colonie signale un chevauchement, en radians.
@@ -265,10 +463,11 @@ def _too_close(model, la, lo, sp):
 # déplace une structure choisit où elle va, et on a tranché pareil pour le
 # budget CPU/énergie — on laisse dépasser, on montre en rouge.
 #
-# Fixe, contrairement à _too_close qui se mesure à l'espacement médian du
-# template. Cette règle relative est juste pour add_factory et add_hub, qui
-# choisissent une position *à la place* de l'utilisateur et ont besoin d'un
-# creux libre — pas la même question qu'un déplacement délibéré.
+# Fixe, contrairement à la moitié relative de _too_close, qui se mesure à
+# l'espacement médian du template. _too_close applique aussi celui-ci : une
+# position qu'add_factory ou add_hub choisit *à la place* de l'utilisateur doit
+# être libre selon la règle du jeu, alors qu'un déplacement délibéré est
+# seulement marqué.
 #
 # BASE_SPACING parce que c'est la limite du jeu et non un goût à nous : EVE ne
 # tient pas deux structures plus près, et les écarte à l'import. Le seuil valait
@@ -411,17 +610,52 @@ def add_factory(model):
 
     Les bras-ponts ne grandissent jamais — insérer entre le bout et le hub
     d'en face tasserait le layout sous son propre espacement.
+
+    Sur une colonie Basic→Advanced, un jeu entier (voir
+    `factory_set_products`), refusé en bloc si un membre n'a pas de place ou si
+    les extracteurs ne peuvent pas le nourrir.
     """
     fac_schematics = {p.get("S") for p in model.pins
                       if kind_of(p) in FACTORY_KINDS} - {None}
-    if len(fac_schematics) > 1:
+    if len(fac_schematics) <= 1:
+        # Pas de contrôle de nourriture ici : `grow_to_supply` passe le nouveau
+        # rendement en argument sans le réécrire dans les routes, donc un
+        # contrôle qui lit le rendement du template refuserait toute croissance.
+        return parse_colony(_place_factory(model, None))
+
+    products = factory_set_products(model.pins)
+    if products is None:
         raise EditError("two different products — counters are locked")
+    # Un membre à la fois, reparsé entre chaque, pour que chaque placement voie
+    # les précédents. La nourriture se juge sur le jeu fini : une usine avancée
+    # ne mange rien du sol, la vérifier seule passerait puis refuserait une
+    # usine de base à mi-chemin.
+    working = model
+    for schematic in products:
+        working = parse_colony(_place_factory(working, schematic))
+    _assert_extraction_feeds_itself(working.to_template())
+    return working
+
+
+def _place_factory(model, schematic):
+    """Place une usine et rend le template patché, non parsé.
+
+    schematic None copie l'usine au bout de laquelle on se greffe, comme
+    toujours ; renseigné, on copie un pin qui fabrique ce produit — le bout du
+    bras où l'on s'accroche n'en est pas forcément un.
+    """
     open_arms = [a for a in model.arms if a.end_hub is None
                  and all(kind_of(model.pins[i]) in FACTORY_KINDS for i in a.pins)]
     factory_arms = [a for a in model.arms
                     if any(kind_of(model.pins[i]) in FACTORY_KINDS for i in a.pins)]
     if not factory_arms:
         raise EditError("template has no factory to copy from")
+
+    def donor_for(candidate):
+        if schematic is None or model.pins[candidate].get("S") == schematic:
+            return candidate
+        return max(i for i, p in enumerate(model.pins)
+                   if kind_of(p) in FACTORY_KINDS and p.get("S") == schematic)
 
     tpl = _working_copy(model)
     sp = _median_spacing(model)
@@ -441,7 +675,7 @@ def add_factory(model):
         la = round(2 * tip["La"] - prev["La"], 5)
         lo = round(2 * tip["Lo"] - prev["Lo"], 5)
         if not _too_close(model, la, lo, sp):
-            placed = (arm.pins[-1], la, lo, arm.pins[-1] + 1)
+            placed = (donor_for(arm.pins[-1]), la, lo, arm.pins[-1] + 1)
             break
 
     if placed is not None:
@@ -451,7 +685,7 @@ def add_factory(model):
         # tout. Le vrai cul-de-sac est celui de `_free_spot_near`, plus bas.
         # Nouveau bras sur le hub le moins chargé, en miroir d'un bras existant.
         donor_arm = min(factory_arms, key=lambda a: len(a.pins))
-        donor_0b = donor_arm.pins[-1]
+        donor_0b = donor_for(donor_arm.pins[-1])
         load = {h: 0 for h in model.hubs}
         for a in model.arms:
             load[a.hub] += len(a.pins)
@@ -466,19 +700,82 @@ def add_factory(model):
     new_1b = len(tpl["P"])
     tpl["L"].append({"D": attach_1b, "Lv": 0, "S": new_1b})
     tpl["R"].extend(_clone_routes_for(tpl, donor_0b + 1, new_1b))
-    return parse_colony(tpl)
+    return tpl
 
 
 def remove_factory(model):
-    """Retire l'usine en bout du bras le plus long (bras ouverts d'abord)."""
-    candidates = []
-    for a in model.arms:
-        tip = a.pins[-1]
-        if kind_of(model.pins[tip]) in FACTORY_KINDS:
-            candidates.append((a.end_hub is not None, -len(a.pins), a))
-    total = sum(1 for p in model.pins if kind_of(p) in FACTORY_KINDS)
-    if not candidates or total <= 1:
+    """Retire l'usine en bout du bras le plus long (bras ouverts d'abord).
+
+    Sur une colonie Basic→Advanced, un jeu entier : l'avancée puis une usine de
+    base de chaque produit, chacune choisie par la même règle parmi les pins
+    de ce produit. Le dernier jeu reste.
+    """
+    fac_schematics = {p.get("S") for p in model.pins
+                      if kind_of(p) in FACTORY_KINDS} - {None}
+    products = factory_set_products(model.pins) if len(fac_schematics) > 1 else None
+    if products is None:
+        return _drop_factory(model, None)
+
+    sets = sum(1 for p in model.pins if kind_of(p) == ADVANCED_KIND)
+    if sets <= 1:
         raise EditError("cannot remove the last factory")
+    working = model
+    for schematic in products:
+        working = _drop_factory(working, schematic)
+    return working
+
+
+def _tip_reach(model):
+    """Liens entre chaque bras et son hub, jusqu'à son bout : `tipReach` de l'outil web.
+
+    Pour un bras posé sur un hub, c'est sa longueur ; pour une branche, la
+    portée du bras d'où elle part plus la sienne. Mesurer au hub plutôt qu'à la
+    fourche garde « le bras le plus long » vrai sur un éventail P4.
+    """
+    arm_of = {pin: index for index, arm in enumerate(model.arms) for pin in arm.pins}
+    reach = {}
+
+    def of(index):
+        if index not in reach:
+            arm = model.arms[index]
+            parent = arm_of.get(arm.parent)
+            reach[index] = len(arm.pins) + (0 if parent is None else of(parent))
+        return reach[index]
+
+    return [of(index) for index in range(len(model.arms))]
+
+
+def _drop_factory(model, schematic):
+    """Une usine en bout du bras le plus long, bras ouverts d'abord — de ce produit si donné.
+
+    Un bout d'où partent d'autres bras est une fourche, pas une extrémité libre :
+    le retirer laisserait en plan tout ce qui pousse au-delà. Ces bras sont
+    sautés et leurs branches sont candidates, si bien que la fourche se libère
+    une fois les branches parties. Miroir de `dropFactory` dans l'outil web, qui
+    le faisait depuis toujours ; le bureau ne le voyait pas, la bibliothèque
+    n'ayant aucune fourche, mais les colonies P1 → P4 et P2 → P4 générées en ont.
+    """
+    forks = {a.parent for a in model.arms}
+    reach = _tip_reach(model)
+    candidates = []
+    for index, a in enumerate(model.arms):
+        tip = a.pins[-1]
+        pin = model.pins[tip]
+        if (tip not in forks and kind_of(pin) in FACTORY_KINDS
+                and (schematic is None or pin.get("S") == schematic)):
+            candidates.append((a.end_hub is not None, -reach[index], a))
+    if schematic is None:
+        total = sum(1 for p in model.pins if kind_of(p) in FACTORY_KINDS)
+        if not candidates or total <= 1:
+            raise EditError("cannot remove the last factory")
+    else:
+        of_product = sum(1 for p in model.pins
+                         if kind_of(p) in FACTORY_KINDS and p.get("S") == schematic)
+        if of_product <= 1:
+            raise EditError("cannot remove the last factory")
+        if not candidates:
+            raise EditError(f"no {ID_TO_NAME.get(schematic, schematic)} factory "
+                            "at the end of an arm to remove")
     _bridge, _neg, arm = sorted(candidates, key=lambda c: (c[0], c[1]))[0]
     tip_1b = arm.pins[-1] + 1
     repair = None
@@ -490,10 +787,103 @@ def remove_factory(model):
     return parse_colony(tpl)
 
 
-def add_extractor(model):
-    """Nouvel ECU, copie d'un existant, accroché au hub qui porte déjà les ECUs."""
+_TIER_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3, "P4": 4}
+
+
+def production_set_members(pins):
+    """Un jeu de production d'une colonie d'usines, produit en tête, ou None.
+
+    Le produit est la seule marchandise du palier le plus haut qu'une usine
+    d'ici fabrique ; une égalité n'a pas de réponse et rend None. Un jeu, c'est
+    une usine de ce produit plus, pour chaque intrant qu'une usine d'ici fabrique
+    aussi, `ceil(mangé par heure / fabriqué par heure)` usines de cet intrant par
+    usine parente, récursivement, additionnées quand deux branches partagent un
+    intrant. Camera Drones depuis P1 : une usine P3 et deux de chaque intrant P2 ;
+    une colonie P1 → P4 est son arbre entier.
+
+    Liste de (type id du produit, usines par jeu). Miroir de
+    `productionSetMembers` dans l'outil web.
+    """
+    from src.pi_data import CYCLE_HOURS
+    from src.services.template_service import NAME_TO_ID, find_recipe
+    facility_of = {}
+    for pin in pins:
+        schematic = pin.get("S")
+        if (kind_of(pin) in FACTORY_KINDS and schematic is not None
+                and schematic not in facility_of):
+            facility_of[schematic] = kind_of(pin)
+
+    def rank(type_id):
+        return _TIER_RANK.get(get_tier(ID_TO_NAME.get(type_id, "")), -1)
+
+    ranked = sorted(facility_of, key=lambda type_id: -rank(type_id))
+    if not ranked or (len(ranked) > 1 and rank(ranked[1]) == rank(ranked[0])):
+        return None
+
+    members = [[ranked[0], 1]]
+    index = 0
+    while index < len(members):
+        product, per_set = members[index]
+        index += 1
+        recipe = find_recipe(ID_TO_NAME.get(product, ""))
+        if not recipe:
+            return None
+        parent_hours = CYCLE_HOURS.get(facility_of[product], 1)
+        for input_name, quantity in recipe["input"]:
+            input_id = NAME_TO_ID.get(input_name)
+            input_recipe = find_recipe(input_name)
+            if input_id is None or not input_recipe or input_id not in facility_of:
+                continue
+            input_hours = CYCLE_HOURS.get(facility_of[input_id], 1)
+            per_parent = math.ceil(
+                (quantity / parent_hours) / (input_recipe["output"] / input_hours) - 1e-9)
+            existing = next((m for m in members if m[0] == input_id), None)
+            if existing is None:
+                members.append([input_id, per_set * per_parent])
+            else:
+                existing[1] += per_set * per_parent
+    return [tuple(m) for m in members]
+
+
+def production_set_count(pins):
+    """Les jeux de production entiers d'une colonie d'usines, ou None."""
+    members = production_set_members(pins)
+    if members is None:
+        return None
+    return min(sum(1 for pin in pins
+                   if kind_of(pin) in FACTORY_KINDS and pin.get("S") == product) // per_set
+               for product, per_set in members)
+
+
+def remove_production_set(model):
+    """Retire un jeu de production, produit d'abord, chaque usine par `_drop_factory`.
+
+    Reparse entre chaque usine. Refuse le jeu entier sur le premier membre qu'il
+    ne peut pas prendre, et au dernier jeu. Pas un compteur : c'est ce que la
+    suggestion de stockage échange contre de la place dans le budget quand pas
+    même un Storage Facility n'y tient. Miroir de `removeProductionSet`.
+    """
+    members = production_set_members(model.pins)
+    sets = production_set_count(model.pins)
+    if members is None or sets is None:
+        raise EditError("this colony has no production set to remove")
+    if sets <= 1:
+        raise EditError("cannot remove the last production set")
+    working = model
+    for product, per_set in members:
+        for _ in range(per_set):
+            working = _drop_factory(working, product)
+    return working
+
+
+def _place_extractor(model, resource):
+    """ECU copié du premier extracteur de `resource` (de n'importe laquelle si None).
+
+    Accroché au hub du premier bras qui finit sur un tel extracteur. Template non re-parsé.
+    """
     ecus = [i for i, p in enumerate(model.pins)
-            if kind_of(p) == "Extractor Control Unit"]
+            if kind_of(p) == "Extractor Control Unit"
+            and (resource is None or p.get("S") == resource)]
     if not ecus:
         raise EditError("template extracts nothing — no resource to assign")
     donor_0b = ecus[0]
@@ -508,16 +898,51 @@ def add_extractor(model):
     new_1b = len(tpl["P"])
     tpl["L"].append({"D": hub + 1, "Lv": 0, "S": new_1b})
     tpl["R"].extend(_clone_routes_for(tpl, donor_0b + 1, new_1b))
-    return parse_colony(tpl)
+    return tpl
+
+
+def add_extractor(model):
+    """Nouvel ECU, copie d'un existant, accroché au hub qui porte déjà les ECUs.
+
+    Sur une colonie à plusieurs ressources, une paire : un ECU par ressource,
+    copié de l'extracteur de sa ressource, re-parsé entre chaque. Un membre sans
+    place refuse la paire entière ; le modèle d'entrée n'est jamais touché.
+    """
+    resources = extractor_set_resources(model.pins)
+    if resources is None:
+        return parse_colony(_place_extractor(model, None))
+    working = model
+    for resource in resources:
+        working = parse_colony(_place_extractor(working, resource))
+    return working
 
 
 def remove_extractor(model):
-    ecus = [i for i, p in enumerate(model.pins)
-            if kind_of(p) == "Extractor Control Unit"]
-    if len(ecus) <= 1:
-        raise EditError("cannot remove the last extractor")
+    """Retire le dernier ECU ; sur plusieurs ressources, le dernier de chacune.
+
+    Refusé tant qu'une ressource n'en a plus qu'un. Retirés de l'index le plus
+    haut au plus bas, sur une seule copie : les index plus bas ne bougent pas.
+    """
+    resources = extractor_set_resources(model.pins)
+    if resources is None:
+        ecus = [i for i, p in enumerate(model.pins)
+                if kind_of(p) == "Extractor Control Unit"]
+        if len(ecus) <= 1:
+            raise EditError("cannot remove the last extractor")
+        tpl = _working_copy(model)
+        _drop_pin(tpl, ecus[-1] + 1)
+        return parse_colony(tpl)
+
+    chosen = []
+    for resource in resources:
+        ecus = [i for i, p in enumerate(model.pins)
+                if kind_of(p) == "Extractor Control Unit" and p.get("S") == resource]
+        if len(ecus) <= 1:
+            raise EditError("cannot remove the last extractor")
+        chosen.append(ecus[-1])
     tpl = _working_copy(model)
-    _drop_pin(tpl, ecus[-1] + 1)
+    for idx in sorted(chosen, reverse=True):
+        _drop_pin(tpl, idx + 1)
     return parse_colony(tpl)
 
 
@@ -529,6 +954,37 @@ def set_heads(model, per_ecu):
     for p in tpl["P"]:
         if kind_of(p) == "Extractor Control Unit" and p.get("H") != per_ecu:
             p["H"] = per_ecu
+            changed = True
+    if not changed:
+        return model
+    return parse_colony(tpl)
+
+
+def set_yield_per_head(model, per_head):
+    """Réécrit Q = têtes × rendement sur chaque route qui sort d'un ECU.
+
+    Le rendement vit dans ces routes : c'est ce qu'y relit
+    `_assert_extraction_feeds_itself`. Faire grandir une colonie sans l'y écrire
+    d'abord refusait chaque jeu avec « raise the yield per head » — juste après
+    qu'on l'eut relevé. Jamais muet : une colonie qui n'extrait rien le dit.
+    Miroir de `setYieldPerHead`.
+    """
+    if per_head < 1:
+        raise EditError("yield per head must be at least 1")
+    tpl = _working_copy(model)
+    pins = tpl["P"]
+    routes = [route for route in tpl["R"]
+              if route.get("P")
+              and 0 < route["P"][0] <= len(pins)
+              and kind_of(pins[route["P"][0] - 1]) == "Extractor Control Unit"]
+    if not routes:
+        raise EditError("no extractor route to carry a yield")
+    changed = False
+    for route in routes:
+        heads = pins[route["P"][0] - 1].get("H", 0) or 0
+        quantity = max(int(heads * per_head), 1)
+        if route["Q"] != quantity:
+            route["Q"] = quantity
             changed = True
     if not changed:
         return model
@@ -569,6 +1025,76 @@ def add_hub(model, kind):
     tpl = _working_copy(model)
     tpl["P"].append({"H": 0, "La": la, "Lo": lo, "S": None, "T": type_id})
     tpl["L"].append({"D": anchor + 1, "Lv": 0, "S": len(tpl["P"])})
+    # Relié ne suffit pas : un stockage ne contient que ce qu'une route charge ou décharge.
+    _route_hub(tpl, len(tpl["P"]))
+    return parse_colony(tpl)
+
+
+def _storage_feeds(template):
+    """Les couples (usine, marchandise) que la colonie alimente depuis un stockage.
+
+    Dans l'ordre des routes, chacun avec le Q de la première route qui le fait.
+    Les marchandises qu'une usine ou un extracteur d'ici fabrique sont exclues :
+    un stockage ne les reçoit que par une route de sortie, que rien ici n'ajoute.
+    """
+    pins = template["P"]
+
+    def kind_at(one_based):
+        return kind_of(pins[one_based - 1]) if 1 <= one_based <= len(pins) else None
+
+    made = {p.get("S") for p in pins
+            if kind_of(p) in FACTORY_KINDS or kind_of(p) == "Extractor Control Unit"}
+    made.discard(None)
+    feeds = []
+    seen = set()
+    for route in template["R"]:
+        path = route["P"]
+        if len(path) < 2:
+            continue
+        source, factory = path[0], path[-1]
+        key = (factory, route["T"])
+        if (kind_at(source) in HUB_KINDS and kind_at(factory) in FACTORY_KINDS
+                and route["T"] not in made and key not in seen):
+            seen.add(key)
+            feeds.append((factory, route["T"], route["Q"]))
+    return feeds
+
+
+def _route_hub(template, hub_1b):
+    """Ajoute une route du hub vers chaque couple qu'il n'alimente pas encore ; renvoie le nombre.
+
+    EVE n'autorise aucune route entre deux stockages — déplacer du stock entre
+    eux est un Expedited Transfer manuel — donc un stockage devient utile de la
+    seule façon qu'une route permet : directement vers les usines qui mangent ce
+    qu'il contiendrait. Miroir de `routeHub` dans l'outil web.
+    """
+    from src.services.template_service import _bfs_path
+    added = 0
+    for factory, type_id, quantity in _storage_feeds(template):
+        if any(r["P"][0] == hub_1b and r["P"][-1] == factory and r["T"] == type_id
+               for r in template["R"] if r["P"]):
+            continue
+        path = _bfs_path(template["L"], hub_1b, factory, len(template["P"]))
+        if not path:
+            continue
+        template["R"].append({"P": path, "Q": quantity, "T": type_id})
+        added += 1
+    return added
+
+
+def route_hubs(model):
+    """Relie chaque launch pad et entrepôt, dans l'ordre des pins, aux usines qu'il peut nourrir.
+
+    Refusé quand rien n'est ajouté, pour que le bouton ne reste jamais muet.
+    Miroir de `routeHubs` dans l'outil web.
+    """
+    tpl = _working_copy(model)
+    added = 0
+    for index, pin in enumerate(tpl["P"]):
+        if kind_of(pin) in HUB_KINDS:
+            added += _route_hub(tpl, index + 1)
+    if added == 0:
+        raise EditError("every launch pad and storage facility already feeds every factory it can")
     return parse_colony(tpl)
 
 
@@ -640,8 +1166,17 @@ def set_radius_km(model, radius_km_value):
     """Rayon saisi → diamètre stocké. LA conversion, même ×2.0 que le champ ④.
 
     Métadonnée pure : aucun pin ne bouge, seul le prix des liens change.
+
+    Un rayon impossible est refusé comme toute autre édition, plutôt que ramené
+    en silence à 0 : le champ gardait le nombre tapé pendant que la colonie en
+    prenait un autre. Miroir de `setRadiusKm` dans l'outil web (2026-09-09).
     """
-    diameter = max(0.0, float(radius_km_value or 0.0)) * 2.0
+    radius = float(radius_km_value or 0.0)
+    diameter = radius * 2.0
+    if (not math.isfinite(radius) or diameter < PLANET_DIAMETER_KM[0]
+            or diameter > PLANET_DIAMETER_KM[1]):
+        raise EditError(f"planet radius must be between {PLANET_DIAMETER_KM[0] // 2:,} "
+                        f"and {PLANET_DIAMETER_KM[1] // 2:,} km")
     return dataclasses.replace(model, diameter=diameter)
 
 
@@ -691,15 +1226,14 @@ def editability(model):
     ecu_schematics = {p.get("S") for p in model.pins
                       if kind_of(p) == "Extractor Control Unit"} - {None}
 
-    if len(fac_schematics) > 1:
+    if len(fac_schematics) > 1 and factory_set_products(model.pins) is None:
         reasons["factories"] = "two different products — locked"
     elif not fac_schematics:
         reasons["factories"] = "template has no factory to copy from"
 
-    if len(ecu_schematics) > 1:
-        reasons["extractors"] = "two different resources — locked"
-        reasons["heads"] = reasons["extractors"]
-    elif not ecu_schematics:
+    # Plus de verrou à plusieurs ressources : les extracteurs avancent par
+    # paires, et set_heads écrit déjà le même H sur chaque ECU.
+    if not ecu_schematics:
         reasons["extractors"] = "template extracts nothing"
         reasons["heads"] = "template extracts nothing"
 

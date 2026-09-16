@@ -40,9 +40,9 @@ from src.pi_data import (
     STRUCTURE_IDS,
 )
 from src.services.colony_model import (MIN_SEPARATION, EditError, ParseError,
-                                       add_factory, crowded_pins,
-                                       mixed_schematics, move_pin, parse_colony,
-                                       remove_factory, template_shape_error)
+                                       add_factory, crowded_pins, editability,
+                                       move_pin, parse_colony, remove_factory,
+                                       route_hubs, template_shape_error)
 from src.services.history import MAX_ENTRIES, History
 from src.services.stage_edit import apply_edit, apply_retune
 from src.services.stage_plan import (EDIT, INERT, REBUILD, REFUSE, RETUNE,
@@ -65,14 +65,21 @@ from src.services.template_service import (
     MAX_LAUNCH_PADS,
     TemplateService,
     analyze_template,
+    counted_factory_kinds,
+    extractors_label,
+    factories_label,
+    factories_per_unit,
     factory_balance,
     factory_clamp_note,
     factory_coverage,
     factory_coverage_note,
+    intermediate_rows,
+    route_rows,
     is_balanced,
+    observed_counts,
+    rejected_counts,
     supports_arm_length,
     trip_interval,
-    PRODUCTION_FACILITIES,
     get_full_supply_chain,
     get_tier,
     throughput_rows,
@@ -85,6 +92,7 @@ from src.ui.more_tools import (BUG_REPORT_URL, COPYRIGHT_LINES,
 from src.ui.screens import (DESKTOP_RAIL, DESKTOP_SCREENS, RAIL_ITEMS,
                             RAIL_SCREENS, SCREEN_MODE_LABELS)
 from src.ui.stage_notice import StageNotice
+from src.services.storage_suggestion import higher_tier_chain, storage_suggestion
 # `src/ui/template_editor.py` n'est plus importe : sa fenetre redessinait la
 # meme planete dans une seconde scene, et Build est desormais le seul endroit
 # ou une colonie se regarde et se change. Le fichier reste en place, dormant,
@@ -354,6 +362,36 @@ LINK_CYAN = "#5ad1e6"
 # noir détaché du monde, de chaque côté — signalé comme tel. Ne suit pas le
 # thème, pour la même raison que LINK_CYAN : c'est de l'espace, pas du châssis.
 MAP_SPACE = "#000000"
+# Le bleu du survol, `--accent-primary` de l'outil web. Fixe, pour la même
+# raison que LINK_CYAN : l'anneau d'un bâtiment survolé se lit sur l'artwork
+# d'une planète, et l'accent doré du thème s'y perdait.
+FOCUS_BLUE = "#4da3ff"
+# Les routes allumées au survol, en pixels à zoom 1. Réglées ici, en un seul
+# endroit, pour qu'un « un cran plus épais » reste une ligne à changer.
+#
+# L'outil web dessine un halo de 9 px à 22 % d'opacité, en tirets 2 / 8 à bouts
+# ronds : chaque tiret s'arrondit en une pastille de 11 px qui chevauche la
+# suivante, si bien que l'œil lit une bande continue, et les routes empilées
+# près d'un hub la rendent plus vive. Le bureau copiait le motif et obtenait
+# des points : Tk sous Windows espace les tirets d'un trait large bien au-delà
+# du motif demandé (une perle tous les 23 px environ à 12 px de large), et le
+# motif gray25 qui tenait lieu d'opacité émiettait le reste. Signalé « trop
+# petit » le 2026-09-16, capture de l'outil web à l'appui.
+#
+# D'où une bande continue et pleine, pâle pour se lire comme translucide, et
+# les perles plus claires qui défilent dessus — choisie sur une échelle de six
+# réglages capturée dans l'application (la variante « O »).
+ROUTE_HALO_PX = 9
+ROUTE_HALO_STIPPLE = ""
+ROUTE_HALO_LIGHTNESS = 0.70
+ROUTE_BEAD_PX = 4
+ROUTE_BEAD_LIGHTNESS = 0.90
+ROUTE_DASH = (2, 8)
+# Le motif du halo ; None pour une bande continue.
+ROUTE_HALO_DASH = None
+LINK_ACTIVE_PX = 4
+# Ce que dit une structure posée trop près d'une autre, mot pour mot l'outil web.
+CROWDED_REASON = "too close to another structure"
 
 
 def get_planet_art(planet_type_id, px):
@@ -572,6 +610,17 @@ def _attach_tooltip(widget, text):
 # Sert de plancher au redimensionnement et de test sur une géométrie enregistrée
 # du temps où la colonie vivait dans une seconde fenêtre.
 MIN_MERGED_WIDTH = 900
+
+# La colonne de réglages de Build, en pixels à 100 % de taille de texte. Elle
+# faisait 470, héritage de la fenêtre de 420 px : une bande vide à droite de
+# chaque carte. À 340, « Transcranial Microcontrollers » tient encore face à ses
+# chiffres ; à 300, les valeurs de la nomenclature se chevauchent (mesuré le
+# 2026-09-16 sur P0 → P2, P1 → P4 et P2 → P3). Ce qui ne tient pas se renvoie
+# à la ligne plutôt que d'être coupé.
+CONFIG_PANEL_WIDTH = 340
+# Du bord du panneau au bord de ses canvas : 8 + 8 de marge des cartes, 1 + 1 de
+# bordure, 4 + 4 de marge du canvas. Non mis à l'échelle, comme ces marges.
+CONFIG_CANVAS_INSET = 26
 
 # La carte de bibliothèque, en pixels à 100 % de taille de texte. Assez large
 # pour qu'un nom de colonie tienne sur deux lignes et que « Advanced Industry
@@ -1626,7 +1675,7 @@ class PIGeneratorApp:
         build_screen = ttk.Frame(self._screen_host)
         self._screens["build"] = build_screen
 
-        config_host = ttk.Frame(build_screen, width=_px(470))
+        config_host = ttk.Frame(build_screen, width=_px(CONFIG_PANEL_WIDTH))
         config_host.pack(side=tk.LEFT, fill=tk.Y)
         # Sans ça, le cadre se rétracte sur son contenu et la largeur demandée
         # ne veut plus rien dire.
@@ -2005,7 +2054,7 @@ class PIGeneratorApp:
             # Le panneau d'abord, la scene ensuite : `doc["config"]` est pris
             # apres, donc il decrit la colonie posee et non celle d'avant.
             self._apply_template_to_panel(template)
-            self._show_popup(template)
+            self._show_popup(template, source="library")
             doc = (self._stage_state or {}).get("doc")
             if doc is not None:
                 doc["hand_edited"] = True
@@ -2035,7 +2084,7 @@ class PIGeneratorApp:
             self._history.record(pasted, f"Opened {source}", kind="load")
             self._show_screen("build")
             self._apply_template_to_panel(pasted)
-            self._show_popup(pasted)
+            self._show_popup(pasted, source="external")
             doc = (self._stage_state or {}).get("doc")
             if doc is not None:
                 doc["hand_edited"] = True
@@ -2769,7 +2818,8 @@ class PIGeneratorApp:
             stage = {"template": doc.get("template"),
                      "config": doc.get("config"),
                      "hand_edited": bool(doc.get("hand_edited")),
-                     "filed": bool(doc.get("filed"))}
+                     "filed": bool(doc.get("filed")),
+                     "source": doc.get("source") or "draft"}
         return {
             "screen": self._screen,
             "panel": panel,
@@ -2871,7 +2921,8 @@ class PIGeneratorApp:
                 # des structures déplacées à la main, qui ne vivent nulle part
                 # ailleurs.
                 self.current_template = stage["template"]
-                self._show_popup(stage["template"])
+                self._show_popup(stage["template"],
+                                 source=stage.get("source") or "draft")
                 doc = (self._stage_state or {}).get("doc")
                 if doc is not None:
                     doc["hand_edited"] = stage["hand_edited"]
@@ -3085,7 +3136,7 @@ class PIGeneratorApp:
         content.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
 
         ttk.Label(content, text="EVE Online — PI Template Generator", style="Header.TLabel").pack(anchor=tk.W, pady=(0,5))
-        ttk.Label(content, text="Version 4.2", style="Sub.TLabel").pack(anchor=tk.W)
+        ttk.Label(content, text="Version 4.4", style="Sub.TLabel").pack(anchor=tk.W)
         ttk.Label(content, text="\nBased on the Planetary Interaction Template\nGenerator spreadsheet by Razkin.").pack(anchor=tk.W)
         # Le crédit de la bibliothèque livrée a été retiré le 12/08/2026 : la
         # bibliothèque ne contient plus que les colonies bâties par l'utilisateur, donc
@@ -3319,7 +3370,10 @@ class PIGeneratorApp:
         radius_row = tk.Frame(grp4, bg=EVE["bg_card"])
         radius_row.pack(fill=tk.X, padx=8, pady=(2, 4))
         self.diameter_var = tk.StringVar(value="5000")
-        diam_entry = tk.Entry(radius_row, textvariable=self.diameter_var, width=12,
+        # 7 caractères : un rayon s'écrit en 4 ou 5 chiffres. À 12, le champ
+        # poussait l'indication hors de la colonne étroite quand l'ajustement
+        # de fenêtre réduit le texte à 80 %.
+        diam_entry = tk.Entry(radius_row, textvariable=self.diameter_var, width=7,
                               bg=EVE["bg_input"], fg=EVE["fg_bright"],
                               insertbackground=EVE["accent"], relief=tk.FLAT,
                               font=("Consolas", _fs(11)), justify=tk.RIGHT)
@@ -3416,6 +3470,9 @@ class PIGeneratorApp:
 
         self.manual_frame = tk.Frame(self.grp_layout, bg=EVE["bg_card"])
         self.manual_vars = {}
+        # Les étiquettes aussi : sur P0 → P2, « Factories » devient « Advanced »,
+        # parce que c'est ce que le générateur y lit.
+        self.manual_labels = {}
         # Renseignée par la boucle ci-dessous ; _refresh_layout_panel la montre
         # ou la retire selon la chaîne.
         self.arm_row = None
@@ -3447,14 +3504,23 @@ class PIGeneratorApp:
             if pair[0][0] == "arm_length":
                 self.arm_row = line
             for key, label, hi in pair:
-                tk.Label(line, text=label, bg=EVE["bg_card"], fg=EVE["fg_dim"],
-                         font=("Segoe UI", _fs(8)), width=9, anchor=tk.W).pack(side=tk.LEFT)
+                lbl = tk.Label(line, text=label, bg=EVE["bg_card"], fg=EVE["fg_dim"],
+                               font=("Segoe UI", _fs(8)), width=9, anchor=tk.W)
+                lbl.pack(side=tk.LEFT)
+                self.manual_labels[key] = lbl
                 var = tk.StringVar(value="0")
                 sp_box = ttk.Spinbox(line, from_=0, to=hi, textvariable=var, width=4,
                                      font=("Segoe UI", _fs(9)), command=self._on_layout_change)
                 sp_box.pack(side=tk.LEFT, padx=(0, 10))
                 sp_box.bind("<KeyRelease>", lambda e: self._on_layout_change())
                 self.manual_vars[key] = var
+            if pair[0][0] == "factories":
+                # Sur P0 → P2 le nombre du champ n'est pas celui des usines de la
+                # carte : chaque Advanced amène sa Basic. Un facteur deux
+                # inexpliqué entre un champ et la carte se lit comme un bug.
+                self.factories_hint = tk.Label(
+                    self.manual_frame, text="", bg=EVE["bg_card"], fg=EVE["fg_dim"],
+                    font=("Segoe UI", _fs(8)), anchor=tk.W)
 
         # Sources des matériaux — quelle moitié la colonie creuse, quelle moitié
         # elle fait entrer. Une colonie P0 → P2 se voit proposer toute planète
@@ -3816,12 +3882,22 @@ class PIGeneratorApp:
         que le panneau, le générateur et la nomenclature ne puissent pas
         décrire trois colonies différentes.
         """
-        recipe = RECIPES_P1_P2.get(self.product_var.get())
+        product, planet = self.product_var.get(), self.planet_var.get()
+        recipe = RECIPES_P1_P2.get(product)
         if not recipe:
             return ()
-        chosen = {name: IMPORT for name, var in self.sourcing_vars.items()
-                  if var.get()}
-        return material_legs(recipe["input"], self.planet_var.get(), chosen)
+        # Les cases appartiennent à la question pour laquelle elles ont été
+        # dessinées. Changer de planète régénère *avant* que _refresh_layout_panel
+        # les redessine : lue telle quelle, la case « haul in » de Barren, cochée
+        # d'office faute d'Autotrophs, faisait bâtir à Temperate un seul
+        # extracteur sous un panneau affichant « from Autotrophs ». Périmées,
+        # elles se taisent et le sol décide — c'est exactement ce que les cases
+        # redessinées vont montrer.
+        chosen = {}
+        if self._sources_signature == (product, planet):
+            chosen = {name: IMPORT for name, var in self.sourcing_vars.items()
+                      if var.get()}
+        return material_legs(recipe["input"], planet, chosen)
 
     def _rebuild_sources_rows(self):
         """Redessine une ligne par entrée P1, quand la recette ou la planète change.
@@ -3897,18 +3973,10 @@ class PIGeneratorApp:
         a = self.current_analysis
         if not a:
             return
-        counts = a.get("structures", {})
-        ecus = counts.get("Extractor Control Unit", 0)
-        # Le générateur pose le même nombre de têtes sur chaque extracteur et
-        # le champ en attend une par extracteur ; l'analyse renvoie le total.
-        heads_total = a.get("heads", 0)
-        values = {
-            "extractors": ecus,
-            "heads": (heads_total // ecus) if ecus else 0,
-            "factories": sum(c for n, c in counts.items()
-                             if n in PRODUCTION_FACILITIES),
-            "launch_pads": counts.get("Launch Pad", 0),
-        }
+        # Relu dans les unités du générateur : sur P0 → P2, « factories » compte
+        # les Advanced. Recopier le total y doublait la colonie au moment même
+        # où l'on cochait la case — 3 + 3 relus « 6 », regénérés en 6 + 6.
+        values = observed_counts(a, self.chain_var.get())
         for key, var in self.manual_vars.items():
             var.set(str(values.get(key, 0)))
 
@@ -3972,6 +4040,22 @@ class PIGeneratorApp:
         else:
             self.sources_frame.pack_forget()
 
+        # Le champ « Factories » porte le nom de ce qu'il compte, et dit ce que
+        # chaque unité bâtit là où ce n'est pas une usine pour une. Après les
+        # cases de sourçage : haul in change le nombre de Basic par Advanced.
+        self.manual_labels["factories"].config(text=factories_label(chain))
+        self.manual_labels["extractors"].config(text=extractors_label(chain))
+        per_unit = factories_per_unit(chain, self.product_var.get(),
+                                      self.planet_var.get(),
+                                      imported_names(self._sourcing_legs()))
+        if per_unit > 1:
+            self.factories_hint.config(
+                text=f"each Advanced brings {per_unit - 1} Basic with it")
+            self.factories_hint.pack(fill=tk.X, pady=(0, 1),
+                                     after=self.manual_labels["factories"].master)
+        else:
+            self.factories_hint.pack_forget()
+
         # Les implantations bâties sur une géométrie figée ne peuvent pas honorer de compteurs manuels.
         configurable = chain in CONFIGURABLE_CHAINS
         self.manual_chk.state(["!disabled"] if configurable else ["disabled"])
@@ -3994,27 +4078,45 @@ class PIGeneratorApp:
             # N'avoir rien à mesurer, c'est soit « rien de choisi pour l'instant », soit
             # « ce que vous avez choisi ne tient pas » — et le second doit le dire.
             reason = getattr(self, "_preview_error", None)
-            c.create_text(8, 10, anchor=tk.NW, width=max(120, c.winfo_width() - 16),
-                          text=f"⚠ {reason}" if reason
-                               else "Select a product and chain",
-                          fill=EVE["orange"] if reason else EVE["fg_dim"],
-                          font=("Segoe UI", _fs(9)))
-            c.config(height=(_px(26) + _px(14) * (1 + len(reason) // 46)) if reason else _px(26))
+            item = c.create_text(8, 10, anchor=tk.NW, width=max(120, c.winfo_width() - 16),
+                                 text=f"⚠ {reason}" if reason
+                                      else "Select a product and chain",
+                                 fill=EVE["orange"] if reason else EVE["fg_dim"],
+                                 font=("Segoe UI", _fs(9)))
+            # Hauteur mesurée : l'estimation à 46 caractères par ligne valait
+            # pour l'ancienne colonne de 470 px.
+            box = c.bbox(item)
+            c.config(height=max(_px(26), (box[3] if box else 0) + _px(8)))
             return
 
         # Toujours renseigné en même temps que current_preview dans _update_bom ; le seul
         # autre appelant ici est le binding de changement de largeur, qui ne peut pas
         # modifier les options.
-        a = self.current_analysis
-        if a is None:
-            a = analyze_template(tpl, self._layout_options())
-        # Au premier dessin, le canvas n'a pas encore de vraie largeur ; 392 correspond à
-        # la fenêtre de 420 px, et le binding <Configure> redessine une fois en place.
+        draft_a = self.current_analysis
+        if draft_a is None:
+            draft_a = analyze_template(tpl, self._layout_options())
+        # Les jauges, l'autonomie et les avertissements décrivent la colonie de la
+        # scène ; les notes sur les compteurs refusés restent celles du brouillon,
+        # puisqu'elles parlent de ce que le générateur a fait des compteurs.
+        a = self._report_analysis() or draft_a
+        # Au premier dessin, le canvas n'a pas encore de vraie largeur ; on prend celle
+        # que la colonne lui donnera, et le binding <Configure> redessine une fois en place.
+        # Seul « pas encore disposé » (1 px) déclenche le repli : un seuil à 200
+        # remplaçait aussi une vraie largeur étroite par une plus grande, et le
+        # texte débordait du canvas.
         right_x = c.winfo_width() - 8
-        if right_x < 200:
-            right_x = 392
+        if c.winfo_width() < 50:
+            right_x = _px(CONFIG_PANEL_WIDTH) - CONFIG_CANVAS_INSET - 8
         self._layout_drawn_width = c.winfo_width()
         y = 6
+
+        def note(text, fill, font):
+            """Du texte renvoyé à la ligne dans le canvas ; y avance de sa hauteur réelle."""
+            nonlocal y
+            item = c.create_text(8, y, anchor=tk.NW, text=text, fill=fill, font=font,
+                                 width=max(_px(120), right_x - 8))
+            box = c.bbox(item)
+            y = max(y + _px(14), box[3] if box else 0)
 
         def bar(label, used, cap, x0, x1):
             pct = used / cap if cap else 0
@@ -4028,12 +4130,25 @@ class PIGeneratorApp:
             c.create_rectangle(x0, track_y, x0 + (x1 - x0) * min(pct, 1.0), track_y + _px(3),
                                outline="", fill=colour)
 
+        # Côte à côte tant que l'étiquette et ses chiffres tiennent dans une
+        # demi-largeur ; sinon l'une sous l'autre, pleine largeur, plutôt que
+        # « CPU » qui passe sous « 22,977 / 25,415 ».
+        label_w = tkfont.Font(family="Segoe UI", size=_fs(8)).measure("CPU")
+        digits_font = tkfont.Font(family="Consolas", size=_fs(8))
+        need = label_w + _px(8) + max(
+            digits_font.measure(f"{a['cpu_used']:,} / {a['cpu_max']:,}"),
+            digits_font.measure(f"{a['power_used']:,} / {a['power_max']:,}"))
         mid = 8 + (right_x - 8) // 2
-        bar("CPU", a["cpu_used"], a["cpu_max"], 8, mid - 10)
-        bar("PWR", a["power_used"], a["power_max"], mid + 10, right_x)
+        if need <= (mid - 10) - 8:
+            bar("CPU", a["cpu_used"], a["cpu_max"], 8, mid - 10)
+            bar("PWR", a["power_used"], a["power_max"], mid + 10, right_x)
+        else:
+            bar("CPU", a["cpu_used"], a["cpu_max"], 8, right_x)
+            y += _px(22)
+            bar("PWR", a["power_used"], a["power_max"], 8, right_x)
         y += _px(26)
 
-        # Un fait par ligne — à 420 px de large, tout le reste se chevauche.
+        # Un fait par ligne — dans la colonne étroite, tout le reste se chevauche.
         # On nomme toujours la cible : sans elle, une colonie qui dépasse déjà
         # l'intervalle donne l'impression que le réglage est ignoré.
         # « untended » nommait un mode de jeu plutôt que la chose mesurée.
@@ -4051,30 +4166,25 @@ class PIGeneratorApp:
             runs_txt = f"storage lasts {runs:.0f}h  ({target}h asked, already covered)"
         else:
             runs_txt = f"storage lasts {runs:.0f}h  ({target}h asked)"
-        c.create_text(8, y, anchor=tk.NW, text=runs_txt,
-                      fill=EVE["green"] if ok else EVE["orange"],
-                      font=("Segoe UI", _fs(9), "bold"))
-        y += _px(16)
+        # Renvoyée à la ligne : « (48h asked, already covered) » se faisait couper
+        # au bord de la colonne étroite.
+        note(runs_txt, EVE["green"] if ok else EVE["orange"],
+             ("Segoe UI", _fs(9), "bold"))
 
         # Sur une chaîne à géométrie figée, l'intervalle juge la colonie mais ne peut
         # pas la remodeler — donc tous les chiffres au-dessus et tout le bloc HAUL IN
         # restent identiques quel que soit l'intervalle choisi. Ça se lit comme un
         # contrôle cassé si on ne le dit pas explicitement.
         if not configurable:
-            c.create_text(8, y, anchor=tk.NW,
-                          width=max(_px(120), c.winfo_width() - 16),
-                          text="This chain's layout is fixed — the interval "
-                               "checks it, it cannot resize the colony",
-                          fill=EVE["fg_dim"], font=("Segoe UI", _fs(8)))
-            y += _px(14) * 2
+            note("This chain's layout is fixed — the interval "
+                 "checks it, it cannot resize the colony",
+                 EVE["fg_dim"], ("Segoe UI", _fs(8)))
 
         if a["p0_supply_h"]:
             fed = a["p0_supply_h"] >= a["p0_demand_h"]
-            c.create_text(8, y, anchor=tk.NW,
-                          text=f"extract {a['p0_supply_h']:,.0f}/h   ·   factories use "
-                               f"{a['p0_demand_h']:,.0f}/h",
-                          fill=EVE["green"] if fed else EVE["red"], font=("Consolas", _fs(8)))
-            y += _px(16)
+            note(f"extract {a['p0_supply_h']:,.0f}/h   ·   factories use "
+                 f"{a['p0_demand_h']:,.0f}/h",
+                 EVE["green"] if fed else EVE["red"], ("Consolas", _fs(8)))
 
         # Un nombre d'usines manuel supérieur à ce que les pads peuvent asseoir est borné
         # par le générateur, ce qui fige tous les chiffres au-dessus. Il faut le dire,
@@ -4082,20 +4192,40 @@ class PIGeneratorApp:
         layout_opts = self._layout_options()
         clamp_note = factory_clamp_note(
             layout_opts.get("factories"),
-            sum(cnt for name, cnt in a["structures"].items()
-                if name in PRODUCTION_FACILITIES),
-            a["structures"].get("Launch Pad", 0),
+            # Dans l'unité du champ : sur P0 → P2, les Advanced seules.
+            sum(draft_a["structures"].get(kind, 0) for kind in counted_factory_kinds(chain)),
+            draft_a["structures"].get("Launch Pad", 0),
             arm_len=layout_opts.get("arm_length") or MAX_ARM_LEN)
         if clamp_note:
-            c.create_text(8, y, anchor=tk.NW, text=f"⚠ {clamp_note}",
-                          fill=EVE["orange"], font=("Segoe UI", _fs(8)),
-                          width=right_x - 16)
-            y += _px(14) * (1 + len(clamp_note) // 52)
+            note(f"⚠ {clamp_note}", EVE["orange"], ("Segoe UI", _fs(8)))
 
+        # Un compteur manuel que le générateur a borné se dit, au lieu de laisser
+        # le champ afficher 6 pendant que la carte en porte 1. Le champ n'est
+        # jamais réécrit : une valeur qu'on est en train de taper doit rester.
+        if configurable:
+            for rc in rejected_counts(layout_opts, draft_a, chain):
+                # La note des pads dit déjà pourquoi, et quoi faire.
+                if rc.field == "factories" and clamp_note:
+                    continue
+                if rc.field == "extractors" and chain == "P0 → P2 (Extraction)":
+                    why = " — one per raw material dug, see haul in"
+                elif rc.actual < rc.requested:
+                    why = " — capped by the CC budget or layout"
+                else:
+                    why = ""
+                # L'étiquette du champ lui-même, pour que la note pointe un
+                # contrôle qu'on voit.
+                label = self.manual_labels[rc.field].cget("text")
+                # Hauteur mesurée plutôt que devinée : l'estimation à 52
+                # caractères par ligne réservait deux lignes à une note qui
+                # tient sur une, et laissait un trou sous chacune.
+                note(f"⚠ {label}: asked for {rc.requested}, built {rc.actual}{why}",
+                     EVE["orange"], ("Segoe UI", _fs(8)))
+
+        # Même mesure pour les avertissements : l'estimation à 52 caractères
+        # valait pour la colonne de 470 px, et sous-comptait les lignes à 340.
         for warn in a["warnings"]:
-            c.create_text(8, y, anchor=tk.NW, text=f"⚠ {warn}", fill=EVE["red"],
-                          font=("Segoe UI", _fs(8)), width=right_x - 16)
-            y += _px(14) * (1 + len(warn) // 52)
+            note(f"⚠ {warn}", EVE["red"], ("Segoe UI", _fs(8)))
         c.config(height=max(_px(56), y + 2))
 
     def _required_p0(self, product, chain_name):
@@ -4207,6 +4337,34 @@ class PIGeneratorApp:
                 _debug(f"_sync_live_popup failed: {exc}")
 
         self._live_sync_job = self.root.after(140, _push)
+
+    def _report_analysis(self):
+        """L'analyse de la colonie sur la scène, ou None quand la scène est vide.
+
+        Portage de l'outil web (2026-09-13) : la nomenclature et les jauges
+        lisent la colonie montrée, qui suit un glisser, une suggestion de
+        stockage ou « Route storage » — ce que l'aperçu du brouillon ne fait pas.
+        Posée par `_refresh_budget` de la scène.
+        """
+        state = getattr(self, "_stage_state", None) or {}
+        if state.get("doc") is None:
+            return None
+        return state.get("analysis")
+
+    def _report_template(self):
+        """Le template de la colonie montrée : celui de la scène, sinon l'aperçu."""
+        state = getattr(self, "_stage_state", None) or {}
+        doc = state.get("doc")
+        if doc is not None and doc.get("template") is not None:
+            return doc["template"]
+        return self.current_preview
+
+    def _redraw_report(self):
+        """Redessine le panneau d'implantation et la nomenclature sans rien regénérer."""
+        if self.current_preview is None:
+            return
+        self._refresh_layout_panel()
+        self._draw_bom()
 
     def _redraw_bom(self):
         """Redessine la BOM après un changement de largeur du canvas."""
@@ -4377,8 +4535,30 @@ class PIGeneratorApp:
         self._auto_open_stage()
         # La nomenclature vient de changer de hauteur : la fenêtre suit.
         self._schedule_fit()
+        self._draw_bom()
 
-        self.bom_product_lbl.config(text=product)
+    def _draw_bom(self):
+        """Dessine la nomenclature de la colonie montrée, sans regénérer l'aperçu."""
+        c = self.bom_canvas
+        product = self.product_var.get()
+        chain_info = CHAINS.get(self.chain_var.get())
+        recipe = chain_info["recipes"].get(product) if chain_info else None
+        if not recipe:
+            return
+        c.delete("all")
+        analysis = self._report_analysis() or self.current_analysis
+
+        # Le nom du produit partage l'en-tête avec « BILL OF MATERIALS » : dans la
+        # colonne étroite, « Transcranial Microcontrollers » se faisait couper
+        # au lieu de passer sur deux lignes.
+        header = self.bom_product_lbl.master
+        title_w = sum(w.winfo_reqwidth() for w in header.winfo_children()
+                      if w is not self.bom_product_lbl)
+        header_w = header.winfo_width()
+        if header_w < 50:          # pas encore disposé → largeur de la colonne
+            header_w = _px(CONFIG_PANEL_WIDTH) - CONFIG_CANVAS_INSET - 8
+        self.bom_product_lbl.config(text=product, justify=tk.RIGHT,
+                                    wraplength=max(_px(80), header_w - title_w - _px(10)))
 
         TIER_CLR = {
             "P0": "#7a7a9a", "P1": "#88c0d0", "P2": "#a3be8c",
@@ -4392,21 +4572,43 @@ class PIGeneratorApp:
         # soient jamais coupés.
         c.update_idletasks()
         right_x = c.winfo_width() - 10
-        if right_x < 200:          # pas encore disposé (1re construction) → repli fenêtre 420 px
-            right_x = _px(372)
+        if c.winfo_width() < 50:   # pas encore disposé (1re construction) → largeur de la colonne
+            right_x = _px(CONFIG_PANEL_WIDTH) - CONFIG_CANVAS_INSET - 10
+
+        label_font = tkfont.Font(family="Segoe UI", size=_fs(9))
+        value_font = tkfont.Font(family="Consolas", size=_fs(9))
+        label_gap = _px(8)
+
+        def draw_label(x, text, color, limit_x):
+            """Un nom à gauche de ses chiffres ; renvoie la hauteur ajoutée.
+
+            Tient sur une ligne : dessiné comme avant, centré sur y. Sinon il se
+            renvoie à la ligne sous lui-même au lieu de passer sous les chiffres
+            (« Transcranial Microcontrollers » dans la colonne étroite), et les
+            chiffres restent sur sa première ligne.
+            """
+            if label_font.measure(text) <= limit_x - x:
+                c.create_text(x, y, anchor=tk.W, text=text,
+                              fill=color, font=("Segoe UI", _fs(9)))
+                return 0
+            line = label_font.metrics("linespace")
+            item = c.create_text(x, y - line // 2, anchor=tk.NW, text=text,
+                                 fill=color, font=("Segoe UI", _fs(9)),
+                                 width=max(_px(60), limit_x - x))
+            box = c.bbox(item)
+            return max(0, (box[3] - box[1]) - line) if box else 0
 
         def draw_row(label, value, color, indent=0):
             nonlocal y
-            c.create_text(8 + indent, y, anchor=tk.W, text=label,
-                          fill=color, font=("Segoe UI", _fs(9)))
+            limit_x = right_x - (value_font.measure(value) + label_gap if value else 0)
+            extra = draw_label(8 + indent, label, color, limit_x)
             if value:
                 c.create_text(right_x, y, anchor=tk.E, text=value,
                               fill=color, font=("Consolas", _fs(9)))
-            y += lh
+            y += lh + extra
 
-        rows = (throughput_rows(self.current_analysis, product,
-                                chain_info["facility"])
-                if self.current_analysis else None)
+        rows = (throughput_rows(analysis, product, chain_info["facility"])
+                if analysis else None)
 
         facilities = rows["facilities"] if rows else []
         if facilities:
@@ -4439,7 +4641,7 @@ class PIGeneratorApp:
             # lequel on charge un hauler — le débit horaire ne l'a jamais été.
             # Borné à ce que le stockage encaisse : demander 48 h à une colonie qui sature
             # à 33, ce n'est pas une plus grosse cargaison, c'est 15 heures à l'arrêt.
-            trip = trip_interval(self.current_analysis, self.interval_var.get())
+            trip = trip_interval(analysis, self.interval_var.get())
             trip_h = trip.effective
             # Arrondi pour l'étiquette seulement. Le calcul garde toutes les décimales :
             # 501,6 m³/h sur 33,245 h réelles, c'est 22 m³ de plus que sur « 33,2 ».
@@ -4467,21 +4669,21 @@ class PIGeneratorApp:
             def draw_flows(flows, indent=4):
                 for flow in flows:
                     clr = TIER_CLR.get(flow.tier, EVE["fg"])
-                    c.create_text(8 + indent, y, anchor=tk.W, text=f"  {flow.name}",
-                                  fill=clr, font=("Segoe UI", _fs(9)))
-                    c.create_text(per_hour_x, y, anchor=tk.E,
-                                  text=f"{_num(flow.per_hour)}/h",
+                    hour_txt = f"{_num(flow.per_hour)}/h"
+                    extra = draw_label(8 + indent, f"  {flow.name}", clr,
+                                       per_hour_x - digits.measure(hour_txt) - label_gap)
+                    c.create_text(per_hour_x, y, anchor=tk.E, text=hour_txt,
                                   fill=clr, font=("Consolas", _fs(9)))
                     c.create_text(per_trip_x, y, anchor=tk.E,
                                   text=_num(flow.per_hour * trip_h),
                                   fill=clr, font=("Consolas", _fs(9), "bold"))
                     c.create_text(tier_x, y, anchor=tk.E, text=f"[{flow.tier}]",
                                   fill=clr, font=("Consolas", _fs(9)))
-                    _advance()
+                    _advance(extra)
 
-            def _advance():
+            def _advance(extra=0):
                 nonlocal y
-                y += lh
+                y += lh + extra
 
             def draw_flow_header(text, color):
                 """Intitulés de colonnes, pour que le nombre du milieu dise ce qu'il compte."""
@@ -4533,7 +4735,7 @@ class PIGeneratorApp:
                 draw_subtotal(rows["haul_in_m3_h"])
                 # Une quantité importée se lit pareil qu'il s'agisse d'un import délibéré
                 # ou d'extracteurs qui ne suivent pas. Autant dire lequel.
-                note = factory_coverage_note(factory_coverage(self.current_analysis))
+                note = factory_coverage_note(factory_coverage(analysis))
                 if note:
                     draw_note(note[0], EVE["orange"])
                     draw_note(note[1], EVE["fg_dim"])
@@ -4549,6 +4751,83 @@ class PIGeneratorApp:
                              EVE["fg_dim"], indent=4)
                     draw_flows(rows["surplus"], indent=8)
                 draw_subtotal(rows["collect_m3_h"])
+
+            # Les étapes entre ce qui monte et ce qui redescend : HAUL IN et
+            # COLLECT ne montrent que les deux bouts, et les usines du milieu ne
+            # disaient rien. Fabriqué et utilisé par heure, côte à côte — une
+            # paire qui diffère est l'écart que HAUL IN ou COLLECT transporte.
+            intermediates = intermediate_rows(analysis)
+            if intermediates:
+                c.create_text(8, y, anchor=tk.W,
+                              text="⇄ INTERMEDIATES · made and used on-planet",
+                              fill=EVE["fg_dim"], font=("Segoe UI", _fs(9)))
+                _advance()
+                c.create_text(per_hour_x, y, anchor=tk.E, text="made /h",
+                              fill=EVE["fg_dim"], font=("Segoe UI", _fs(7)))
+                c.create_text(per_trip_x, y, anchor=tk.E, text="used /h",
+                              fill=EVE["fg_dim"], font=("Segoe UI", _fs(7), "bold"))
+                _advance()
+                for row in intermediates:
+                    clr = TIER_CLR.get(row.tier, EVE["fg"])
+                    made_txt = _num(row.made_per_hour)
+                    extra = draw_label(12, f"  {row.name}", clr,
+                                       per_hour_x - digits.measure(made_txt) - label_gap)
+                    c.create_text(per_hour_x, y, anchor=tk.E, text=made_txt,
+                                  fill=clr, font=("Consolas", _fs(9)))
+                    c.create_text(per_trip_x, y, anchor=tk.E,
+                                  text=_num(row.used_per_hour),
+                                  fill=clr, font=("Consolas", _fs(9), "bold"))
+                    c.create_text(tier_x, y, anchor=tk.E, text=f"[{row.tier}]",
+                                  fill=clr, font=("Consolas", _fs(9)))
+                    _advance(extra)
+
+        # ── Les routes, dans l'ordre du template ──────────────────────────
+        # Portage de la table « Routes » de l'outil web, fermée par défaut comme
+        # elle : une colonie P1 → P3 en porte 92, et les dérouler d'office
+        # noierait la nomenclature. L'ordre est celui du JSON — la ligne 1 est
+        # R[0] — parce que s'aligner sur le JSON est la seule raison de montrer
+        # des routes brutes. Lues sur la colonie montrée, comme le reste.
+        routes = route_rows(self._report_template() or {})
+        opened = getattr(self, "_routes_open", False)
+        y += 4
+        c.create_line(8, y, right_x, y, fill=EVE["border"], width=1)
+        y += lh // 2 + 4
+        c.create_text(8, y, anchor=tk.W,
+                      text=f"{'▾' if opened else '▸'} ROUTES · {len(routes)} in template order",
+                      fill=EVE["accent_text"], font=("Segoe UI", _fs(9)),
+                      tags=("routes_toggle",))
+        y += lh
+        if opened and not routes:
+            c.create_text(12, y, anchor=tk.W, text="This template has no routes.",
+                          fill=EVE["fg_dim"], font=("Segoe UI", _fs(8)))
+            y += lh
+        elif opened:
+            numbers = tkfont.Font(family="Consolas", size=_fs(9))
+            text_x = 8 + numbers.measure(str(len(routes))) + _px(10)
+            for row in routes:
+                clr = TIER_CLR.get(get_tier(row.commodity), EVE["fg"])
+                c.create_text(8, y, anchor=tk.W, text=str(row.number),
+                              fill=EVE["fg_dim"], font=("Consolas", _fs(9)))
+                c.create_text(text_x, y, anchor=tk.W, text=row.commodity,
+                              fill=clr, font=("Segoe UI", _fs(9)))
+                c.create_text(right_x, y, anchor=tk.E, text=_num(row.quantity),
+                              fill=clr, font=("Consolas", _fs(9)))
+                path = c.create_text(
+                    text_x, y + lh // 2 - 1, anchor=tk.NW,
+                    text=" → ".join(str(n) for n in row.path) + "\n"
+                         + " → ".join(row.waypoints),
+                    fill=EVE["fg_dim"], font=("Segoe UI", _fs(7)),
+                    width=max(_px(120), right_x - text_x))
+                box = c.bbox(path)
+                y = (box[3] if box else y + lh) + lh // 2 + 2
+
+        def _toggle_routes(_event=None):
+            self._routes_open = not getattr(self, "_routes_open", False)
+            self._draw_bom()
+
+        c.tag_bind("routes_toggle", "<Button-1>", _toggle_routes)
+        c.tag_bind("routes_toggle", "<Enter>", lambda _e: c.config(cursor="hand2"))
+        c.tag_bind("routes_toggle", "<Leave>", lambda _e: c.config(cursor=""))
 
         c.config(height=max(80, y + 8))
         # On redimensionne la fenêtre principale au contenu après un changement de hauteur de BOM
@@ -4930,7 +5209,7 @@ class PIGeneratorApp:
                 return
             self.current_template = template
             close_popup()
-            self._show_popup(template)
+            self._show_popup(template, source="history")
 
         def _save_to_library(_event=None):
             """Promeut un état enregistré en template nommé de la bibliothèque.
@@ -5415,7 +5694,12 @@ class PIGeneratorApp:
         except Exception:
             pass
         popup.configure(bg=EVE["bg_deep"])
-        popup.geometry(_load_window_config().get("mixed_geometry", "560x680"))
+        # Seule la position enregistrée est reprise. La taille se calcule sur le
+        # contenu à la fin : une colonie de 23 usines ne tenait pas dans les
+        # 560x680 d'origine, et une taille enregistrée pour une autre colonie
+        # coupait la liste ou le bouton GENERATE MIXED.
+        saved = re.search(r"[+-]-?\d+[+-]-?\d+$",
+                          _load_window_config().get("mixed_geometry", ""))
         popup.minsize(440, 420)
         apply_window_border(popup)
 
@@ -5462,17 +5746,18 @@ class PIGeneratorApp:
                 return
 
             y = [10]
-            right = max(240, summary.winfo_width() - 12)
+            summary_w[0] = summary.winfo_width()
+            right = max(_px(240), summary.winfo_width() - 12)
 
             def row(label, value="", color=None, indent=0, bold=False):
                 summary.create_text(10 + indent, y[0], anchor=tk.NW, text=label,
                                     fill=color or EVE["fg"],
                                     font=("Segoe UI", _fs(9), "bold") if bold
-                                    else ("Segoe UI", 9))
+                                    else ("Segoe UI", _fs(9)))
                 if value:
                     summary.create_text(right, y[0], anchor=tk.NE, text=value,
                                         fill=color or EVE["fg"], font=("Consolas", _fs(9)))
-                y[0] += 17
+                y[0] += _px(17)
 
             row("FACTORY ALLOCATION", "", EVE["accent_text"], bold=True)
             for name, count in sorted(batch.assignments):
@@ -5497,16 +5782,31 @@ class PIGeneratorApp:
             # rien, donc arrondir au-dessus promettrait une production que le pad ne nourrit pas.
             row("RUNS FOR", f"{batch.cycles:,} h   ({batch.days:,.1f} d)",
                 EVE["accent_text"], bold=True)
-            summary.config(height=max(120, y[0] + 10))
+            summary.config(height=max(_px(120), y[0] + 10))
 
+        # Les valeurs s'alignent sur le bord droit mesuré au dessin : le premier
+        # dessin a lieu avant que la fenêtre ait sa taille, il faut donc redessiner
+        # quand la largeur arrive — et seulement la largeur, puisque le dessin
+        # fixe la hauteur.
+        summary_w = [0]
+        summary.bind("<Configure>", lambda e: _draw_summary()
+                     if e.width != summary_w[0] else None)
+
+        # Deux colonnes au-delà de 8 usines : en une seule, les 23 sélecteurs
+        # d'une colonie ordinaire faisaient à eux seuls plus de 600 px.
+        columns = 1 if factory_count <= 8 else 2
+        per_column = -(-factory_count // columns)
+        for col in range(columns):
+            sel_frame.columnconfigure(col, weight=1, uniform="factories")
         for i in range(factory_count):
             line = tk.Frame(sel_frame, bg=EVE["bg_card"])
-            line.pack(fill=tk.X, padx=6, pady=2)
+            line.grid(row=i % per_column, column=i // per_column,
+                      sticky="ew", padx=6, pady=2)
             tk.Label(line, text=f"Factory {i + 1}", width=10, anchor=tk.W,
                      bg=EVE["bg_card"], fg=EVE["fg_dim"],
                      font=("Segoe UI", _fs(9))).pack(side=tk.LEFT)
             var = tk.StringVar(value=assignments[i])
-            combo = ttk.Combobox(line, textvariable=var, values=products,
+            combo = ttk.Combobox(line, textvariable=var, values=products, width=22,
                                  state="readonly", font=("Segoe UI", _fs(9)))
             combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
             combo.bind("<<ComboboxSelected>>", lambda _e: _draw_summary())
@@ -5542,7 +5842,7 @@ class PIGeneratorApp:
                 mixed, "Mixed P2 · " + ", ".join(dict.fromkeys(assignments)),
                 kind="mixed")
             close_popup()
-            self._show_popup(mixed)
+            self._show_popup(mixed, source="mixed")
 
         tk.Button(btns, text="▶  GENERATE MIXED", font=("Segoe UI", _fs(10), "bold"),
                   bg=EVE["accent_dim"], fg=EVE["fg_bright"],
@@ -5552,6 +5852,18 @@ class PIGeneratorApp:
 
         popup.update_idletasks()
         _draw_summary()
+        # La taille que demande le contenu, résumé dessiné compris, bornée à
+        # l'écran. Centrée sur la fenêtre principale à la première ouverture.
+        popup.update_idletasks()
+        width = max(_px(560), popup.winfo_reqwidth())
+        height = min(popup.winfo_reqheight(), popup.winfo_screenheight() - 60)
+        if saved:
+            position = saved.group(0)
+        else:
+            x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - width) // 2)
+            y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - height) // 2)
+            position = f"+{x}+{max(0, y)}"
+        popup.geometry(f"{width}x{height}{position}")
         popup.lift()
         popup.focus_force()
 
@@ -5638,7 +5950,7 @@ class PIGeneratorApp:
                 self.root.after_cancel(job)
             except Exception:
                 pass
-        for key in ("tooltip_win", "timer", "notice"):
+        for key in ("tooltip_win", "details_win", "timer", "notice"):
             widget = state.pop(key, None)
             if widget is not None:
                 try:
@@ -5650,7 +5962,7 @@ class PIGeneratorApp:
         for child in self._stage_host.winfo_children():
             child.destroy()
 
-    def _show_popup(self, template):
+    def _show_popup(self, template, source="draft"):
         """Dessine la colonie sur la moitié droite de la fenêtre.
 
         C'était une fenêtre à part, « Generated PI Template ». Les deux moitiés
@@ -5658,6 +5970,12 @@ class PIGeneratorApp:
         produisent — et regarder l'effet d'un réglage demandait d'aller chercher
         l'autre fenêtre. Le nom de la méthode est resté : quatre appelants la
         connaissent, et ce qu'elle fait n'a pas changé, seulement où.
+
+        « source » dit d'où vient la colonie : « draft » pour ce que le panneau
+        a généré, « library », « external » ou « history » pour une colonie
+        venue d'ailleurs, « mixed » pour le planificateur P2 mixte. Portage du
+        `stageSource` de l'outil web : seule une colonie du brouillon a un
+        template par défaut où revenir, ou une chaîne à changer.
         """
         # Une colonie venue d'ailleurs — bibliothèque, JSON, historique — n'est
         # pas la ligne choisie : le panneau revient à la chaîne plutôt que de
@@ -5689,7 +6007,8 @@ class PIGeneratorApp:
                # chose à remplacer ceci ». Une colonie qu'on vient d'ouvrir
                # depuis la bibliothèque est arrangée *et* classée : la protéger
                # d'un rebuild est juste, demander de l'enregistrer ne l'est pas.
-               "filed": False}
+               "filed": False,
+               "source": source}
         # La fenêtre JSON lit ceci, et non `current_preview` : après un glisser,
         # les deux diffèrent, et exporter l'aperçu du panneau rendrait la colonie
         # d'avant le déplacement. C'est ce qu'on est *en train de regarder* qui
@@ -5717,10 +6036,46 @@ class PIGeneratorApp:
             view_state["fit"] = None
             self._draw_map(map_canvas, doc["template"], view_state)
 
-        tk.Button(btn_bar, text="🔄 Reset View", font=("Segoe UI", _fs(9), "bold"),
-                  bg=EVE["bg_card"], fg=EVE["fg"], activebackground=EVE["border_hi"],
-                  activeforeground=EVE["fg_bright"], relief=tk.FLAT, cursor="hand2",
-                  command=reset_view).pack(side=tk.LEFT, padx=(10, 0))
+        reset_view_btn = tk.Button(btn_bar, text="🔄 Reset View", font=("Segoe UI", _fs(9), "bold"),
+                                   bg=EVE["bg_card"], fg=EVE["fg"], activebackground=EVE["border_hi"],
+                                   activeforeground=EVE["fg_bright"], relief=tk.FLAT, cursor="hand2",
+                                   command=reset_view)
+        reset_view_btn.pack(side=tk.LEFT, padx=(10, 0))
+        self._stage_state["reset_view_btn"] = reset_view_btn
+
+        def reset_template():
+            """Remet la colonie que le générateur a faite, en gardant chaque réglage.
+
+            Demandé sur la planète de l'outil web : *« reset the template to the
+            default one ... the first one generated »*. Laisse tomber les
+            déplacements, les structures ajoutées ou retirées et une suggestion de
+            stockage appliquée ; garde tous les réglages du panneau, ce qui le
+            distingue de « Start over ». Pas de dialogue, comme les autres
+            réglages.
+            """
+            preview = self.current_preview
+            if preview is None or doc.get("source") != "draft":
+                return
+            doc["template"] = preview
+            doc["hand_edited"] = False
+            doc["filed"] = False
+            doc["config"] = self._stage_config()
+            _stage_refusal(None)
+            self._draw_map(map_canvas, doc["template"], view_state)
+            _refresh_budget()
+            _refresh_json()
+            self._history.record(doc["template"], "Reset template", kind="edit")
+
+        # Présent seulement pour une colonie du brouillon : une colonie venue de
+        # la bibliothèque ou d'un fichier n'a pas de colonie générée où revenir.
+        reset_template_btn = tk.Button(
+            btn_bar, text="↶ Reset template", font=("Segoe UI", _fs(9), "bold"),
+            bg=EVE["bg_card"], fg=EVE["fg"], activebackground=EVE["border_hi"],
+            activeforeground=EVE["fg_bright"], disabledforeground=EVE["fg_dim"],
+            relief=tk.FLAT, cursor="hand2", command=reset_template)
+        reset_template_btn.pack(side=tk.LEFT, padx=(10, 0))
+        # Pas encore view_state : il est lié plus bas, sur le même dict.
+        self._stage_state["reset_template_btn"] = reset_template_btn
 
         def save_to_library():
             # doc["template"], et pas celui avec lequel cette fenêtre s'est ouverte : ce
@@ -5743,6 +6098,43 @@ class PIGeneratorApp:
                   bg=EVE["bg_card"], fg=EVE["fg"], activebackground=EVE["border_hi"],
                   activeforeground=EVE["fg_bright"], relief=tk.FLAT, cursor="hand2",
                   command=self._start_over).pack(side=tk.LEFT, padx=(10, 0))
+
+        def route_storage():
+            """Relie chaque launch pad et entrepôt aux usines qu'il peut nourrir.
+
+            Pour un entrepôt arrivé sans route — une colonie importée, ou posée
+            en jeu. EVE n'admet aucune route entre deux entrepôts : un hub ne se
+            rend utile qu'en nourrissant les usines. Portage du bouton de
+            « Structures & budget » dans l'outil web.
+            """
+            try:
+                routed = route_hubs(parse_colony(doc["template"]))
+            except (ParseError, EditError) as exc:
+                # Le refus se lit sur la planète, comme celui d'un réglage.
+                _stage_refusal(str(exc))
+                return
+            added = len(routed.routes) - len(doc["template"].get("R", []))
+            doc["template"] = routed.to_template()
+            # Des routes qu'aucun générateur n'écrit : un rebuild les perdrait,
+            # exactement comme il perdrait un glisser.
+            doc["hand_edited"] = True
+            _stage_refusal(None)
+            self._draw_map(map_canvas, doc["template"], view_state)
+            _refresh_budget()
+            _refresh_json()
+            self._history.record(doc["template"], f"Routed storage ({added} routes)",
+                                 kind="edit")
+            messagebox.showinfo(
+                "Route storage to factories",
+                f"Added {added} {'route' if added == 1 else 'routes'}.\n\n"
+                "Storage facilities do not receive imports: on each visit, move "
+                "the inputs into them with an Expedited Transfer from a launch pad.",
+                parent=popup)
+
+        tk.Button(btn_bar, text="🔗 Route storage", font=("Segoe UI", _fs(9), "bold"),
+                  bg=EVE["bg_card"], fg=EVE["fg"], activebackground=EVE["border_hi"],
+                  activeforeground=EVE["fg_bright"], relief=tk.FLAT, cursor="hand2",
+                  command=route_storage).pack(side=tk.LEFT, padx=(10, 0))
 
         # Permanent, pas soulevé par un clic. Qu'EVE signale une implantation
         # qu'il ne peut pas poser ou qu'il la réécrive en silence tient à une
@@ -5777,13 +6169,15 @@ class PIGeneratorApp:
         def _counters_can_act():
             """Les compteurs savent-ils faire quelque chose de cette colonie.
 
-            Deux schémas d'usine les verrouillent : une chaîne P0 → P2 ne peut
-            être ni agrandie ni réduite d'une seule usine sans casser la paire.
-            L'écart reste montré, mais sans bouton — un bouton qui ne pourrait
-            qu'échouer est pire que pas de bouton.
+            Une colonie P0 → P2 avance par jeux entiers depuis le 2026-09-13 : le
+            bandeau les compte en jeux, et son bouton en passe le nombre. Seule
+            une colonie sans ratio de jeu — deux produits avancés, une usine
+            high-tech — reste verrouillée. L'écart y reste montré, mais sans
+            bouton : un bouton qui ne pourrait qu'échouer est pire que pas de
+            bouton. La même question que `editability`, comme dans l'outil web.
             """
             try:
-                return not mixed_schematics(parse_colony(doc["template"]))
+                return editability(parse_colony(doc["template"]))["factories"] is None
             except (ParseError, EditError):
                 return False
 
@@ -5812,18 +6206,116 @@ class PIGeneratorApp:
                     if timer is not None:
                         timer.update(a, self.interval_var.get())
                     if notice is not None:
-                        # Les compteurs se verrouillent sur une colonie à deux
-                        # schémas d'usine : l'écart reste montré, sans bouton.
-                        notice.update(a, can_act=_counters_can_act())
+                        # Les compteurs se verrouillent sur une colonie sans
+                        # ratio de jeu : l'écart reste montré, sans bouton.
+                        # Les pins comptent une colonie P0 → P2 en jeux.
+                        shown = tpl if tpl is not None else doc["template"]
+                        notice.update(a, can_act=_counters_can_act(),
+                                      pins=shown.get("P", []),
+                                      storage=_storage_offer(a, shown))
                 except tk.TclError:
                     pass
                 except Exception as exc:
                     _debug(f"stage overlay refresh failed: {exc}")
+                _sync_reset_template()
+                # Le panneau de gauche décrit la colonie de la scène, comme la
+                # jauge et la minuterie : il lisait l'aperçu du brouillon, et
+                # après la suggestion de stockage il continuait d'annoncer 39,9 h
+                # sous une minuterie à 87,7 h. Redessiné seulement quand
+                # l'analyse a changé, ce qui coupe court à tout aller-retour
+                # entre ce rappel et _update_bom.
+                routes_now = doc["template"].get("R") or []
+                if tpl is None and (view_state.get("analysis") != a
+                                    or view_state.get("report_routes") != routes_now):
+                    view_state["analysis"] = a
+                    # Une route ajoutée ne change pas toujours l'analyse, et la
+                    # liste des routes du panneau doit la montrer quand même.
+                    view_state["report_routes"] = copy.deepcopy(routes_now)
+                    try:
+                        self._redraw_report()
+                    except Exception as exc:
+                        _debug(f"report redraw from stage failed: {exc}")
+
+        def _storage_offer(analysis, shown):
+            """La suggestion de stockage de la colonie montrée, ou None si elle tient sa tournée.
+
+            Hors planificateur P2 mixte, qui dimensionne ses lots sur bufferM3
+            lui-même. Mise en cache par colonie : l'échange de jeux peut coûter
+            deux dixièmes de seconde sur une grosse colonie P2 → P3 à la semaine,
+            et ce rappel part à chaque rafraîchissement.
+            """
+            hours = self.interval_var.get()
+            if doc.get("source") == "mixed" or not analysis["buffer_hours"] < hours:
+                return None
+            yield_per_head = self._layout_options()["yield_per_head"]
+            key = (json.dumps(shown, sort_keys=True, default=str), hours, yield_per_head,
+                   doc.get("source"))
+            cached = view_state.get("storage_offer")
+            if cached is not None and cached[0] == key:
+                return cached[1]
+            offer = None
+            suggestion = storage_suggestion(shown, hours, yield_per_head)
+            if suggestion is not None:
+                switch = None
+                # La dernière réponse quand rien ne tient et que rien ne s'échange :
+                # le même produit depuis le palier au-dessus. Seulement pour la
+                # colonie du brouillon, puisque c'est sa chaîne qui change.
+                if (suggestion.kind == "none" and suggestion.reason == "budget"
+                        and doc.get("source") == "draft"):
+                    switch = higher_tier_chain(self._bom_config())
+                offer = {"suggestion": suggestion, "switch": switch, "requested": hours}
+            view_state["storage_offer"] = (key, offer)
+            return offer
+
+        def _sync_reset_template():
+            """« Reset template » n'existe que pour une colonie du brouillon, et n'agit que si elle a bougé."""
+            button = view_state.get("reset_template_btn")
+            if button is None:
+                return
+            try:
+                if doc.get("source") != "draft":
+                    button.pack_forget()
+                    return
+                if not button.winfo_ismapped():
+                    button.pack(side=tk.LEFT, padx=(10, 0),
+                                after=view_state.get("reset_view_btn") or None)
+                preview = self.current_preview
+                changed = preview is not None and doc["template"] != preview
+                button.config(state=tk.NORMAL if changed else tk.DISABLED)
+                # Montré ou caché, le bouton change la place de l'astuce sans
+                # que la barre elle-même change de taille.
+                btn_bar.after_idle(_fit_hint)
+            except tk.TclError:
+                pass
 
         zoom_label = tk.Label(btn_bar, text="Drag a building to move it · Scroll: Zoom · Drag: Pan",
                               font=("Segoe UI", _fs(8)),
                               bg=EVE["bg_deep"], fg=EVE["fg_dim"])
         zoom_label.pack(side=tk.RIGHT)
+
+        # L'astuce prend la place qui reste entre les boutons et le budget. Elle
+        # était déjà rognée en plein mot à la largeur d'ouverture, et « Reset
+        # template » lui a pris encore 110 px : la plus longue formulation qui
+        # tient gagne, plutôt qu'une phrase coupée au milieu d'un mot.
+        hint_texts = ("Drag a building to move it · Scroll: Zoom · Drag: Pan",
+                      "Drag a building to move it · Scroll: Zoom",
+                      "Drag: move · Scroll: zoom", "")
+        hint_font = tkfont.Font(font=zoom_label.cget("font"))
+
+        def _fit_hint(_event=None):
+            try:
+                left = max((w.winfo_x() + w.winfo_width() for w in btn_bar.winfo_children()
+                            if isinstance(w, tk.Button) and w.winfo_ismapped()), default=0)
+                room = budget_lbl.winfo_x() - 10 - left - 8
+                # Avant la première disposition, la place peut être négative : rien.
+                text = next((t for t in hint_texts if hint_font.measure(t) <= room), "")
+                if zoom_label.cget("text") != text:
+                    zoom_label.config(text=text)
+            except tk.TclError:
+                pass
+
+        btn_bar.bind("<Configure>", _fit_hint, add="+")
+        budget_lbl.bind("<Configure>", _fit_hint, add="+")
 
         json_text = scrolledtext.ScrolledText(top_frame, height=10, wrap=tk.WORD,
                                               bg=EVE["bg_input"], fg=EVE["json_fg"],
@@ -5897,8 +6389,41 @@ class PIGeneratorApp:
             self._history.record(doc["template"],
                                  f"{verb} {applied} to match the ground", kind="edit")
 
+        def _apply_storage(suggestion):
+            """Pose la colonie que la suggestion de stockage a calculée.
+
+            Le chemin d'un glisser : les entrepôts et leurs routes, ou les jeux
+            retirés, ne sont écrits par aucun générateur, donc un rebuild les
+            perdrait — la colonie devient arrangée à la main.
+            """
+            if suggestion is None or suggestion.template is None:
+                return
+            doc["template"] = suggestion.template
+            doc["hand_edited"] = True
+            doc["filed"] = False
+            _stage_refusal(None)
+            self._draw_map(map_canvas, doc["template"], view_state)
+            _refresh_budget()
+            _refresh_json()
+            noun = "facility" if suggestion.count == 1 else "facilities"
+            if suggestion.kind == "trade":
+                sets = "set" if suggestion.sets == 1 else "sets"
+                label = (f"Removed {suggestion.sets} production {sets}, "
+                         f"added {suggestion.count} storage {noun}")
+            else:
+                label = f"Added {suggestion.count} storage {noun}"
+            self._history.record(doc["template"], label, kind="edit")
+
+        def _switch_chain(chain_name):
+            """Le même produit depuis le palier au-dessus : c'est la chaîne du panneau qui change."""
+            self._variant_pick = None
+            self._set_chain(chain_name)
+            self._on_chain_changed()
+
         view_state["notice"] = StageNotice(map_frame, on_apply=_apply_balance,
-                                           top=self._collect_bar.height() + 6)
+                                           top=self._collect_bar.height() + 6,
+                                           on_storage=_apply_storage,
+                                           on_switch=_switch_chain)
 
         # Le panoramique déplace les objets déjà dessinés (tag « map ») — aucun redessin,
         # aucun scintillement. Le zoom les met à l'échelle sur place pour un retour
@@ -5918,12 +6443,16 @@ class PIGeneratorApp:
             """L'infobulle est désormais une fenêtre : le panoramique et le glisser
             doivent donc la fermer explicitement — il n'y a plus de tag de canvas
             à supprimer."""
-            tip = view_state.pop("tooltip_win", None)
-            if tip is not None:
-                try:
-                    tip.destroy()
-                except Exception:
-                    pass
+            unfocus = view_state.get("unfocus")
+            if unfocus is not None:
+                unfocus()
+            for key in ("tooltip_win", "details_win"):
+                tip = view_state.pop(key, None)
+                if tip is not None:
+                    try:
+                        tip.destroy()
+                    except Exception:
+                        pass
 
         # ── Déplacer une structure ────────────────────────────────────────
         # Validé une seule fois, au relâchement. Chaque image réécrirait le document des
@@ -5946,6 +6475,7 @@ class PIGeneratorApp:
                 return None
             grab["pin"] = pin_idx
             grab["moved"] = False
+            view_state["dragging_pin"] = pin_idx
             return "break"
 
         def on_structure_drag(event):
@@ -5970,6 +6500,8 @@ class PIGeneratorApp:
                 return None
             pin_idx, moved_at_all = grab["pin"], grab["moved"]
             grab["pin"] = None
+            # Plus rien en main : le prochain dessin n'écrit plus la raison.
+            view_state["dragging_pin"] = None
             if not moved_at_all:
                 # Finir là où on a commencé, c'est qu'il ne s'est rien passé : valider un
                 # déplacement nul marquerait le document modifié pour un simple clic.
@@ -5998,6 +6530,7 @@ class PIGeneratorApp:
             if grab["pin"] is None:
                 return
             grab["pin"] = None
+            view_state["dragging_pin"] = None
             self._draw_map(map_canvas, doc["template"], view_state)
             _refresh_budget()
 
@@ -6051,6 +6584,7 @@ class PIGeneratorApp:
                 doc["template"] = template
                 doc["hand_edited"] = False
                 doc["filed"] = False
+                doc["source"] = "draft"
                 _stage_refusal(None)
             else:
                 try:
@@ -6060,6 +6594,7 @@ class PIGeneratorApp:
                     doc["template"] = template
                     doc["hand_edited"] = False
                     doc["filed"] = False
+                    doc["source"] = "draft"
                     plan = REBUILD
                 else:
                     if plan == REFUSE:
@@ -6085,13 +6620,21 @@ class PIGeneratorApp:
         self._live_popup = follow
 
         # ── Flux ──────────────────────────────────────────────────────────
-        # Une période de tirets par pas, pour que le défilement boucle sans couture :
-        # les liens font 5 pleins / 4 vides, les signaux 2 / 8. Rien n'est redessiné —
-        # seul le décalage d'objets déjà sur le canvas bouge.
+        # Une période de tirets par tour, pour que le défilement boucle sans
+        # couture : les liens font 5 pleins / 4 vides, les signaux 2 / 8. Rien
+        # n'est redessiné — seul le décalage d'objets déjà sur le canvas bouge.
+        #
+        # Aux vitesses de l'outil web (renderer.css) : un lien avance de 9 px en
+        # 1,6 s, une perle de route de 20 px en 1 s. Le bureau faisait défiler
+        # les deux à 18 px/s, le lien trois fois trop vite. La phase compte les
+        # tours de 55 ms ; le décalage en pixels en est tiré, et tronqué, puisque
+        # Tk ne prend qu'un entier.
         def _animate(phase=0):
+            elapsed = phase * 55
             try:
-                map_canvas.itemconfig("link", dashoffset=-(phase % 9))
-                map_canvas.itemconfig("signal", dashoffset=-(phase % 7))
+                map_canvas.itemconfig("link", dashoffset=-(int(elapsed * 9 / 1600) % 9))
+                map_canvas.itemconfig("signal", dashoffset=-(int(elapsed * 20 / 1000)
+                                                             % sum(ROUTE_DASH)))
             except tk.TclError:
                 return          # canvas disparu : le popup a été fermé
             view_state["anim_job"] = popup.after(55, _animate, phase + 1)
@@ -6280,6 +6823,24 @@ class PIGeneratorApp:
         
         if view_state is None:
             view_state = {"zoom": 1.0, "pan_x": 0, "pan_y": 0}
+        # Le survol ne survit pas à un redessin : ses objets viennent d'être
+        # effacés. On oublie donc ce qu'il faudrait restaurer, et on ferme ses
+        # fenêtres ; le prochain passage du pointeur le rallume.
+        pending = view_state.pop("unfocus_job", None)
+        if pending is not None:
+            try:
+                canvas.after_cancel(pending)
+            except tk.TclError:
+                pass
+        view_state.pop("focus_restore", None)
+        view_state["focus_pin"] = None
+        for key in ("tooltip_win", "details_win"):
+            tip = view_state.pop(key, None)
+            if tip is not None:
+                try:
+                    tip.destroy()
+                except tk.TclError:
+                    pass
         zoom = view_state.get("zoom", 1.0)
         pan_x = view_state.get("pan_x", 0)
         pan_y = view_state.get("pan_y", 0)
@@ -6421,6 +6982,7 @@ class PIGeneratorApp:
         # trait ici. Le motif fait 5 pleins / 4 vides, et l'animation avance dashoffset
         # d'une période entière pour que le défilement boucle sans couture.
         link_width = max(1, int(2 * zoom))
+        link_items = []   # (objet, pin source 0-based, pin destination 0-based)
 
         for lk in links:
             src_1b = lk.get("S", 0)
@@ -6433,9 +6995,11 @@ class PIGeneratorApp:
                 x2, y2 = positions[dst_0b]
                 tx1, ty1 = transform(x1, y1)
                 tx2, ty2 = transform(x2, y2)
-                canvas.create_line(tx1, ty1, tx2, ty2, fill=LINK_CYAN,
-                                   width=link_width, dash=(5, 4),
-                                   capstyle=tk.ROUND, tags=("link",))
+                link_items.append((
+                    canvas.create_line(tx1, ty1, tx2, ty2, fill=LINK_CYAN,
+                                       width=link_width, dash=(5, 4),
+                                       capstyle=tk.ROUND, tags=("link",)),
+                    src_0b, dst_0b))
 
         def draw_gear_icon(cx, cy, size, color="#ffffff", tags=()):
             teeth = 8
@@ -6672,52 +7236,96 @@ class PIGeneratorApp:
             # Type de structure non reconnu (rendu par un « ? » gris)
             return [f"Unknown structure (type {pin.get('T')})"]
 
-        # L'infobulle est sa propre petite fenêtre plutôt que des objets de canvas,
-        # uniquement pour pouvoir être translucide : un rectangle de canvas n'a pas de
-        # canal alpha en Tk, et la seule transparence honnête disponible est celle d'un
-        # toplevel. Elle ne prend jamais le focus et ne voit jamais le pointeur, donc
-        # elle ne peut pas voler le <Leave> qui la fait disparaître.
+        # ── Le survol d'un bâtiment ───────────────────────────────────────
+        # Porté de l'outil web (TemplateOverlay, renderer.css), à la demande : le
+        # bâtiment survolé prend un anneau bleu et une lueur, ceux qui lui sont
+        # reliés un liseré bleuté, et tout le reste s'efface ; ses liens
+        # s'éclaircissent et s'épaississent pendant que les autres pâlissent, et
+        # chaque route qui passe par lui défile en perles, de bout en bout.
+        #
+        # Tk n'a pas de canal alpha, et Windows ignore le motif sur le remplissage
+        # comme sur le contour d'un ovale — mesuré avant d'écrire ceci. Il
+        # l'honore sur une ligne et sur un polygone. D'où les équivalences :
+        # l'opacité 0,12 d'un lien pâli devient le motif gray12 ; les 28 % d'un
+        # bâtiment effacé, une plaque vidée de son remplissage et un glyphe en
+        # gray25 — la perle d'une route se voit alors au travers, comme sur le
+        # web ; la lueur de l'actif, deux disques polygonaux en gray12 et gray25
+        # posés sous sa plaque ; le halo d'une perle, un trait large en gray25.
+        pin_plates = {}   # pin 0-based -> objet plaque
+        link_active = _blend(LINK_CYAN, "#ffffff", 0.45)
+        connected_edge = _blend("#1f2a3c", FOCUS_BLUE, 0.62)
+
+        def _describe_pin(pin_idx):
+            """Une ligne, comme le `title` d'un bâtiment dans l'outil web (describePin)."""
+            pin = pins[pin_idx]
+            kind = STRUCT_TYPE_TO_NAME.get(pin.get("T")) or "Unknown structure"
+            parts = [kind]
+            if pin.get("S"):
+                parts.append(_commodity(pin.get("S")))
+            if kind == "Extractor Control Unit":
+                parts.append(f"{pin.get('H', 0) or 0} heads")
+            if pin_idx in crowded:
+                parts.append(CROWDED_REASON)
+            return " — ".join(parts)
+
         def _hide_pin_tooltip(_event=None):
-            tip = view_state.pop("tooltip_win", None)
-            if tip is not None:
-                try:
-                    tip.destroy()
-                except Exception:
-                    pass
+            for key in ("tooltip_win", "details_win"):
+                tip = view_state.pop(key, None)
+                if tip is not None:
+                    try:
+                        tip.destroy()
+                    except Exception:
+                        pass
 
-        def _show_pin_tooltip(event, pin_idx):
-            _hide_pin_tooltip()
-            lines = _pin_tooltip_lines(pin_idx)
+        def _floating(lines, font, border, alpha=True):
+            """Une petite fenêtre sans décor, qui ne prend jamais le focus.
 
+            Une fenêtre plutôt que des objets de canvas pour la translucidité :
+            un rectangle de canvas n'a pas de canal alpha en Tk. Elle ne voit
+            jamais le pointeur, donc elle ne peut pas voler le <Leave> qui la
+            fait disparaître.
+            """
             tip = tk.Toplevel(canvas)
             tip.overrideredirect(True)
             tip.attributes("-topmost", True)
-            try:
-                # Une nuance sous l'opacité de la fenêtre elle-même : la planète reste
-                # lisible dessous, ce qui est bien le but quand on survole un bâtiment
-                # posé sur la chose dont on est en train de lire la description.
-                tip.attributes("-alpha", max(0.35, self.alpha * 0.86))
-            except Exception:
-                pass
-            tip.configure(bg=EVE["accent"])
+            if alpha:
+                try:
+                    tip.attributes("-alpha", max(0.35, self.alpha * 0.86))
+                except Exception:
+                    pass
+            tip.configure(bg=border)
             tk.Label(tip, text="\n".join(lines), justify=tk.LEFT,
-                     bg=EVE["bg_panel"], fg=EVE["fg_bright"],
-                     font=("Segoe UI", _fs(9)), padx=8, pady=6,
-                     anchor=tk.W).pack(padx=1, pady=1)
-            view_state["tooltip_win"] = tip
-
-            # Placée par rapport à l'écran, pas au canvas, et repoussée à l'intérieur
-            # quand le pointeur est près d'un bord.
+                     bg=EVE["bg_panel"], fg=EVE["fg_bright"], font=font,
+                     padx=_px(8), pady=_px(5), anchor=tk.W).pack(padx=1, pady=1)
             tip.update_idletasks()
-            w, h = tip.winfo_reqwidth(), tip.winfo_reqheight()
-            x = canvas.winfo_rootx() + event.x + _px(16)
-            y = canvas.winfo_rooty() + event.y - h // 2
-            right = canvas.winfo_rootx() + canvas.winfo_width()
-            bottom = canvas.winfo_rooty() + canvas.winfo_height()
-            x = min(x, right - w - 8)
-            x = max(x, canvas.winfo_rootx() + 8)
-            y = min(max(y, canvas.winfo_rooty() + 8), bottom - h - 8)
-            tip.geometry(f"+{int(x)}+{int(y)}")
+            return tip
+
+        def _show_pin_tooltip(event, pin_idx):
+            """Le nom près du pointeur, et le détail dans le coin de la carte.
+
+            Le détail s'ouvrait à côté du pointeur, et recouvrait justement les
+            routes que le survol venait d'allumer. L'outil web a tranché pareil :
+            une ligne au pointeur, le reste dans un panneau en bas à droite. Le
+            panneau se pose au-dessus du décompte de pins, qui garde son coin.
+            """
+            _hide_pin_tooltip()
+            left, top = canvas.winfo_rootx(), canvas.winfo_rooty()
+            right, bottom = left + canvas.winfo_width(), top + canvas.winfo_height()
+
+            label = _floating([_describe_pin(pin_idx)], ("Segoe UI", _fs(8)),
+                              EVE["border_hi"], alpha=False)
+            w, h = label.winfo_reqwidth(), label.winfo_reqheight()
+            x = min(left + event.x + _px(12), right - w - 8)
+            y = min(top + event.y + _px(18), bottom - h - 8)
+            label.geometry(f"+{int(max(x, left + 8))}+{int(max(y, top + 8))}")
+            view_state["tooltip_win"] = label
+
+            details = _floating(_pin_tooltip_lines(pin_idx), ("Segoe UI", _fs(9)),
+                                EVE["accent"])
+            w, h = details.winfo_reqwidth(), details.winfo_reqheight()
+            details.geometry(f"+{int(max(left + 8, right - w - 12))}"
+                             f"+{int(max(top + 8, bottom - h - _px(34)))}")
+            view_state["details_win"] = details
 
         # ── Signaux de route ──────────────────────────────────────────────
         # Mouvement directionnel des marchandises, montré uniquement tant qu'une
@@ -6742,11 +7350,14 @@ class PIGeneratorApp:
         def _show_route_signals(pin_idx):
             canvas.delete("signal")
             focused_1b = pin_idx + 1
+            halo_width = max(4, int(round(ROUTE_HALO_PX * zoom)))
+            bead_width = max(2, int(round(ROUTE_BEAD_PX * zoom)))
             for route in template.get("R", []):
                 path = route.get("P") or []
                 if focused_1b not in path:
                     continue
-                color = commodity_color(route.get("T"))
+                bead = commodity_color(route.get("T"), lightness=ROUTE_BEAD_LIGHTNESS)
+                halo = commodity_color(route.get("T"), lightness=ROUTE_HALO_LIGHTNESS)
                 for step in range(len(path) - 1):
                     src, dst = path[step] - 1, path[step + 1] - 1
                     if src not in positions or dst not in positions:
@@ -6755,24 +7366,159 @@ class PIGeneratorApp:
                     end = _live_pin_center(dst)
                     if start is None or end is None:
                         continue
-                    sx, sy = start
-                    dx_, dy_ = end
                     # Tagués « map » dès leur naissance. Ils sont dessinés au survol, bien
                     # après que le dessin a tagué tout le reste ; sans ça, ils restaient
                     # immobiles pendant que la colonie filait en panoramique sous eux.
                     #
-                    # Tirets 3/4, et non le 2/8 du web : seul l'écart entre deux plaques
-                    # est jamais visible — environ 9 px — et un point de 2 px tous les
-                    # 10 px n'est le plus souvent pas dans cet écart du tout, si bien que
-                    # le flux défilait là où personne ne pouvait le voir.
-                    canvas.create_line(sx, sy, dx_, dy_, fill=color,
-                                       width=max(2, int(3 * zoom)), dash=(3, 4),
+                    # La bande d'abord, puis les perles qui défilent dessus ; voir
+                    # ROUTE_HALO_PX pour pourquoi la bande est continue sur le
+                    # bureau. Une plaque effacée laisse passer les deux, comme au
+                    # travers des 28 % du web.
+                    canvas.create_line(start[0], start[1], end[0], end[1], fill=halo,
+                                       width=halo_width, dash=ROUTE_HALO_DASH or "",
+                                       stipple=ROUTE_HALO_STIPPLE,
+                                       capstyle=tk.ROUND,
+                                       tags=("signal", "signal_halo", "map"),
+                                       state=tk.DISABLED)
+                    canvas.create_line(start[0], start[1], end[0], end[1], fill=bead,
+                                       width=bead_width, dash=ROUTE_DASH,
                                        capstyle=tk.ROUND, tags=("signal", "map"),
                                        state=tk.DISABLED)
             # Sous les bâtiments, au-dessus des liens et de la planète : un signal ne
             # doit jamais recouvrir la structure dont il explique le réseau.
             if canvas.find_withtag("pinlayer"):
                 canvas.tag_lower("signal", "pinlayer")
+
+        _STYLE_KEYS = {"line": ("fill", "width", "stipple"),
+                       "polygon": ("fill", "outline", "stipple"),
+                       "oval": ("fill", "outline", "width", "state"),
+                       "text": ("fill",)}
+
+        def _clear_focus():
+            for item, style in view_state.pop("focus_restore", []):
+                try:
+                    canvas.itemconfig(item, **style)
+                except tk.TclError:
+                    pass
+            canvas.addtag_withtag("link", "link_dim")
+            canvas.dtag("link_dim", "link_dim")
+            canvas.delete("focusglow")
+            canvas.delete("focusfade")
+            view_state["focus_pin"] = None
+
+        def _apply_focus(focus):
+            """Actif, relié ou effacé : les trois états du web, sur le canvas."""
+            restore = []
+
+            def remember(item):
+                keys = _STYLE_KEYS.get(canvas.type(item), ())
+                restore.append((item, {k: canvas.itemcget(item, k) for k in keys}))
+
+            connected = set()
+            for item, src, dst in link_items:
+                if focus in (src, dst):
+                    connected.add(dst if src == focus else src)
+            for item, src, dst in link_items:
+                remember(item)
+                if focus in (src, dst):
+                    canvas.itemconfig(item, fill=link_active,
+                                      width=max(2, int(round(LINK_ACTIVE_PX * zoom))))
+                else:
+                    # Pâli, et à l'arrêt comme sur le web : hors du tag que
+                    # l'animation fait défiler.
+                    canvas.itemconfig(item, stipple="gray12")
+                    canvas.dtag(item, "link")
+                    canvas.addtag_withtag("link_dim", item)
+
+            for idx, plate in pin_plates.items():
+                if idx == focus:
+                    remember(plate)
+                    x0, y0, x1, y1 = canvas.coords(plate)
+                    cx_, cy_, radius = (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2
+                    canvas.itemconfig(plate, outline=FOCUS_BLUE,
+                                      width=max(2, int(round(2 * zoom))))
+                    # La lueur puis l'anneau doux, du plus large au plus serré,
+                    # chacun glissé juste sous la plaque — au-dessus des perles.
+                    for extra, pattern in ((9 * zoom, "gray12"), (3 * zoom, "gray25")):
+                        ring = radius + extra
+                        points = []
+                        for k in range(36):
+                            angle = 2 * math.pi * k / 36
+                            points += [cx_ + ring * math.cos(angle),
+                                       cy_ + ring * math.sin(angle)]
+                        glow = canvas.create_polygon(points, fill=FOCUS_BLUE, outline="",
+                                                     stipple=pattern, state=tk.DISABLED,
+                                                     tags=("focusglow", "map"))
+                        canvas.tag_lower(glow, plate)
+                elif idx in connected:
+                    remember(plate)
+                    canvas.itemconfig(plate, outline=connected_edge)
+                else:
+                    for item in canvas.find_withtag(f"pin{idx}"):
+                        remember(item)
+                        kind = canvas.type(item)
+                        if item == plate:
+                            # La plaque à 28 % : un disque polygonal en gray25 de sa
+                            # propre couleur, glissé à sa place pendant qu'elle se
+                            # cache. Vider l'ovale laissait un anneau clair plus
+                            # voyant que la plaque même. Il porte le tag du pin : le
+                            # pointeur l'attrape sur toute sa surface.
+                            x0, y0, x1, y1 = canvas.coords(plate)
+                            cx_, cy_, radius = (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2
+                            points = []
+                            for k in range(36):
+                                angle = 2 * math.pi * k / 36
+                                points += [cx_ + radius * math.cos(angle),
+                                           cy_ + radius * math.sin(angle)]
+                            fade = canvas.create_polygon(
+                                points, fill=canvas.itemcget(plate, "fill") or EVE["bg_panel"],
+                                outline="", stipple="gray25",
+                                tags=(f"pin{idx}", "focusfade", "map"))
+                            canvas.tag_lower(fade, plate)
+                            canvas.itemconfig(plate, state=tk.HIDDEN)
+                        elif kind == "line":
+                            canvas.itemconfig(item, stipple="gray25")
+                        elif kind == "polygon":
+                            # Le contour d'un polygone reste plein sous un
+                            # remplissage en motif : le glyphe gardait ses
+                            # arêtes blanches et ne pâlissait pas.
+                            canvas.itemconfig(item, stipple="gray25", outline="")
+                        elif kind == "oval":
+                            canvas.itemconfig(item, fill="", outline=_blend(
+                                canvas.itemcget(item, "outline") or "#ffffff", "#000000", 0.6))
+                        elif kind == "text":
+                            canvas.itemconfig(item, fill=_blend(
+                                canvas.itemcget(item, "fill") or "#ffffff", "#000000", 0.6))
+            view_state["focus_restore"] = restore
+            view_state["focus_pin"] = focus
+
+        def _unfocus_now():
+            view_state.pop("unfocus_job", None)
+            _hide_pin_tooltip()
+            canvas.delete("signal")
+            _clear_focus()
+
+        view_state["unfocus"] = _unfocus_now
+
+        def _hover_pin(i, event=None):
+            """Tout ce que fait le survol d'un bâtiment, en un seul point d'entrée.
+
+            Le rappel <Enter> passe par ici, et les tests aussi : Tk n'envoie
+            <Enter> que quand l'objet sous le pointeur change, ce qu'un
+            évènement synthétique ne sait pas provoquer deux fois de suite.
+            """
+            if event is None:
+                center = _live_pin_center(i) or (0, 0)
+
+                class _At:
+                    x, y = int(center[0]), int(center[1])
+                event = _At
+            _unfocus_now()
+            _show_route_signals(i)
+            _apply_focus(i)
+            _show_pin_tooltip(event, i)
+
+        view_state["hover_pin"] = _hover_pin
 
         # ── Encombrement ──────────────────────────────────────────────────
         # Un cercle rouge en pointillés au rayon d'espacement minimal sur chaque
@@ -6789,6 +7535,22 @@ class PIGeneratorApp:
             canvas.create_oval(cx_ - ring, cy_ - ring, cx_ + ring, cy_ + ring,
                                outline=EVE["red"], width=max(1, int(1.5 * zoom)),
                                dash=(4, 3), tags=("crowd",), state=tk.DISABLED)
+            # La raison écrite, sous la seule structure en main : sur chacune ce
+            # serait du bruit, et une infobulle n'apparaît jamais en plein
+            # glisser. Portage de `crowding-reason` de l'outil web.
+            if pin_idx == view_state.get("dragging_pin"):
+                label = canvas.create_text(cx_, cy_ + ring + _px(6), anchor=tk.N,
+                                           text=CROWDED_REASON, fill=EVE["red"],
+                                           font=("Segoe UI", _fs(9)),
+                                           tags=("crowd", "crowd_reason"),
+                                           state=tk.DISABLED)
+                x0, y0, x1, y1 = canvas.bbox(label)
+                plate = canvas.create_rectangle(x0 - _px(6), y0 - _px(2),
+                                                x1 + _px(6), y1 + _px(2),
+                                                fill=EVE["bg_panel"], outline="",
+                                                tags=("crowd", "crowd_reason"),
+                                                state=tk.DISABLED)
+                canvas.tag_lower(plate, label)
 
         for pin_idx, (x, y) in positions.items():
             pin = pins[pin_idx]
@@ -6813,10 +7575,11 @@ class PIGeneratorApp:
             # posée sur de l'artwork désormais, et un gros anneau blanc disputait
             # l'attention à la planète — et gagnait. C'est le glyphe qui porte
             # l'identité ; la plaque n'a qu'à rester lisible sur ce qu'il y a derrière.
-            canvas.create_oval(tx - r, ty - r, tx + r, ty + r,
-                             fill=EVE["bg_panel"],
-                             outline=EVE["red"] if pin_idx in crowded else EVE["border_hi"],
-                             width=max(1, int(1.4 * zoom)), tags=tags)
+            pin_plates[pin_idx] = canvas.create_oval(
+                tx - r, ty - r, tx + r, ty + r,
+                fill=EVE["bg_panel"],
+                outline=EVE["red"] if pin_idx in crowded else EVE["border_hi"],
+                width=max(1, int(1.4 * zoom)), tags=tags)
 
             icon_size = r * 0.58
             if sname == "Launch Pad":
@@ -6852,13 +7615,23 @@ class PIGeneratorApp:
                                          "bold"),
                                    tags=tags)
 
+            # Passer de la plaque au glyphe d'un même bâtiment, c'est quitter un
+            # objet pour un autre : Tk envoie <Leave> puis <Enter>. Le retrait est
+            # donc différé de 40 ms, et annulé si le même bâtiment revient — sans
+            # quoi la lueur et les perles clignotaient à chaque pixel.
             def _enter(e, i=pin_idx):
-                _show_pin_tooltip(e, i)
-                _show_route_signals(i)
+                job = view_state.pop("unfocus_job", None)
+                if job is not None:
+                    canvas.after_cancel(job)
+                if view_state.get("focus_pin") == i and canvas.find_withtag("signal"):
+                    return
+                _hover_pin(i, e)
 
             def _leave(_e):
-                _hide_pin_tooltip()
-                canvas.delete("signal")
+                job = view_state.pop("unfocus_job", None)
+                if job is not None:
+                    canvas.after_cancel(job)
+                view_state["unfocus_job"] = canvas.after(40, _unfocus_now)
 
             canvas.tag_bind(pin_tag, "<Enter>", _enter)
             canvas.tag_bind(pin_tag, "<Leave>", _leave)

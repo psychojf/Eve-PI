@@ -11,35 +11,36 @@ Deux règles, toutes deux venues du webtool :
   garde ce qui tenait et dit pourquoi elle s'arrête, plutôt que de tout annuler :
   punir un travail à moitié valable serait pire que de le laisser incomplet.
 """
-from src.services.colony_model import (FACTORY_KINDS, EditError, add_extractor,
-                                       add_factory, add_hub, heads_per_extractor,
-                                       remove_extractor, remove_factory,
-                                       remove_hub, set_cc_level, set_heads,
-                                       set_radius_km, structure_counts)
+from src.services.colony_model import (EditError, add_extractor, add_factory,
+                                       add_hub, counter_tally,
+                                       heads_per_extractor, remove_extractor,
+                                       remove_factory, remove_hub, set_cc_level,
+                                       set_heads, set_radius_km,
+                                       set_yield_per_head)
 from src.services.grow_to_supply import grow_to_supply
 
 # Le compteur du panneau, et l'opération qui le sert sans rien reposer.
 _COUNTERS = (
-    ("factories", FACTORY_KINDS, add_factory, remove_factory),
-    ("extractors", ("Extractor Control Unit",), add_extractor, remove_extractor),
-    ("launch_pads", ("Launch Pad",),
+    ("factories", add_factory, remove_factory),
+    ("extractors", add_extractor, remove_extractor),
+    ("launch_pads",
      lambda m: add_hub(m, "Launch Pad"), lambda m: remove_hub(m, "Launch Pad")),
-    ("storage", ("Storage Facility",),
+    ("storage",
      lambda m: add_hub(m, "Storage Facility"),
      lambda m: remove_hub(m, "Storage Facility")),
 )
 
 
-def _count(model, kinds):
-    counts = structure_counts(model)
-    return sum(c for name, c in counts.items() if name in kinds)
+def _step_to(model, target, key, grow, shrink):
+    """Amène un compteur à sa cible, en gardant ce qui a pu être fait.
 
-
-def _step_to(model, target, kinds, grow, shrink):
-    """Amène un compteur à sa cible, en gardant ce qui a pu être fait."""
+    Compté par `counter_tally`, dans l'unité du pas de l'opération : un jeu
+    d'usines sur P0 → P2, une paire d'extracteurs sur deux ressources. Compter
+    des structures ici faisait que 3 ECU demandés en donnaient 4.
+    """
     if target is None:
         return model, None
-    current = _count(model, kinds)
+    current = counter_tally(model)[key]
     op = grow if target > current else shrink
     for _ in range(abs(target - current)):
         try:
@@ -86,8 +87,12 @@ def apply_edit(model, before, after):
     """
     refusal = None
 
-    for key, kinds, grow, shrink in _COUNTERS:
-        model, why = _step_to(model, after.get(key), kinds, grow, shrink)
+    # Sur P0 → P2, le champ « factories » compte les Advanced et `counter_tally`
+    # les jeux — une Advanced par jeu : les deux disent le même nombre, et
+    # `add_factory` / `remove_factory` avancent d'un jeu entier depuis le
+    # 2026-09-13. Le verrou qui refusait tout nouveau compte n'a plus de raison.
+    for key, grow, shrink in _COUNTERS:
+        model, why = _step_to(model, after.get(key), key, grow, shrink)
         refusal = refusal or why
 
     heads = after.get("heads")
@@ -100,6 +105,14 @@ def apply_edit(model, before, after):
     new_yield = after.get("yield_per_head")
     old_yield = before.get("yield_per_head")
     if new_yield and old_yield and new_yield > old_yield:
+        # Écrit dans les routes avant de faire pousser : `add_factory` relit le
+        # rendement du template pour vérifier qu'un jeu est nourri, et refusait
+        # sinon chaque jeu avec « raise the yield per head » — juste après
+        # qu'on l'eut relevé. L'ordre de `editStage` dans l'outil web.
+        try:
+            model = set_yield_per_head(model, new_yield)
+        except EditError:
+            pass    # une colonie qui n'extrait rien n'a aucune route à réécrire
         # Les compteurs manuels ont déjà dit combien d'usines ils voulaient ;
         # faire pousser par-dessus contredirait le champ qu'on vient d'honorer.
         if after.get("factories") is None:

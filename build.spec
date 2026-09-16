@@ -58,6 +58,7 @@ a = Analysis(
         'src.services.grace', 'src.services.factory_runtime',
         'src.services.grow_to_supply', 'src.services.history',
         'src.services.sourcing', 'src.services.eve_time',
+        'src.services.storage_suggestion',
         # Les écrans et panneaux flottants.
         'src.ui.screens', 'src.ui.factory_timer', 'src.ui.stage_notice',
         'src.ui.collect_bar',

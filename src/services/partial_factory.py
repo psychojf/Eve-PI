@@ -73,6 +73,38 @@ def _push_routes(routes, links, arms, pad, direction, quantity, type_id, pin_cou
                 routes.append({"P": path, "Q": quantity, "T": type_id})
 
 
+def _spread_to_spare_pads(feeds, launch_pad_pins, hub):
+    """Donne des intrants amenes a charger aux pads qu'aucune rangee n'utilise.
+
+    `feeds` liste, rangee par rangee, le pad d'ou part chaque intrant amene ;
+    chaque liste est modifiee en place. La recherche pose trois pads des que le
+    budget le permet, quel que soit le nombre de rangees a ancrer, et un pad sur
+    aucune route ne contient rien en jeu. Ce pad est deja paye : il sert de
+    stockage plutot que d'etre retire. Mesure sur Data Chips en CC5, la rangee
+    de Microfiber Shielding tenait 23,5 h sur son seul pad d'ancrage et tient
+    47 h une fois ses deux P1 repartis, sans une usine ni un lien de plus.
+
+    Deux passes, dans l'ordre des rangees. D'abord une rangee qui puise au hub
+    passe entiere sur un pad libre, car le hub porte deja chaque intrant et la
+    sortie du produit, et un meme pin ne fait qu'un reservoir. Ensuite une
+    rangee qui tire tous ses intrants d'un meme pad en envoie le reste sur un
+    pad libre, pour que chaque P1 ait si possible un pad a lui, comme dans
+    `_gen_p1_to_p3_template`.
+
+    Miroir de `spreadToSparePads` dans `partial-factory.ts` (branche
+    `recipe-variants` du webtool), que `variants-live-python.spec.ts` compare
+    route pour route.
+    """
+    used = {pad for feed in feeds for pad in feed}
+    spare = [pad for pad in launch_pad_pins[1:] if pad not in used]
+    for feed in feeds:
+        if spare and feed and all(pad == hub for pad in feed):
+            feed[:] = [spare.pop(0)] * len(feed)
+    for feed in feeds:
+        if spare and len(feed) > 1 and len(set(feed)) == 1:
+            feed[1:] = [spare.pop(0)] * (len(feed) - 1)
+
+
 def _latitude_pool(count):
     """Latitudes pour `count` rangees, en s'ecartant de l'equateur.
 
@@ -217,15 +249,21 @@ def generate_partial_factory(config, plan):
         routes = []
         pin_count = len(pins)
 
-        # P1 en entree, depuis le pad qui ancre la rangee qui les mange.
+        # P1 en entree, depuis le pad qui ancre la rangee qui les mange, ou un
+        # pad que rien d'autre n'utilise.
+        p1_sources = []
+        for index in range(len(made)):
+            anchor = row_anchors[index] if index < len(row_anchors) else hub
+            p1_sources.append([anchor] * len(made_recipes[index]["input"]))
+        _spread_to_spare_pads(p1_sources, launch_pad_pins, hub)
         for index, (name, _) in enumerate(made):
             made_recipe = made_recipes[index]
-            anchor = row_anchors[index] if index < len(row_anchors) else hub
-            for p1_name, p1_quantity in made_recipe["input"]:
+            for (p1_name, p1_quantity), source in zip(made_recipe["input"],
+                                                      p1_sources[index]):
                 p1_tid = NAME_TO_ID.get(p1_name)
                 if p1_tid is None:
                     raise ValueError(f"Unknown P1 commodity: {p1_name}")
-                _push_routes(routes, links, made_arms[index], anchor, "in",
+                _push_routes(routes, links, made_arms[index], source, "in",
                              p1_quantity, p1_tid, pin_count)
 
         # P2 fabrique en sortie vers le hub, ou la rangee de produit puise.
@@ -453,14 +491,26 @@ def _generate_partial_p4(config, plan):
     routes = []
     pin_count = len(pins)
 
-    # P1 en entree, depuis le pad qui ancre la rangee qui les mange.
-    for leg, row in leg_rows:
-        anchor = anchor_for(row["latitude_index"])
-        for p1_name, p1_quantity in leg["inputs"]:
+    # D'ou part chaque intrant amene d'une rangee fabriquee : le pad qui ancre
+    # la rangee, ou un pad que rien d'autre n'utilise. Un P3 bati depuis les P1
+    # n'en a pas : ses P2 sont faits ici et l'attendent au hub, donc le pad qui
+    # partage sa latitude restait vide.
+    leg_sources = [[anchor_for(row["latitude_index"])] * len(leg["inputs"])
+                   for leg, row in leg_rows]
+    child_sources = {
+        child["name"]: [anchor_for(child_rows[child["name"]]["latitude_index"])]
+        * len(child["inputs"])
+        for child in made_children if child["source"] == "make-from-p2"}
+    _spread_to_spare_pads(leg_sources + list(child_sources.values()),
+                          launch_pad_pins, hub)
+
+    # P1 en entree de chaque rangee P2.
+    for (leg, row), sources in zip(leg_rows, leg_sources):
+        for (p1_name, p1_quantity), source in zip(leg["inputs"], sources):
             p1_tid = NAME_TO_ID.get(p1_name)
             if p1_tid is None:
                 return None
-            _push_routes(routes, links, row["arms"], anchor, "in", p1_quantity,
+            _push_routes(routes, links, row["arms"], source, "in", p1_quantity,
                          p1_tid, pin_count)
 
     # P2 fabrique en sortie vers le hub, ou la rangee P3 qui le mange puise.
@@ -470,12 +520,11 @@ def _generate_partial_p4(config, plan):
 
     # P2 en entree de chaque rangee P3 fabriquee. Un P3 bati depuis les P1 puise
     # les P2 que cette colonie vient de faire, donc il les prend au hub ; un P3
-    # bati depuis des P2 amenes les prend au pad qui ancre sa propre rangee.
+    # bati depuis des P2 amenes les prend la ou `_spread_to_spare_pads` les a mis.
     for child in made_children:
         row = child_rows[child["name"]]
-        source = hub if child["source"] == "make-from-p1" \
-            else anchor_for(row["latitude_index"])
-        for p2_name, p2_quantity in child["inputs"]:
+        sources = child_sources.get(child["name"], [hub] * len(child["inputs"]))
+        for (p2_name, p2_quantity), source in zip(child["inputs"], sources):
             p2_tid = NAME_TO_ID.get(p2_name)
             if p2_tid is None:
                 return None
@@ -488,14 +537,47 @@ def _generate_partial_p4(config, plan):
         _push_routes(routes, links, row["arms"], hub, "out", child["output"],
                      child["type_id"], pin_count)
 
-    # Tous les intrants du produit sortent du hub, fabriques comme amenes.
-    for child in children:
-        _push_routes(routes, links, product_arms, hub, "in", child["quantity"],
-                     child["type_id"], pin_count)
+    # Chaque HTF a son pad, en tourniquet sur les pads : sa sortie y aboutit et il
+    # y puise d'abord ses intrants amenes, les autres pads servant de
+    # debordement (en jeu, une usine vide ses routes d'entree dans l'ordre de
+    # creation). C'est ce que font les generateurs P4 des chaines. Tout faire
+    # passer par le hub le laissait porter seul les P3 amenes et la sortie de
+    # chaque HTF : 6 x 100 m3/h dans 10 000 m3, 16,7 h pour les 21 plans
+    # « Make X from P2 », quand les autres pads restaient a 55,6 h. Mesure sur
+    # 1 242 colonies P4 mixtes : 210 sous 24 h avant, aucune apres, aucune qui
+    # tienne moins longtemps, sans une usine ni un lien de plus.
+    #
+    # Les routes de debordement seules ne suffisaient pas : le modele de
+    # stockage aurait mis les pads en commun et efface l'avertissement, alors
+    # que toute la sortie serait restee au hub. Une seule route de sortie par
+    # usine : qu'EVE partage une sortie entre plusieurs routes n'est pas verifie.
+    #
+    # Pas encore dans `partial-factory.ts` (branche `recipe-variants` du
+    # webtool) : a porter, `variants-live-python.spec.ts` le reclame.
+    product_pins = [pin for arm in product_arms for pin in arm]
+    home_pad = {factory: launch_pad_pins[index % len(launch_pad_pins)]
+                for index, factory in enumerate(product_pins)}
 
-    # Produit en sortie.
-    _push_routes(routes, links, product_arms, hub, "out", recipe["output"],
-                 product_tid, pin_count)
+    # Intrants du produit. Un P3 fabrique ici n'atterrit qu'au hub, ou ses
+    # rangees le deposent, donc il n'est pris que la.
+    for child in children:
+        for factory in product_pins:
+            if child["source"] == "import":
+                home = home_pad[factory]
+                sources = [home] + [pad for pad in launch_pad_pins if pad != home]
+            else:
+                sources = [hub]
+            for pad in sources:
+                path = _bfs_path(links, pad, factory, pin_count)
+                if path:
+                    routes.append({"P": path, "Q": child["quantity"],
+                                   "T": child["type_id"]})
+
+    # Produit en sortie, chaque usine vers son propre pad.
+    for factory in product_pins:
+        path = _bfs_path(links, factory, home_pad[factory], pin_count)
+        if path:
+            routes.append({"P": path, "Q": recipe["output"], "T": product_tid})
 
     return {
         "CmdCtrLv": cc_level,

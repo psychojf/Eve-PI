@@ -79,15 +79,9 @@ def open_template_editor(app, template, source_name=None):
     counter_vars, counter_boxes = {}, {}
 
     def current_counts():
-        m = state["model"]
-        counts = cm.structure_counts(m)
-        return {
-            "factories": sum(c for k, c in counts.items() if k in cm.FACTORY_KINDS),
-            "extractors": counts.get("Extractor Control Unit", 0),
-            "heads": cm.heads_per_extractor(m),
-            "launch_pads": counts.get("Launch Pad", 0),
-            "storage": counts.get("Storage Facility", 0),
-        }
+        # Dans l'unité du pas de chaque édition — jeux, paires —, sinon un clic
+        # en ajoutait trois pendant que la case n'avançait que d'un.
+        return cm.counter_tally(state["model"])
 
     def apply_counter(key):
         m = state["model"]

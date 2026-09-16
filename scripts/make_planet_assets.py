@@ -20,7 +20,7 @@ import sys
 
 from PIL import Image, ImageDraw, ImageFilter
 
-SOURCE_DIR = os.path.join("WEBTOOL", "src", "assets", "planets")
+SOURCE_DIR = os.path.join("..", "PI WEBTOOL", "src", "assets", "planets")
 TARGET_DIR = os.path.join("data", "planets")
 SIZE = 1024
 QUALITY = 82
