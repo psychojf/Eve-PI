@@ -14,7 +14,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from src.pi_data import DEFAULT_YIELD_PER_HEAD, RECIPES_P1_P2
-from src.services.template_service import (ID_TO_NAME, MAX_ARM_LEN, MAX_ARM_LEN_HARD,
+from src.services.template_service import (ID_TO_NAME, MAX_ARM_LEN, MAX_ARM_LEN_EDITABLE,
                                            STRUCT_ID_TO_NAME, analyze_template,
                                            get_tier)
 
@@ -223,11 +223,11 @@ def parse_colony(template):
                 for branch in onward:
                     pending.append((cur, branch))
                 break
-            # On tolère tout ce que la surcharge arm_length du générateur peut
-            # produire ; MAX_ARM_LEN, plus compact, ne plafonne que la
+            # On tolère ce que la surcharge arm_length produisait avant son
+            # plafond à 4 ; MAX_ARM_LEN, plus compact, ne plafonne que la
             # croissance automatique.
-            if len(arm) > MAX_ARM_LEN_HARD:
-                raise ParseError(f"arm of {len(arm)} pins exceeds {MAX_ARM_LEN_HARD}")
+            if len(arm) > MAX_ARM_LEN_EDITABLE:
+                raise ParseError(f"arm of {len(arm)} pins exceeds {MAX_ARM_LEN_EDITABLE}")
             arms.append(Arm(hub=h, pins=arm, end_hub=end_hub, parent=parent))
     if len(visited) != n:
         raise ParseError("structures not reachable from any hub")
@@ -578,6 +578,24 @@ def _clone_routes_for(template, donor_1b, new_1b):
     return added
 
 
+def _with_cloned_routes(template, donor_1b, new_1b):
+    """Les routes du donneur clonées sur le nouveau pin, chacune dans les 7 structures d'EVE.
+
+    Un clone trop long se charge (ou se décharge) au launch pad ou à l'entrepôt
+    le plus proche, et tombe là où cette route existe déjà — voir `fit_routes`.
+    Un clone qui ne tient toujours pas refuse la structure : la poser donnerait
+    un template qu'EVE rejette. Miroir de `withClonedRoutes` dans l'outil web.
+    """
+    from src.services.route_limits import MAX_ROUTE_STRUCTURES, fit_routes
+    first_new = len(template["R"])
+    template["R"].extend(_clone_routes_for(template, donor_1b, new_1b))
+    fitted, unfit = fit_routes(template, first_new)
+    if unfit:
+        raise EditError(f"a structure here would need a route through more than "
+                        f"{MAX_ROUTE_STRUCTURES} structures, which EVE does not build")
+    return fitted
+
+
 def _drop_pin(template, idx_1b, repair=None):
     """Retire un pin : liens et routes qui le touchent tombent, indices remappés.
 
@@ -699,8 +717,7 @@ def _place_factory(model, schematic):
                      "S": donor_pin["S"], "T": donor_pin["T"]})
     new_1b = len(tpl["P"])
     tpl["L"].append({"D": attach_1b, "Lv": 0, "S": new_1b})
-    tpl["R"].extend(_clone_routes_for(tpl, donor_0b + 1, new_1b))
-    return tpl
+    return _with_cloned_routes(tpl, donor_0b + 1, new_1b)
 
 
 def remove_factory(model):
@@ -897,8 +914,7 @@ def _place_extractor(model, resource):
                      "S": donor["S"], "T": donor["T"]})
     new_1b = len(tpl["P"])
     tpl["L"].append({"D": hub + 1, "Lv": 0, "S": new_1b})
-    tpl["R"].extend(_clone_routes_for(tpl, donor_0b + 1, new_1b))
-    return tpl
+    return _with_cloned_routes(tpl, donor_0b + 1, new_1b)
 
 
 def add_extractor(model):
@@ -1015,12 +1031,7 @@ def add_hub(model, kind):
         raise EditError(f"unknown planet id {model.planet_id} — cannot pick a type id")
     type_id = STRUCTURE_IDS[kind][ptype]
 
-    load = {h: 0 for h in model.hubs}
-    for a in model.arms:
-        load[a.hub] += len(a.pins)
-    anchor = min(model.hubs, key=lambda h: (load[h], h))
-    sp = _median_spacing(model)
-    la, lo = _free_spot_near(model, anchor, sp)
+    anchor, la, lo = _hub_spot(model)
 
     tpl = _working_copy(model)
     tpl["P"].append({"H": 0, "La": la, "Lo": lo, "S": None, "T": type_id})
@@ -1028,6 +1039,41 @@ def add_hub(model, kind):
     # Relié ne suffit pas : un stockage ne contient que ce qu'une route charge ou décharge.
     _route_hub(tpl, len(tpl["P"]))
     return parse_colony(tpl)
+
+
+def _hub_spot(model):
+    """(ancre, la, lo) d'un nouveau hub : le launch pad dont l'usine alimentée la plus loin est la plus proche.
+
+    Puis le moins chargé, puis le plus petit index. Il allait sur le hub le
+    moins chargé, et un entrepôt ne porte aucun bras : chaque entrepôt après le
+    premier s'accrochait au précédent — entrepôt, entrepôt, pad, pad, quatre
+    usines, les routes de 8 structures qu'EVE a refusées sur une colonie
+    Nano-Factory (2026-09-17). Un pad sans place laisse la main au suivant.
+    Miroir de `hubSpot` dans l'outil web.
+    """
+    from src.services.template_service import _bfs_path
+    tpl = model.to_template()
+    factories = list(dict.fromkeys(factory for factory, _, _ in _storage_feeds(tpl)))
+    load = {h: 0 for h in model.hubs}
+    for a in model.arms:
+        load[a.hub] += len(a.pins)
+    pads = [h for h in model.hubs if kind_of(model.pins[h]) == "Launch Pad"]
+
+    def reach(hub):
+        lengths = []
+        for factory in factories:
+            path = _bfs_path(tpl["L"], hub + 1, factory, len(tpl["P"]))
+            lengths.append(len(path) if path else float("inf"))
+        return max([0] + lengths)
+
+    sp = _median_spacing(model)
+    for hub in sorted(pads or model.hubs, key=lambda h: (reach(h), load[h], h)):
+        try:
+            la, lo = _free_spot_near(model, hub, sp)
+        except EditError:
+            continue
+        return hub, la, lo
+    raise EditError("no free spot near the hub — layout too dense")
 
 
 def _storage_feeds(template):
@@ -1068,6 +1114,7 @@ def _route_hub(template, hub_1b):
     seule façon qu'une route permet : directement vers les usines qui mangent ce
     qu'il contiendrait. Miroir de `routeHub` dans l'outil web.
     """
+    from src.services.route_limits import MAX_ROUTE_STRUCTURES
     from src.services.template_service import _bfs_path
     added = 0
     for factory, type_id, quantity in _storage_feeds(template):
@@ -1075,7 +1122,9 @@ def _route_hub(template, hub_1b):
                for r in template["R"] if r["P"]):
             continue
         path = _bfs_path(template["L"], hub_1b, factory, len(template["P"]))
-        if not path:
+        # Une route qu'EVE ne bâtirait pas n'alimente rien : le pad qui atteint
+        # déjà l'usine la garde (2026-09-17, entrepôts chaînés au-delà de 7).
+        if not path or len(path) > MAX_ROUTE_STRUCTURES:
             continue
         template["R"].append({"P": path, "Q": quantity, "T": type_id})
         added += 1

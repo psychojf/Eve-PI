@@ -197,6 +197,31 @@ Work down the numbered panels:
        feeds three of them. Raise it if your deposits are
        rich, lower it if the extractors run dry.
 
+     Shape — the same colony, put down in a different
+       arrangement: Standard, # Hashtag, Star, Grid, Plus +,
+       Diamond, Ring, Spiral, PI letters.
+
+       Standard is the layout the generator built, in rows.
+       The others move those same structures onto the cells
+       of the shape, rebuild the links along it, and re-walk
+       every route. Nothing is added or removed, so the
+       colony still makes exactly what it made before.
+
+       The list only offers the shapes this colony can take.
+       A shape is refused when it would crowd two structures,
+       push CPU or power over budget, overload a link, or when
+       there are simply too few structures for it to read as
+       a shape at all (a # needs 12, the PI letters 22). If a
+       shape stops fitting after you change something, the
+       panel says so in orange and keeps the standard rows.
+
+       What a shape costs is link length, and a colony always
+       has one link fewer than it has structures: the tight
+       ones are free, Ring pays about 93 CPU for its spokes,
+       Spiral about 25 and it is the first to overload a link
+       on a bulky chain. Your choice is remembered between
+       sessions.
+
      Set counts myself — tick this to place exact numbers of
        extractors, heads, factories, pads and arm length.
 
@@ -229,27 +254,32 @@ Work down the numbered panels:
 
      Arm len — how many factories may chain off one side of a
        pad. Factories hang off a pad in two arms, so a pad
-       seats twice this number: the default 4 gives the
-       familiar 8 per pad, 6 gives 12, and the maximum 8
-       gives 16. Leave it at 0 for the default.
+       seats twice this number: 4 gives the familiar 8 per
+       pad, and 4 is also the most the generator will build.
+       Leave it at 0 for the default. Lower it to spread the
+       same factories over more pads.
 
-       Raise it when you want the same factory count on
-       fewer pads. A pad costs 3600 CPU and 700 power, so
-       dropping one pays for several extra factories — the
-       24-factory build (Pads 2, Factories 24, Arm len 6) is
-       the standard use: it fits inside a level 5 command
-       center where 24 factories on three pads does not, and
-       leaves you two banks of 12 to split between two
-       different P2 products on the same planet.
+       Why it stops at 4: a route in EVE may pass through at
+       most 7 structures, and the longest route of a
+       generated colony is the arm length plus 3. At 5, 302
+       of 604 full factory colonies carried a route the game
+       refuses to build; at 4, none do. Asking for more says
+       so rather than handing you a colony EVE will import
+       with routes missing.
 
-       The cost is link load. Traffic stacks toward the pad,
-       so the link nearest it carries every factory behind
-       it, and a level-0 link moves 1250 m3 an hour. Light
-       cargo never notices: 24 P1 → P2 factories on arms of 6
-       peak at about 227. Bulky cargo does — a P3 → P4 planet
-       on arms of 6 already runs at 1123, and arms of 7 go
-       over. The panel tells you either way, so there is
-       nothing to compute by hand.
+       Longer arms also cost link load. Traffic stacks toward
+       the pad, so the link nearest it carries every factory
+       behind it, and a level-0 link moves 1250 m3 an hour.
+       Light cargo never notices: 24 P1 → P2 factories on
+       arms of 6 peak at about 227. Bulky cargo does — a
+       P3 → P4 planet on arms of 6 already runs at 1123. The
+       panel tells you either way, so there is nothing to
+       compute by hand.
+
+       A colony that already has longer arms — imported, or
+       built before the cap — still opens and still edits.
+       The cap is on what the generator builds, not on what
+       the tool will read.
 
        Only shown for the single-stage factory chains
        (P1 → P2, P2 → P3, P3 → P4). Extraction planets place
@@ -283,8 +313,15 @@ Work down the numbered panels:
          the interval is satisfied rather than ignored.
        "extract N/h · factories use N/h" on extraction
          chains — red when the factories outrun the ground.
-       Any number of ⚠ warning lines, including a link named
-         as carrying more than 1250 m3/h — see Arm len above.
+       Any number of ⚠ warning lines: a link named as carrying
+         more than 1250 m3/h (see Arm len above), a shape that
+         did not fit, a count that could not be honoured, and
+         a route through more than 7 structures — the one
+         warning that costs you part of the colony on import.
+       ⬆ lines name a link to upgrade in game: the level it
+         needs, what it will then carry, and what the upgrade
+         adds in CPU and power. Measured in game up to level
+         2; above that the figure is marked as an estimate.
 
      Your yield choice is remembered between sessions; the
      manual counts are not.
@@ -380,6 +417,15 @@ HOVERING A STRUCTURE
                  fills or runs dry
     extractors   what it extracts and how many heads
     storage      what it receives and sends out
+
+WHAT THE SHAPES MEAN
+
+  Each structure wears the icon the game draws for it in the
+  PI window — launch pad, storage, extractor, and the three
+  factory tiers — so a colony here reads the way it will read
+  in the client. White for a normal structure, red when it
+  sits too close to a neighbour, pale when a hover has faded
+  it. The legend in the bottom-left corner names all six.
 
 WHAT THE LINES MEAN
 
@@ -954,14 +1000,16 @@ TIPS
 
 - Radius matters. Check it in-game and type the real value.
 
-- Two products on one factory planet: set Pads 2,
-  Factories 24, Arm len 6, then in game set half the
-  factories to the second schematic — or use ASSIGN P2 PER
-  FACTORY to do it in the template. Two pads instead of
-  three is what buys the 24th factory, and each bank of 12
-  ends up on its own pad — which the route order then
-  respects, so the two products do not compete for the same
-  stock.
+- Two products on one factory planet: use ASSIGN P2 PER
+  FACTORY on the colony the generator built — 23 Advanced
+  facilities on 3 pads at command center 5 — and the second
+  schematic is written into the template itself, with the
+  routes to match. If you would rather have two clean banks,
+  each on its own pad and its own stock, set Pads 2 and
+  Factories 16: eight per pad, which the route order then
+  respects, so the two products never compete for the same
+  launch pad. Power is what stops 24 from fitting on three
+  pads — 396 MW over at command center 5 — not CPU.
 
 - Extraction planets are power-limited, not CPU-limited. A
   10-head extractor burns 8100 of the 19000 power a level 5
@@ -1022,6 +1070,24 @@ Route storage says every pad already feeds everything
     one more pad, or upgrade that link in game. Ignoring it
     does not break the import; the factories behind that
     link simply cannot all be fed at once.
+
+EVE says "Some template routes failed to build"
+  — A route in that template passes through more than 7
+    structures, which is the game's limit. EVE builds every
+    other route and silently drops those, so the colony
+    imports looking complete and does not run. The panel
+    warns about it before you copy the JSON. It comes from
+    hand-lengthened arms or from an old template: generate
+    again, or shorten the arm.
+
+The shape I picked did not happen
+  — The panel says why, in orange, under the CPU bars: too
+    few structures for that shape, crowding, CPU or power
+    over budget, or a link pushed past 1250 m3/h. The colony
+    keeps the standard rows. Shapes that cannot fit the
+    colony on screen are not offered in the list at all, so
+    this only shows up when something else changed after you
+    picked one.
 
 Two structures on top of each other
   — Should not happen any more; every colony the tool can

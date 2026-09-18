@@ -52,6 +52,12 @@ from src.services.mixed_p2 import (MIXED_CHAIN, MixedP2Error,
                                    normalize_assignments,
                                    summarize_mixed_p2_batch)
 from src.services.variants import enumerate_recipe_variants
+from src.services.layout_shapes import (SHAPE_MENU, SHAPES, STANDARD, apply_shape,
+                                        available_shapes)
+from src.services.route_limits import (MAX_ROUTE_STRUCTURES, link_capacity_at_level,
+                                       link_upgrades_needed, long_routes, long_routes_note)
+
+SHAPE_BY_MENU = {label: key for key, label in SHAPE_MENU.items()}
 from src.services.scout_universe import PLANET_TYPE_NAMES, load_universe
 from src.services.template_describe import describe as describe_template
 from src.services.library_cards import (card_for, chain_of, matches,
@@ -414,6 +420,78 @@ def get_planet_art(planet_type_id, px):
         _debug(f"get_planet_art - {name} @{px}px failed: {e}")
     _PLANET_ART_CACHE[key] = art
     return art
+
+
+# ── Glyphes de structures pour la carte ───────────────────────
+# Les icônes du client, reprises de l'UniWiki, plutôt que les formes vectorielles
+# dessinées à la main qu'elles remplacent : la fusée et l'engrenage ne
+# ressemblaient à rien de ce que le joueur voit dans son colonie.
+#
+# `data/pi_icons/*.png` ne sont pas des images à afficher mais des masques 8 bits
+# — la forme du glyphe, sans couleur. Voir `scripts/make_pi_glyphs.py`. La
+# couleur est appliquée ici parce qu'elle change : blanche pour une structure
+# connue, rouge pour une structure trop serrée, et pâle quand le survol d'un
+# autre bâtiment l'efface.
+_PI_GLYPH_FILES = {
+    "Launch Pad":                  "launch_pad.png",
+    "Storage Facility":            "storage.png",
+    "Extractor Control Unit":      "extractor.png",
+    "Basic Industry Facility":     "basic_industry.png",
+    "Advanced Industry Facility":  "advanced_industry.png",
+    "High-Tech Industry Facility": "high_tech.png",
+}
+# Les masques décodés une seule fois, et les PhotoImage teintées. Ce second cache
+# détient l'unique référence à chaque PhotoImage — la lâcher et Tk vide l'image,
+# ce qui laisse une plaque nue sur la carte.
+_PI_MASK_CACHE: dict = {}
+_PI_GLYPH_CACHE: dict = {}
+# Le zoom est continu, la taille demandée ne l'est donc pas : on l'arrondit pour
+# qu'un panoramique à zoom constant retrouve ses images au lieu d'en rendre six
+# de plus à chaque image.
+_GLYPH_PX_STEP = 2
+# Une passe de zoom complète (0,3 à 3,0) fabrique ~40 tailles par structure et
+# par couleur. Au-delà on vide : un cache sans plafond garde en vie chaque
+# PhotoImage de chaque niveau de zoom jamais traversé.
+_GLYPH_CACHE_MAX = 600
+# Les 28 % du webtool, ici en vrai alpha. Tk n'a pas de canal alpha sur ses
+# objets de canvas — d'où les motifs gray12/gray25 ailleurs sur la carte — mais
+# une image, elle, en a un : le glyphe effacé est une seconde PhotoImage.
+_GLYPH_DIM_ALPHA = 0.28
+
+
+def get_struct_glyph(sname, px, color, dim=False):
+    """Retourne l'icône Tk d'une structure à px pixels, teintée, None si indisponible.
+
+    None est un vrai résultat : sans PIL ou sans le dossier d'icônes, la carte
+    retombe sur ses glyphes vectoriels. Une plaque sans glyphe ne se lit pas.
+    """
+    fname = _PI_GLYPH_FILES.get(sname)
+    if not fname or px < 4:
+        return None
+    px = max(_GLYPH_PX_STEP, int(round(px / _GLYPH_PX_STEP)) * _GLYPH_PX_STEP)
+    key = (fname, px, color, dim)
+    if key in _PI_GLYPH_CACHE:
+        return _PI_GLYPH_CACHE[key]
+    if len(_PI_GLYPH_CACHE) >= _GLYPH_CACHE_MAX:
+        _PI_GLYPH_CACHE.clear()
+    glyph = None
+    try:
+        from PIL import Image as _Img, ImageTk as _ImgTk
+        mask = _PI_MASK_CACHE.get(fname)
+        if mask is None:
+            with _Img.open(bundled_path("data", "pi_icons", fname)) as src:
+                mask = src.convert("L")
+            _PI_MASK_CACHE[fname] = mask
+        alpha = mask.resize((px, px), _Img.LANCZOS)
+        if dim:
+            alpha = alpha.point(lambda v: int(v * _GLYPH_DIM_ALPHA))
+        im = _Img.new("RGBA", (px, px), color)
+        im.putalpha(alpha)
+        glyph = _ImgTk.PhotoImage(im)
+    except Exception as e:
+        _debug(f"get_struct_glyph - {sname} @{px}px {color} failed: {e}")
+    _PI_GLYPH_CACHE[key] = glyph
+    return glyph
 
 
 # ── La planète vide de l'accueil ───────────────────────────────────
@@ -950,7 +1028,7 @@ def _enforce_readable_dim(themes):
     vingt-trois sous 3:1, douze sous 2:1. Rapporté sur l'écran JSON, celui qui
     s'en remet le plus au texte secondaire — « we barely see the text in the
     JSON tab » — mais le défaut était partout : l'indication de rayon, les
-    débits de la nomenclature, la légende de la carte, les étiquettes CPU/PWR.
+    débits de la nomenclature, les étiquettes CPU/PWR.
 
     Mesuré contre `bg_card`, le plus clair des quatre fonds (`_lighten(base,
     22)` contre 18, 10 et 0) : ce qui se lit là se lit sur les trois autres.
@@ -2799,6 +2877,7 @@ class PIGeneratorApp:
                 "use_sf": bool(self.sf_var.get()),
                 "interval": self.interval_var.get(),
                 "yield": self.yield_var.get(),
+                "shape": self.shape_var.get(),
                 "manual": bool(self.manual_var.get()),
                 "manual_counts": {key: var.get()
                                   for key, var in self.manual_vars.items()},
@@ -2880,6 +2959,8 @@ class PIGeneratorApp:
                 self.interval_var.set(panel["interval"])
             if panel.get("yield"):
                 self.yield_var.set(panel["yield"])
+            if panel.get("shape") in SHAPES:
+                self.shape_var.set(panel["shape"])
 
             if panel.get("manual"):
                 self.manual_var.set(True)
@@ -3136,7 +3217,7 @@ class PIGeneratorApp:
         content.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
 
         ttk.Label(content, text="EVE Online — PI Template Generator", style="Header.TLabel").pack(anchor=tk.W, pady=(0,5))
-        ttk.Label(content, text="Version 4.4", style="Sub.TLabel").pack(anchor=tk.W)
+        ttk.Label(content, text="Version 4.5", style="Sub.TLabel").pack(anchor=tk.W)
         ttk.Label(content, text="\nBased on the Planetary Interaction Template\nGenerator spreadsheet by Razkin.").pack(anchor=tk.W)
         # Le crédit de la bibliothèque livrée a été retiré le 12/08/2026 : la
         # bibliothèque ne contient plus que les colonies bâties par l'utilisateur, donc
@@ -3460,6 +3541,30 @@ class PIGeneratorApp:
                  fg=EVE["fg_dim"], font=("Segoe UI", _fs(8))).pack(side=tk.LEFT)
         yield_entry.bind("<KeyRelease>", lambda e: self._on_layout_change())
 
+        # Forme de la colonie — la même colonie, reposée en #, en étoile, en
+        # anneau… (src/services/layout_shapes.py). Une liste sur une seule
+        # rangée : huit pastilles en prenaient deux, et ces 30 px de plus
+        # suffisaient à faire défiler le panneau d'une colonie P1 → P4 sur un
+        # écran de 1440 — l'ajustement ne rétrécit pas le texte pour moins d'un
+        # cran de 5 %.
+        saved_shape = cfg_layout.get("layout_shape", STANDARD)
+        self.shape_var = tk.StringVar(value=saved_shape if saved_shape in SHAPES else STANDARD)
+        # Les formes que la colonie montrée peut prendre ; la liste n'offre qu'elles.
+        self._available_shapes = (STANDARD,)
+        shape_row = tk.Frame(self.grp_layout, bg=EVE["bg_card"])
+        shape_row.pack(fill=tk.X, padx=8, pady=(4, 0))
+        tk.Label(shape_row, text="Shape", bg=EVE["bg_card"], fg=EVE["fg_dim"],
+                 font=("Segoe UI", _fs(9))).pack(side=tk.LEFT, padx=(0, 6))
+        self._shape_display = tk.StringVar(value=SHAPE_MENU[self.shape_var.get()])
+        self.shape_combo = ttk.Combobox(shape_row, textvariable=self._shape_display,
+                                        values=[SHAPE_MENU[key] for key in SHAPES],
+                                        state="readonly", width=12,
+                                        font=("Segoe UI", _fs(9)))
+        self.shape_combo.pack(side=tk.LEFT)
+        self.shape_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: self._set_shape(SHAPE_BY_MENU[self._shape_display.get()]))
+
         # Compteurs manuels — « valide-moi, ne décide pas à ma place »
         self.manual_var = tk.BooleanVar(value=False)
         self.manual_chk = ttk.Checkbutton(self.grp_layout,
@@ -3688,6 +3793,8 @@ class PIGeneratorApp:
         needed = frame.winfo_reqheight()
         if needed <= 1:
             return None
+        # Les routes dépliées défilent au lieu de pousser la fenêtre (_draw_bom).
+        needed -= getattr(self, "_routes_extra_px", 0)
         # Ce que la fenêtre porte *en plus* du viewport : barre de titre,
         # séparateur, marges. Mesuré plutôt que constant, parce qu'il suit
         # lui-même la taille du texte.
@@ -3753,7 +3860,12 @@ class PIGeneratorApp:
 
             height = min(want, room)
             current = self.root.winfo_height()
-            if abs(height - current) <= FIT_DEAD_ZONE:
+            # La zone morte n'amortit que le rétrécissement. Elle bloquait aussi
+            # la croissance : une colonie Coolant P1 → P2 demandait 964 px dans
+            # une fenêtre de 950, l'écart de 14 tombait dans la zone, et le
+            # panneau défilait pour 14 px — ce que l'ajustement existe pour éviter.
+            if height == current or (height < current
+                                     and current - height <= FIT_DEAD_ZONE):
                 return
             width = self.root.winfo_width()
             x, y = self.root.winfo_x(), self.root.winfo_y()
@@ -3857,6 +3969,7 @@ class PIGeneratorApp:
             "yield_per_head": yield_per_head,
             "collection_hours": self.interval_var.get(),
             "use_sf": bool(self.sf_var.get()),
+            "shape": self.shape_var.get(),
         }
         if self.manual_var.get():
             for key, var in self.manual_vars.items():
@@ -3992,9 +4105,17 @@ class PIGeneratorApp:
             self.manual_frame.pack_forget()
         self._on_layout_change()
 
+    def _set_shape(self, key):
+        """Change la forme de la colonie et regénère l'aperçu."""
+        if key == self.shape_var.get():
+            return
+        self.shape_var.set(key)
+        self._on_layout_change()
+
     def _on_layout_change(self):
         """Persiste les réglages de layout et rafraîchit l'aperçu."""
         _update_window_config("layout_collection_hours", self.interval_var.get())
+        _update_window_config("layout_shape", self.shape_var.get())
         try:
             _update_window_config("layout_yield_per_head", int(float(self.yield_var.get())))
         except (ValueError, TypeError):
@@ -4010,6 +4131,16 @@ class PIGeneratorApp:
             on = hrs == self.interval_var.get()
             btn.config(bg=EVE["accent"] if on else EVE["bg_input"],
                        fg=EVE["bg_deep"] if on else EVE["fg_dim"])
+        shape_label = SHAPE_MENU.get(self.shape_var.get(), SHAPE_MENU[STANDARD])
+        if self._shape_display.get() != shape_label:
+            self._shape_display.set(shape_label)
+        # Une forme qui ne tient pas n'est pas dans la liste (ttk.Combobox ne sait
+        # pas griser une ligne). Celle déjà choisie reste affichée : la note
+        # orange du panneau dit pourquoi la colonie est restée standard.
+        shape_values = tuple(SHAPE_MENU[key] for key in SHAPES
+                             if key in self._available_shapes)
+        if tuple(self.shape_combo.cget("values")) != shape_values:
+            self.shape_combo.configure(values=shape_values)
 
         chain = self.chain_var.get()
         info = CHAINS.get(chain, {})
@@ -4221,11 +4352,39 @@ class PIGeneratorApp:
                 # tient sur une, et laissait un trou sous chacune.
                 note(f"⚠ {label}: asked for {rc.requested}, built {rc.actual}{why}",
                      EVE["orange"], ("Segoe UI", _fs(8)))
+            # La longueur de bras n'est pas relue sur la colonie : un bras demandé
+            # au-delà du plafond se dit ici, sinon la case afficherait 7 pendant
+            # que la carte en porte 4.
+            asked_arm = layout_opts.get("arm_length") or 0
+            if asked_arm > MAX_ARM_LEN_HARD and supports_arm_length(chain):
+                note(f"⚠ {self.manual_labels['arm_length'].cget('text')}: asked for "
+                     f"{asked_arm}, built {MAX_ARM_LEN_HARD} — a longer arm makes routes "
+                     f"of more than {MAX_ROUTE_STRUCTURES} structures, which EVE does not "
+                     "build", EVE["orange"], ("Segoe UI", _fs(8)))
+
+        shape_note = getattr(self, "_shape_note", None)
+        if shape_note:
+            note(f"⚠ {shape_note}", EVE["orange"], ("Segoe UI", _fs(8)))
 
         # Même mesure pour les avertissements : l'estimation à 52 caractères
         # valait pour la colonne de 470 px, et sous-comptait les lignes à 340.
         for warn in a["warnings"]:
             note(f"⚠ {warn}", EVE["red"], ("Segoe UI", _fs(8)))
+
+        # Ce que le jeu impose et que l'analyse ne dit pas encore
+        # (src/services/route_limits.py) : quel lien améliorer et ce que ça
+        # coûte, et les routes qu'EVE refusera de construire.
+        report_template = self._report_template()
+        if report_template:
+            for up in link_upgrades_needed(report_template, layout_opts):
+                cost = f"+{up.extra_cpu} CPU, +{up.extra_power} MW"
+                note(f"⬆ Upgrade link {up.a}–{up.b} in game to level {up.level} "
+                     f"({link_capacity_at_level(up.level):,} m³/h): "
+                     f"{cost if up.verified else cost + ' (estimate)'}",
+                     EVE["orange"], ("Segoe UI", _fs(8)))
+            too_long = long_routes_note(long_routes(report_template))
+            if too_long:
+                note(f"⚠ {too_long}", EVE["red"], ("Segoe UI", _fs(8)))
         c.config(height=max(_px(56), y + 2))
 
     def _required_p0(self, product, chain_name):
@@ -4385,6 +4544,8 @@ class PIGeneratorApp:
         """
         canvas = self.bom_canvas
         canvas.delete("all")
+        # Plus de table des routes : rien à retirer de la demande de hauteur.
+        self._routes_extra_px = 0
         self.bom_product_lbl.config(text="")
         canvas.create_text(8, 12, anchor=tk.W, text=message,
                            fill=EVE["fg_dim"], font=("Segoe UI", _fs(9)))
@@ -4393,6 +4554,8 @@ class PIGeneratorApp:
         self.current_analysis = None
         self._preview_error = None
         self._variant_pick = None
+        self._shape_note = None
+        self._available_shapes = (STANDARD,)
         self._sync_chain_display()
         # Sans ça, le panneau d'implantation garde les compteurs de la colonie
         # d'avant : il décrirait une colonie qui n'existe plus.
@@ -4510,8 +4673,22 @@ class PIGeneratorApp:
                 # décrivait la chaîne : CPU, pads et liste de courses d'une
                 # colonie qui n'était pas sur la planète.
                 self.current_preview = picked.template
+                # Une variante ne prend pas de forme : la liste n'en offre aucune.
+                self._shape_note = None
+                self._available_shapes = (STANDARD,)
             else:
-                self.current_preview = self._template_service.generate(config)
+                # La colonie standard d'abord : c'est sur elle qu'on juge les
+                # formes qui tiennent, et la forme choisie s'y pose ensuite —
+                # ce que fait TemplateService.generate, sans générer deux fois.
+                # Une forme refusée se dit dans le panneau ⑥ : la colonie
+                # standard affichée sans explication ressemblerait à un bouton
+                # sans effet.
+                layout = config["layout"]
+                standard = self._template_service.generate(
+                    {**config, "layout": {**layout, "shape": STANDARD}})
+                self.current_preview, self._shape_note = apply_shape(
+                    standard, layout.get("shape", STANDARD))
+                self._available_shapes = available_shapes(standard)
             # Une colonie qui ne tient pas ne laisse rien à dessiner au panneau ; autant
             # dire quel compteur a fait exploser le budget plutôt que de rester vide.
             if self.current_preview is None:
@@ -4519,6 +4696,7 @@ class PIGeneratorApp:
         except Exception as exc:
             _debug(f"_update_bom - preview failed: {exc}")
             self.current_preview = None
+            self._available_shapes = (STANDARD,)
         # Mesuré une seule fois par redessin : le panneau ⑥ et les blocs de BOM en
         # dessous lisent tous les deux ceci, et parcourir chaque pin deux fois par
         # frappe serait du gaspillage.
@@ -4797,6 +4975,7 @@ class PIGeneratorApp:
                       fill=EVE["accent_text"], font=("Segoe UI", _fs(9)),
                       tags=("routes_toggle",))
         y += lh
+        routes_top = y
         if opened and not routes:
             c.create_text(12, y, anchor=tk.W, text="This template has no routes.",
                           fill=EVE["fg_dim"], font=("Segoe UI", _fs(8)))
@@ -4820,6 +4999,15 @@ class PIGeneratorApp:
                     width=max(_px(120), right_x - text_x))
                 box = c.bbox(path)
                 y = (box[3] if box else y + lh) + lh // 2 + 2
+        # La table dépliée ne réclame aucune hauteur de fenêtre. Rapporté :
+        # *« if i expand the route section the screen is going crazy... i dont
+        # want the tool to resize... i know it will add a scroll bar... but it is
+        # ok »*. 161 routes faisaient grandir la fenêtre jusqu'au bord de
+        # l'écran, puis rétrécir le texte cran par cran, une reconstruction à
+        # chaque fois, et la barre de défilement qui apparaissait changeait la
+        # largeur, donc redessinait, donc relançait l'ajustement. `_panel_demand`
+        # retire cette hauteur : la fenêtre ne bouge pas, le panneau défile.
+        self._routes_extra_px = y - routes_top if opened else 0
 
         def _toggle_routes(_event=None):
             self._routes_open = not getattr(self, "_routes_open", False)
@@ -6804,11 +6992,11 @@ class PIGeneratorApp:
         grip.bind("<ButtonRelease-1>", stop_resize)
 
     def _draw_map(self, canvas, template, view_state=None, chrome=True):
-        """Dessine la carte visuelle du template (pins, liens, légende) avec zoom et panoramique.
+        """Dessine la carte visuelle du template (pins, liens) avec zoom et panoramique.
 
-        `chrome` porte ce qui explique la carte sans en faire partie : la
-        légende et le compteur de pins. Faux pour la planète vide de
-        l'accueil, où il n'y a rien à légender.
+        `chrome` porte ce qui explique la carte sans en faire partie : le
+        compteur de pins. Faux pour la planète vide de l'accueil, où il n'y a
+        aucune colonie à décompter.
         """
         canvas.delete("all")
         # Un widget non affiché renvoie 1, pas 0, donc le `or 700` gardait ce 1 et toute
@@ -7252,6 +7440,7 @@ class PIGeneratorApp:
         # web ; la lueur de l'actif, deux disques polygonaux en gray12 et gray25
         # posés sous sa plaque ; le halo d'une perle, un trait large en gray25.
         pin_plates = {}   # pin 0-based -> objet plaque
+        pin_glyph_spec = {}   # objet image -> (structure, px, couleur)
         link_active = _blend(LINK_CYAN, "#ffffff", 0.45)
         connected_edge = _blend("#1f2a3c", FOCUS_BLUE, 0.62)
 
@@ -7392,7 +7581,8 @@ class PIGeneratorApp:
         _STYLE_KEYS = {"line": ("fill", "width", "stipple"),
                        "polygon": ("fill", "outline", "stipple"),
                        "oval": ("fill", "outline", "width", "state"),
-                       "text": ("fill",)}
+                       "text": ("fill",),
+                       "image": ("image",)}
 
         def _clear_focus():
             for item, style in view_state.pop("focus_restore", []):
@@ -7476,6 +7666,15 @@ class PIGeneratorApp:
                                 tags=(f"pin{idx}", "focusfade", "map"))
                             canvas.tag_lower(fade, plate)
                             canvas.itemconfig(plate, state=tk.HIDDEN)
+                        elif kind == "image":
+                            # Le glyphe du client : même icône, alpha à 28 %.
+                            # Sans cette branche il restait seul en pleine
+                            # lumière au milieu d'une colonie effacée.
+                            spec = pin_glyph_spec.get(item)
+                            if spec is not None:
+                                pale = get_struct_glyph(*spec, dim=True)
+                                if pale is not None:
+                                    canvas.itemconfig(item, image=pale)
                         elif kind == "line":
                             canvas.itemconfig(item, stipple="gray25")
                         elif kind == "polygon":
@@ -7581,22 +7780,37 @@ class PIGeneratorApp:
                 outline=EVE["red"] if pin_idx in crowded else EVE["border_hi"],
                 width=max(1, int(1.4 * zoom)), tags=tags)
 
-            icon_size = r * 0.58
-            if sname == "Launch Pad":
-                draw_rocket_icon(tx, ty, icon_size, stroke, tags=tags)
-            elif sname == "Storage Facility":
-                draw_storage_icon(tx, ty, icon_size, stroke, tags=tags)
-            elif sname == "Extractor Control Unit":
-                draw_crosshair_icon(tx, ty, icon_size, stroke, tags=tags)
-            elif sname == "High-Tech Industry Facility":
-                draw_htf_icon(tx, ty, icon_size, stroke, tags=tags)
-            elif sname in ("Basic Industry Facility", "Advanced Industry Facility"):
-                draw_gear_icon(tx, ty, icon_size, stroke, tags=tags)
+            # L'icône du client, à 0,67 du diamètre de la plaque. Ces icônes
+            # remplissent leur propre cadre jusqu'au bord : à pleine largeur,
+            # leur anneau extérieur débordait la plaque sur la planète, et à
+            # 0,88 il se confondait avec son liseré en un double anneau. Mesuré
+            # sur quatre rendus de la vraie carte.
+            glyph_px = int(round(r * 1.34))
+            glyph = get_struct_glyph(sname, glyph_px, stroke)
+            if glyph is not None:
+                item = canvas.create_image(tx, ty, image=glyph, tags=tags)
+                # Ce que le survol doit savoir pour refabriquer le même glyphe
+                # en pâle : une image de canvas n'a pas de motif à lui appliquer.
+                pin_glyph_spec[item] = (sname, glyph_px, stroke)
             else:
-                font_size = max(8, int(r * 0.5))
-                canvas.create_text(tx, ty, text="?", fill=stroke,
-                                 font=("Segoe UI Symbol", font_size, "bold"),
-                                 tags=tags)
+                # Sans PIL ni dossier d'icônes, les formes vectorielles. Une
+                # plaque sans glyphe ne dit pas quel bâtiment elle est.
+                icon_size = r * 0.58
+                if sname == "Launch Pad":
+                    draw_rocket_icon(tx, ty, icon_size, stroke, tags=tags)
+                elif sname == "Storage Facility":
+                    draw_storage_icon(tx, ty, icon_size, stroke, tags=tags)
+                elif sname == "Extractor Control Unit":
+                    draw_crosshair_icon(tx, ty, icon_size, stroke, tags=tags)
+                elif sname == "High-Tech Industry Facility":
+                    draw_htf_icon(tx, ty, icon_size, stroke, tags=tags)
+                elif sname in ("Basic Industry Facility", "Advanced Industry Facility"):
+                    draw_gear_icon(tx, ty, icon_size, stroke, tags=tags)
+                else:
+                    font_size = max(8, int(r * 0.5))
+                    canvas.create_text(tx, ty, text="?", fill=stroke,
+                                     font=("Segoe UI Symbol", font_size, "bold"),
+                                     tags=tags)
 
             # Le nombre de têtes, sur l'extracteur qui les porte. C'est le
             # chiffre qui décide de tout le reste de la colonie — ce que le sol
@@ -7648,68 +7862,22 @@ class PIGeneratorApp:
                                 lambda e, i=pin_idx: on_grab(e, i))
 
         # Tout ce qui a été dessiné jusqu'ici est le template lui-même — on le tague pour
-        # que panoramique et zoom le déplacent/mettent à l'échelle en bloc. La légende
-        # ci-dessous, elle, reste fixe.
+        # que panoramique et zoom le déplacent/mettent à l'échelle en bloc. Le
+        # décompte ci-dessous, lui, reste fixe.
         canvas.addtag_all("map")
         # …sauf la planète. « map » est exactement l'ensemble que le panoramique déplace
         # et que le zoom met à l'échelle : l'en exclure est précisément ce qui la fige.
         canvas.dtag("planet", "map")
 
-        # Une légende de six lignes pour un seul pad décorative se lirait comme le
-        # mode d'emploi d'une pièce vide, et « 1 pins • 0 links » comme un rapport
-        # sur une colonie qui n'existe pas.
+        # « 1 pins • 0 links » sur un pad décoratif se lirait comme un rapport sur
+        # une colonie qui n'existe pas.
         if not chrome:
             return
 
-        legend_items = [
-            ("Launch Pad", "rocket"),
-            ("Storage Facility", "storage"),
-            ("Basic Industry", "gear"),
-            ("Advanced Industry", "gear"),
-            ("High-Tech Industry", "htf"),
-            ("Extractor (ECU)", "crosshair"),
-        ]
-        
-        row = _px(20)
-        lx, ly = 12, ch - (row * len(legend_items) + _px(40))
-        canvas.create_rectangle(lx - 4, ly - 8, lx + _px(155),
-                                ly + len(legend_items) * row + 8,
-                                fill=EVE["bg_panel"], outline=EVE["border"], width=1)
-        canvas.create_text(lx + 2, ly, text="Legend", fill=EVE["accent_text"],
-                           font=("Segoe UI", _fs(9), "bold"), anchor=tk.NW)
-        
-        for j, (name, icon_type) in enumerate(legend_items):
-            ly2 = ly + row + j * row
-            icx, icy = lx + _px(12), ly2
-
-            canvas.create_oval(icx - 8, icy - 8, icx + 8, icy + 8,
-                             fill="#1a1a1a", outline="#ffffff", width=1)
-            
-            if icon_type == "rocket":
-                pts = [icx, icy - 5, icx + 3, icy + 2, icx, icy + 5, icx - 3, icy + 2]
-                canvas.create_polygon(pts, fill="#ffffff", outline="#ffffff")
-            elif icon_type == "storage":
-                for r in [6, 4, 2]:
-                    canvas.create_oval(icx - r, icy - r, icx + r, icy + r,
-                                     fill="" if r > 2 else "#ffffff", outline="#ffffff", width=1)
-            elif icon_type == "gear":
-                canvas.create_oval(icx - 5, icy - 5, icx + 5, icy + 5, fill="#ffffff", outline="#ffffff")
-                canvas.create_oval(icx - 2, icy - 2, icx + 2, icy + 2, fill="#1a1a1a", outline="#ffffff")
-            elif icon_type == "htf":
-                canvas.create_oval(icx - 5, icy - 5, icx + 5, icy + 5, fill="#ffffff", outline="#ffffff")
-                canvas.create_polygon([icx, icy - 4, icx + 2, icy, icx - 2, icy], fill="#1a1a1a")
-            elif icon_type == "crosshair":
-                canvas.create_oval(icx - 5, icy - 5, icx + 5, icy + 5, fill="", outline="#ffffff", width=1)
-                canvas.create_line(icx, icy - 5, icx, icy + 5, fill="#ffffff", width=1)
-                canvas.create_line(icx - 5, icy, icx + 5, icy, fill="#ffffff", width=1)
-            
-            canvas.create_text(lx + 28, ly2, text=name, fill=EVE["fg"],
-                             font=("Segoe UI", _fs(8)), anchor=tk.W)
-
         # En bas à droite, et non en haut : le haut-droit porte désormais la
         # fenêtre de minuterie, qui flotte au-dessus du canevas et recouvrait ce
-        # décompte. Chaque coin de la carte n'a plus qu'une seule chose — légende
-        # en bas à gauche, notices en haut à gauche, minuterie en haut à droite.
+        # décompte. Chaque coin de la carte n'a plus qu'une seule chose — notices
+        # en haut à gauche, minuterie en haut à droite, décompte en bas à droite.
         zoom_pct = int(zoom * 100)
         canvas.create_text(cw - 12, ch - 12,
                            text=f"{len(pins)} pins  •  {len(links)} links  •  {zoom_pct}%",

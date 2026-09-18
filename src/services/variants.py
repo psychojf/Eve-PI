@@ -15,6 +15,7 @@ from collections import namedtuple
 from src.pi_data import RECIPES_P2_P3, RECIPES_P3_P4
 from src.services.factory_runtime import factory_runtime
 from src.services.partial_factory import generate_partial_factory
+from src.services.route_limits import long_routes, long_routes_note
 from src.services.template_service import (analyze_template,
                                            generate_template_json, get_tier,
                                            throughput_rows)
@@ -208,6 +209,19 @@ def enumerate_recipe_variants(config):
                 id=plan.id, label=plan.label, plan=plan.plan,
                 equivalent_chain=plan.equivalent_chain,
                 template=None, reason=_NO_LAYOUT, analysis=None, runtime=None,
+                output_per_hour=0.0, haul_m3_per_unit=None))
+            continue
+
+        # Une colonie dont EVE refuserait des routes n'est pas une proposition
+        # (2026-09-17 : *« this doesnt make sense to propose a not error-free
+        # template/variant »*). Même refus qu'une colonie qui ne tient pas : la
+        # ligne reste, en rouge, avec la raison, et ne se choisit pas.
+        too_long = long_routes_note(long_routes(template))
+        if too_long is not None:
+            variants.append(RecipeVariant(
+                id=plan.id, label=plan.label, plan=plan.plan,
+                equivalent_chain=plan.equivalent_chain,
+                template=None, reason=too_long, analysis=None, runtime=None,
                 output_per_hour=0.0, haul_m3_per_unit=None))
             continue
 

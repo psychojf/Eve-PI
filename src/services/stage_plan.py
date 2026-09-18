@@ -26,8 +26,10 @@ EDIT = "edit"          # une édition qui garde les structures déjà posées
 REBUILD = "rebuild"    # une autre colonie : rien d'honnête à conserver
 REFUSE = "refuse"      # le contrôle ne sait pas agir ici
 
-# Le produit, la chaîne et la planète décident *quelle* colonie c'est.
-_RESHAPING = ("product_name", "chain_name", "planet_type")
+# Le produit, la chaîne et la planète décident *quelle* colonie c'est. La forme
+# (layout_shapes) repose chaque structure : aucune position posée à la main ne
+# peut survivre à un changement de forme, c'est donc une reconstruction.
+_RESHAPING = ("product_name", "chain_name", "planet_type", "shape")
 
 # Des champs du template : la carte s'y ré-accorde sans qu'aucun pin ne bouge.
 # Le rayon n'atteint qu'un seul endroit — `links_cost`, qui facture chaque lien à

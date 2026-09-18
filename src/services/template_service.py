@@ -1112,13 +1112,17 @@ def get_full_supply_chain(product_name, target_chain):
 BASE_SPACING = 0.012
 CENTER_LAT = 1.57079
 MAX_ARM_LEN = 4
-# Le jeu lui-même n'a aucune règle de longueur de bras — seulement une capacité
-# de lien : un lien de niveau 0 déplace 1250 m³/h et une usine P1→P2 pousse
-# ~38 m³/h dans son bras, donc un bras ne sature qu'au-delà de 30 usines. 8 laisse
-# une marge confortable ; c'est le plafond de la surcharge manuelle arm_length et
-# de ce que l'éditeur accepte d'analyser, tandis que MAX_ARM_LEN reste le défaut
-# compact que le générateur choisit de lui-même.
-MAX_ARM_LEN_HARD = 8
+# Le plafond de la surcharge manuelle arm_length et de la recherche de
+# partial_factory. Il valait 8, au nom d'une seule règle du jeu connue alors, la
+# capacité d'un lien. Le jeu en a une seconde : une route traverse au plus 7
+# structures (route_limits, mesuré en jeu le 2026-09-16), et la plus longue route
+# d'une colonie générée vaut la longueur de bras + 3. Sur 604 colonies à usines
+# pleines : 0 route trop longue à 4, 302 colonies touchées à 5, 453 à 6, toutes à
+# 7 et à 8. Plafonné à 4 le 2026-09-17, à la demande de JF.
+MAX_ARM_LEN_HARD = 4
+# Ce que l'éditeur accepte d'analyser : un template importé, ou bâti avant le
+# plafond, aux bras plus longs reste modifiable.
+MAX_ARM_LEN_EDITABLE = 8
 MAX_LAUNCH_PADS = 4
 LINK_CAPACITY_M3H = 1250   # débit d'un lien de niveau 0, valeur du jeu
 
@@ -1230,6 +1234,23 @@ def _place_factory_row(row_lat, row_center_lon, count, spacing, arm_len=MAX_ARM_
 # =============================================================================
 
 def generate_template_json(product_name, chain_name, planet_type, cc_level, planet_diameter,
+                           use_sf=False, layout=None):
+    """La colonie d'une chaîne, chaque route dans les 7 structures qu'EVE bâtit.
+
+    Les générateurs posent des rangées par bras et par pad, et P1 → P3 mettait
+    un troisième P2 sur la rangée du pad central, ses intrants chargés depuis un
+    pad extérieur : deux routes de 8 dans 192 des 3 184 colonies par défaut
+    (2026-09-17). `fit_routes` les charge au pad le plus proche. Miroir de
+    `generateTemplate` dans l'outil web. Import tardif : route_limits importe
+    ce module.
+    """
+    from src.services.route_limits import fit_routes
+    template = _generate_raw_template(product_name, chain_name, planet_type, cc_level,
+                                      planet_diameter, use_sf=use_sf, layout=layout)
+    return None if template is None else fit_routes(template)[0]
+
+
+def _generate_raw_template(product_name, chain_name, planet_type, cc_level, planet_diameter,
                            use_sf=False, layout=None):
     """Aiguille vers le bon générateur de template selon la chaîne de production choisie."""
     opts = LayoutOptions.from_config(layout)
@@ -1772,11 +1793,9 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
         lp_type = STRUCTURE_IDS["Launch Pad"][planet_type]
         sp = BASE_SPACING
 
-        # La longueur de bras est une convention, pas une règle du jeu : des bras
-        # plus longs ne coûtent que de la marge de lien (un lien de niveau 0 nourrit
-        # 30 usines P1→P2 et plus), donc un arm_length manuel peut étirer les rangées
-        # jusqu'à MAX_ARM_LEN_HARD — p. ex. 2 pads × 2 bras de 6 = l'implantation
-        # double-P2 à 24 usines.
+        # Un arm_length manuel étire les rangées jusqu'à MAX_ARM_LEN_HARD, pas
+        # au-delà : un bras plus long pose des routes de plus de 7 structures,
+        # qu'EVE ne bâtit pas (voir MAX_ARM_LEN_HARD).
         arm_len = _clamp(opts.arm_length, 1, MAX_ARM_LEN_HARD, default=MAX_ARM_LEN)
 
         # Un lien par usine supplémentaire, long d'un espacement (les bras sont
@@ -2664,11 +2683,14 @@ class TemplateService:
         "planet_diameter",
     )
 
+    # Pourquoi la dernière forme demandée n'a pas été appliquée, ou None.
+    shape_note: Optional[str] = None
+
     def generate(self, config: dict[str, Any], *, use_sf: bool = False) -> Optional[dict]:
         for key in self.REQUIRED_KEYS:
             if key not in config:
                 raise KeyError(f"Missing required key: {key}")
-        return generate_template_json(
+        template = generate_template_json(
             config["product_name"],
             config["chain_name"],
             config["planet_type"],
@@ -2677,6 +2699,17 @@ class TemplateService:
             use_sf=config.get("use_sf", use_sf),
             layout=config.get("layout"),
         )
+        # La forme se pose après la génération, sur la colonie standard : le
+        # moteur reste celui que l'outil web tient en parité, et « standard »
+        # rend exactement la colonie d'avant. Import tardif : layout_shapes
+        # importe ce module.
+        from src.services.layout_shapes import apply_shape
+        # Le panneau passe un dict ; certains appelants passent déjà un
+        # LayoutOptions, qui ne porte pas de forme.
+        layout = config.get("layout")
+        shape = layout.get("shape") if isinstance(layout, dict) else None
+        template, self.shape_note = apply_shape(template, shape)
+        return template
 
     def why_not(self, config: dict[str, Any], *, use_sf: bool = False) -> Optional[str]:
         """Raison lisible de l'échec de `generate` sur cette même config."""

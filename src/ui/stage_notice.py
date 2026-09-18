@@ -83,10 +83,10 @@ def storage_offer_text(suggestion, switch=None):
 class StageNotice:
     """Bandeau posé en haut à gauche de la carte, avec son bouton quand il peut agir.
 
-    La légende de la carte occupe le bas-gauche, le décompte
-    des pins le bas-droit et la minuterie le haut-droit. Chaque coin n'a qu'une
-    seule chose, et celui-ci est le seul libre — ce qui convient à une alerte,
-    qui doit se lire avant le reste plutôt que sous lui.
+    Le décompte des pins occupe le bas-droit et la minuterie le
+    haut-droit. Chaque coin n'a qu'une seule chose, et celui-ci est celui qui se
+    lit d'abord — ce qui convient à une alerte, qui doit se lire avant le reste
+    plutôt que sous lui.
     """
 
     _MARGIN = 10
