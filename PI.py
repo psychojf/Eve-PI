@@ -40,13 +40,9 @@ from src.pi_data import (
     STRUCTURE_IDS,
 )
 from src.services.colony_model import (MIN_SEPARATION, EditError, ParseError,
-                                       add_factory, crowded_pins, editability,
-                                       move_pin, parse_colony, remove_factory,
-                                       route_hubs, template_shape_error)
+                                       add_factory, crowded_pins, parse_colony,
+                                       remove_factory, template_shape_error)
 from src.services.history import MAX_ENTRIES, History
-from src.services.stage_edit import apply_edit, apply_retune
-from src.services.stage_plan import (EDIT, INERT, REBUILD, REFUSE, RETUNE,
-                                     plan_for)
 from src.services.mixed_p2 import (MIXED_CHAIN, MixedP2Error,
                                    generate_mixed_p2_template,
                                    normalize_assignments,
@@ -91,14 +87,13 @@ from src.services.template_service import (
     throughput_rows,
 )
 from src.services.eve_time import eve_clock_text
-from src.ui.collect_bar import CollectBar
-from src.ui.factory_timer import FactoryTimer
 from src.ui.more_tools import (BUG_REPORT_URL, COPYRIGHT_LINES,
                                MY_TOOLS, RECOMMENDED_TOOLS, TERMS_SECTIONS)
 from src.ui.screens import (DESKTOP_RAIL, DESKTOP_SCREENS, RAIL_ITEMS,
                             RAIL_SCREENS, SCREEN_MODE_LABELS)
-from src.ui.stage_notice import StageNotice
-from src.services.storage_suggestion import higher_tier_chain, storage_suggestion
+from src.ui.map_render import draw_map
+from src.ui.scout_panel import build_scout
+from src.ui.stage_view import StageView
 # `src/ui/template_editor.py` n'est plus importe : sa fenetre redessinait la
 # meme planete dans une seconde scene, et Build est desormais le seul endroit
 # ou une colonie se regarde et se change. Le fichier reste en place, dormant,
@@ -602,6 +597,23 @@ FIT_DEAD_ZONE = 24
 # La hauteur que réclament les écrans qui défilent par nature. Assez pour trois
 # rangées de cartes de bibliothèque ; le reste se fait défiler, et c'est bien.
 FIT_ROOMY_H = 950
+# La part de la hauteur demandée qui ne suit PAS la taille du texte : marges,
+# bordures, canevas à hauteur fixe, et les ~51 px de chrome de fenêtre.
+#
+# Mesuré le 2026-09-22 en forçant l'échelle de 1,00 à 0,80 sur deux colonies que
+# tout oppose — P1 → P3 (1091 px à l'échelle 1, part fixe 41 %) et P1 → P2
+# (964 px, 46 %). L'ajustement supposait cette part nulle, donc qu'une échelle à
+# 0,90 rendrait un panneau 10 % plus court ; il rend 6 % plus court. Il visait
+# 0,91 là où il fallait 0,85, débordait encore, et se reprenait au passage
+# suivant — deux reconstructions complètes, les deux clignotements signalés à
+# chaque génération d'une colonie trop haute pour l'écran.
+#
+# Le modèle ne fait que viser juste du premier coup : quand il se trompe, le
+# passage suivant corrige exactement comme avant. Il change la vitesse de
+# convergence, jamais le résultat — d'où une valeur unique plutôt qu'une
+# mesure par colonie. Vérifié : de 0,35 à 0,41 le premier saut tombe sur le
+# même cran.
+FIT_FIXED_SHARE = 0.41
 
 # Le libellé du choix vide, comme sur le site. Ce n'est pas un produit : tant
 # qu'il est sélectionné, l'outil ne décrit aucune colonie.
@@ -3366,6 +3378,17 @@ class PIGeneratorApp:
 
         viewport.bind_all("<MouseWheel>", _wheel, add="+")
 
+        self._build_step_product(scroll_frame)
+        self._build_step_chain(scroll_frame)
+        self._build_step_planet(scroll_frame)
+        self._build_step_radius(scroll_frame)
+        self._build_step_cc(scroll_frame)
+        self._build_step_layout(scroll_frame)
+        self._build_bom_group(scroll_frame)
+        self._build_panel_actions(scroll_frame)
+
+    def _build_step_product(self, scroll_frame):
+        """Étape 1 : le produit, et la liste maîtresse dont il est tiré."""
         # ── ÉTAPE 1 : PRODUIT ─────────────────────────────────────────
         # On construit la liste maîtresse : tous les produits de toutes les chaînes,
         # triés par palier puis par nom, avec l'étiquette de palier [Px].
@@ -3407,6 +3430,8 @@ class PIGeneratorApp:
         self.product_combo.pack(fill=tk.X, padx=8, pady=(2, 8))
         self.product_combo.bind("<<ComboboxSelected>>", lambda e: self._on_product_pick())
 
+    def _build_step_chain(self, scroll_frame):
+        """Étape 2 : la chaîne de production."""
         # ── ÉTAPE 2 : CHAÎNE ──────────────────────────────────────────
         grp2 = tk.Frame(scroll_frame, bg=EVE["bg_card"],
                         highlightbackground=EVE["border"], highlightthickness=1)
@@ -3424,6 +3449,8 @@ class PIGeneratorApp:
         self.chain_combo.pack(fill=tk.X, padx=8, pady=(2, 8))
         self.chain_combo.bind("<<ComboboxSelected>>", lambda e: self._on_selection_change(e, "chain"))
 
+    def _build_step_planet(self, scroll_frame):
+        """Étape 3 : le type de planète."""
         # ── ÉTAPE 3 : TYPE DE PLANÈTE ─────────────────────────────────
         grp3 = tk.Frame(scroll_frame, bg=EVE["bg_card"],
                         highlightbackground=EVE["border"], highlightthickness=1)
@@ -3440,6 +3467,8 @@ class PIGeneratorApp:
         self.planet_combo.pack(fill=tk.X, padx=8, pady=(2, 8))
         self.planet_combo.bind("<<ComboboxSelected>>", lambda e: self._on_selection_change(e, "planet"))
 
+    def _build_step_radius(self, scroll_frame):
+        """Étape 4 : le rayon de la planète."""
         # ── ÉTAPE 4 : RAYON DE LA PLANÈTE ─────────────────────────────
         grp4 = tk.Frame(scroll_frame, bg=EVE["bg_card"],
                         highlightbackground=EVE["border"], highlightthickness=1)
@@ -3475,6 +3504,8 @@ class PIGeneratorApp:
         self.sf_frame.pack(fill=tk.X, padx=8, pady=(0, 6))
         self.sf_frame.pack_forget()
 
+    def _build_step_cc(self, scroll_frame):
+        """Étape 5 : le niveau du Command Center."""
         # ── ÉTAPE 5 : NIVEAU DU CC ────────────────────────────────────
         grp5 = tk.Frame(scroll_frame, bg=EVE["bg_card"],
                         highlightbackground=EVE["border"], highlightthickness=1)
@@ -3500,6 +3531,8 @@ class PIGeneratorApp:
             btn.bind("<Button-1>", _make_cc_click())
         self._cc_buttons = list(cc_frame.winfo_children())
 
+    def _build_step_layout(self, scroll_frame):
+        """Étape 6 : l'implantation — rendement, forme, compteurs manuels, sources."""
         # ── ÉTAPE 6 : IMPLANTATION ────────────────────────────────────
         # La PI n'a pas de bonne réponse unique, donc ce qui détermine vraiment la forme
         # d'une colonie — la puissance à laquelle tournent les extracteurs, la fréquence
@@ -3521,8 +3554,11 @@ class PIGeneratorApp:
         # La variable reste ici, elle : c'est elle que lisent la génération, la
         # BOM et la minuterie, et la barre s'y branche plutôt que d'en tenir une
         # seconde.
-        self.interval_var = tk.IntVar(
-            value=cfg_layout.get("layout_collection_hours", DEFAULT_COLLECTION_HOURS))
+        # Toujours DEFAULT_COLLECTION_HOURS à l'ouverture, jamais le dernier
+        # intervalle utilisé. Demandé le 2026-09-22 : « the collection interval
+        # should be 24h by default ». Le changer en cours de session marche
+        # comme avant — c'est seulement au démarrage qu'on repart de 24 h.
+        self.interval_var = tk.IntVar(value=DEFAULT_COLLECTION_HOURS)
         self._interval_buttons = {}
         self._collect_bar = None
 
@@ -3547,8 +3583,11 @@ class PIGeneratorApp:
         # suffisaient à faire défiler le panneau d'une colonie P1 → P4 sur un
         # écran de 1440 — l'ajustement ne rétrécit pas le texte pour moins d'un
         # cran de 5 %.
-        saved_shape = cfg_layout.get("layout_shape", STANDARD)
-        self.shape_var = tk.StringVar(value=saved_shape if saved_shape in SHAPES else STANDARD)
+        # Toujours STANDARD à l'ouverture, jamais la dernière forme choisie.
+        # Demandé le 2026-09-22 : « the Shape i want it to standard by
+        # default ». Une forme est un choix qu'on fait pour une colonie
+        # donnée ; la retrouver posée sur la suivante n'était pas voulu.
+        self.shape_var = tk.StringVar(value=STANDARD)
         # Les formes que la colonie montrée peut prendre ; la liste n'offre qu'elles.
         self._available_shapes = (STANDARD,)
         shape_row = tk.Frame(self.grp_layout, bg=EVE["bg_card"])
@@ -3649,6 +3688,8 @@ class PIGeneratorApp:
             lambda e: (self._refresh_layout_panel()
                        if e.width != self._layout_drawn_width else None))
 
+    def _build_bom_group(self, scroll_frame):
+        """La nomenclature, sous les étapes."""
         # ── NOMENCLATURE (BOM) ────────────────────────────────────────
         self.grp_bom = tk.Frame(scroll_frame, bg=EVE["bg_card"],
                                 highlightbackground=EVE["border"], highlightthickness=1)
@@ -3686,6 +3727,8 @@ class PIGeneratorApp:
 
         self.bom_canvas.bind("<Configure>", _on_bom_resize)
 
+    def _build_panel_actions(self, scroll_frame):
+        """Les boutons d'action, au pied du panneau."""
         # ── BOUTONS D'ACTION ──────────────────────────────────────────
         btn_frame = ttk.Frame(scroll_frame)
         btn_frame.pack(fill=tk.X, padx=8, pady=(6, 10))
@@ -3761,6 +3804,12 @@ class PIGeneratorApp:
                 self.root.after_cancel(job)
             except Exception:
                 pass
+        else:
+            # Aucune demande en attente : celle-ci part avec le droit de
+            # rétrécir, sauf si `_set_interval` vient de le retirer. Quand une
+            # demande est déjà en attente on garde son drapeau — la plus
+            # permissive des deux décrit le plus grand changement.
+            self._fit_grow_only = getattr(self, "_fit_grow_only", False)
         self._fit_job = self.root.after(180, self._fit_window_to_content)
 
     def _panel_demand(self):
@@ -3829,6 +3878,9 @@ class PIGeneratorApp:
         self._fit_job = None
         if getattr(self, "_fitting", False):
             return
+        # Consommé ici : le drapeau ne vaut que pour la demande qui l'a posé.
+        grow_only = getattr(self, "_fit_grow_only", False)
+        self._fit_grow_only = False
         want = self._panel_demand()
         if want is None:
             return
@@ -3841,9 +3893,25 @@ class PIGeneratorApp:
             screen_h = self.root.winfo_screenheight()
             room = max(_px(520), screen_h - FIT_SCREEN_MARGIN)
 
-            if want > room:
+            # Un changement qui ne touche qu'au *compte rendu* de la colonie ne
+            # rend pas le texte plus petit : rétrécir toute l'application parce
+            # qu'un tableau par tournée s'est allongé de deux lignes coûte une
+            # reconstruction complète — le clignotement que cette page cherche
+            # justement à éviter. La colonie, elle, garde ce droit.
+            if grow_only:
+                pass
+            elif want > room:
                 # L'écran est épuisé : c'est au texte de céder, juste assez.
-                if _apply_fit_scale(FIT_SCALE * room / float(want)):
+                #
+                # hauteur(échelle) = variable × échelle + fixe, et non
+                # hauteur × échelle : voir FIT_FIXED_SHARE pour la mesure et
+                # pour les deux clignotements que la version proportionnelle
+                # coûtait. On résout pour la plus grande échelle qui tienne.
+                fixed = want * FIT_FIXED_SHARE
+                varying = want - fixed
+                target = (FIT_SCALE * (room - fixed) / varying if varying > 0
+                          else FIT_SCALE)
+                if _apply_fit_scale(target):
                     self._fit_last_demand = None
                     self._rebuild_ui()
                     return
@@ -3851,9 +3919,24 @@ class PIGeneratorApp:
                 # La pression est retombée. On ne rend le texte que si la
                 # colonie tient encore une fois rendu — sinon on rendrait, ça
                 # déborderait, on reprendrait, indéfiniment.
-                bigger = FIT_SCALE + FIT_SCALE_STEP
-                if want * (bigger / FIT_SCALE) <= room:
-                    if _apply_fit_scale(bigger):
+                #
+                # D'un seul coup jusqu'au plus grand cran qui tient, et non
+                # d'un cran de 5 % par passage : chaque cran coûte un
+                # `_rebuild_ui` complet, et l'ajustement ne repart qu'au
+                # rafraîchissement suivant. Remonter de 0,85 à 1,0 après un
+                # « Start over » en faisait donc trois à la file, espacés d'une
+                # demi-seconde — rapporté le 2026-09-22 comme *« i did start
+                # over and it blinked like 6 times before stoping »*, six crans
+                # depuis une colonie P1 → P3 remise à zéro.
+                #
+                # Le nombre de crans est tronqué, jamais arrondi : _apply_fit_scale
+                # arrondit au cran le plus proche, et viser le maximum exact
+                # pouvait le faire arrondir au-dessus — l'interface débordait,
+                # le passage suivant rétrécissait, et les deux se relançaient.
+                headroom = min(1.0, FIT_SCALE * room / float(want))
+                steps = int((headroom - FIT_SCALE) / FIT_SCALE_STEP + 1e-9)
+                if steps >= 1:
+                    if _apply_fit_scale(FIT_SCALE + steps * FIT_SCALE_STEP):
                         self._fit_last_demand = None
                         self._rebuild_ui()
                         return
@@ -3865,7 +3948,8 @@ class PIGeneratorApp:
             # une fenêtre de 950, l'écart de 14 tombait dans la zone, et le
             # panneau défilait pour 14 px — ce que l'ajustement existe pour éviter.
             if height == current or (height < current
-                                     and current - height <= FIT_DEAD_ZONE):
+                                     and (grow_only
+                                          or current - height <= FIT_DEAD_ZONE)):
                 return
             width = self.root.winfo_width()
             x, y = self.root.winfo_x(), self.root.winfo_y()
@@ -4072,8 +4156,18 @@ class PIGeneratorApp:
         self._on_layout_change()
 
     def _set_interval(self, hours):
-        """Change l'intervalle de collecte et régénère l'aperçu."""
+        """Change l'intervalle de collecte et régénère l'aperçu.
+
+        L'intervalle ne change pas la colonie : il change ce que la BOM en
+        *dit* — les chiffres par tournée, et l'avertissement de stockage. La
+        fenêtre n'a donc pas à rétrécir derrière lui. Elle le faisait : les
+        blocs par tournée valent 26 px de plus à 168 h qu'à 24 h, deux de plus
+        que FIT_DEAD_ZONE, si bien que chaque aller-retour entre deux
+        intervalles redimensionnait toute la fenêtre — signalé comme un
+        clignotement d'une seconde à chaque clic.
+        """
         self.interval_var.set(hours)
+        self._fit_grow_only = True
         self._on_layout_change()
 
     def _prefill_manual_counts(self):
@@ -4113,9 +4207,13 @@ class PIGeneratorApp:
         self._on_layout_change()
 
     def _on_layout_change(self):
-        """Persiste les réglages de layout et rafraîchit l'aperçu."""
-        _update_window_config("layout_collection_hours", self.interval_var.get())
-        _update_window_config("layout_shape", self.shape_var.get())
+        """Persiste les réglages de layout et rafraîchit l'aperçu.
+
+        L'intervalle et la forme ne sont plus persistés : ils repartent de
+        24 h et de « standard » à chaque ouverture (voir leur création dans
+        `_build_step_layout`). Le rendement, lui, est une hypothèse sur le
+        personnage et non sur la colonie — celui-là se garde.
+        """
         try:
             _update_window_config("layout_yield_per_head", int(float(self.yield_var.get())))
         except (ValueError, TypeError):
@@ -6159,726 +6257,11 @@ class PIGeneratorApp:
         l'autre fenêtre. Le nom de la méthode est resté : quatre appelants la
         connaissent, et ce qu'elle fait n'a pas changé, seulement où.
 
-        « source » dit d'où vient la colonie : « draft » pour ce que le panneau
-        a généré, « library », « external » ou « history » pour une colonie
-        venue d'ailleurs, « mixed » pour le planificateur P2 mixte. Portage du
-        `stageSource` de l'outil web : seule une colonie du brouillon a un
-        template par défaut où revenir, ou une chaîne à changer.
+        Le corps vit dans `src/ui/stage_view.StageView` depuis le 2026-09-22 :
+        730 lignes et vingt-six fermetures sur les mêmes variables décrivaient
+        un objet qui n'était écrit nulle part.
         """
-        # Une colonie venue d'ailleurs — bibliothèque, JSON, historique — n'est
-        # pas la ligne choisie : le panneau revient à la chaîne plutôt que de
-        # continuer à décrire une variante qui a quitté la planète.
-        if (self._variant_pick is not None
-                and template != self._variant_pick.get("template")):
-            self._variant_pick = None
-        self._clear_stage()
-        container = ttk.Frame(self._stage_host)
-        container.pack(fill=tk.BOTH, expand=True)
-        # `popup` porte tout ce qui n'est pas de la mise en page : after,
-        # presse-papiers, parent de boîte de dialogue. C'est la fenêtre
-        # principale maintenant qu'il n'y a plus de fenêtre à part.
-        popup = self.root
-
-        top_frame = ttk.Frame(container)
-        top_frame.pack(fill=tk.X, padx=10, pady=10)
-
-        # Le document ouvert. Un glisser le remplace, donc tout ce qui suit lit
-        # doc["template"] plutôt que de capturer l'original.
-        doc = {"template": template, "config": self._stage_config(),
-               # Vrai dès qu'une structure a été déplacée à la main : c'est la
-               # seule chose qui rende la question du plan intéressante. Tant
-               # que c'est faux, il n'y a aucune mise en page à protéger.
-               "hand_edited": False,
-               # Ce qui est sur la scène est-il déjà dans la bibliothèque ?
-               # `hand_edited` protège l'arrangement d'une reconstruction ;
-               # celui-ci répond à une autre question — « perdrait-on quelque
-               # chose à remplacer ceci ». Une colonie qu'on vient d'ouvrir
-               # depuis la bibliothèque est arrangée *et* classée : la protéger
-               # d'un rebuild est juste, demander de l'enregistrer ne l'est pas.
-               "filed": False,
-               "source": source}
-        # La fenêtre JSON lit ceci, et non `current_preview` : après un glisser,
-        # les deux diffèrent, et exporter l'aperçu du panneau rendrait la colonie
-        # d'avant le déplacement. C'est ce qu'on est *en train de regarder* qui
-        # doit partir dans le presse-papiers.
-        self._stage_state["doc"] = doc
-
-        btn_bar = ttk.Frame(top_frame)
-        btn_bar.pack(fill=tk.X, pady=(0, 5))
-
-        def copy_json():
-            popup.clipboard_clear()
-            popup.clipboard_append(json.dumps(doc["template"], default=str))
-            messagebox.showinfo("Copied", "Template JSON copied to clipboard!\n\nPaste into EVE Online PI import.", parent=popup)
-
-        tk.Button(btn_bar, text="📋 Copy JSON", font=("Segoe UI", _fs(9), "bold"),
-                  bg=EVE["bg_card"], fg=EVE["fg"], activebackground=EVE["border_hi"],
-                  activeforeground=EVE["fg_bright"], relief=tk.FLAT, cursor="hand2", command=copy_json).pack(side=tk.LEFT)
-
-        def reset_view():
-            view_state["zoom"] = 1.0
-            view_state["pan_x"] = 0
-            view_state["pan_y"] = 0
-            # Explicite uniquement : c'est le seul endroit où le cadrage a le droit de
-            # resuivre la colonie après que des structures ont été déplacées.
-            view_state["fit"] = None
-            self._draw_map(map_canvas, doc["template"], view_state)
-
-        reset_view_btn = tk.Button(btn_bar, text="🔄 Reset View", font=("Segoe UI", _fs(9), "bold"),
-                                   bg=EVE["bg_card"], fg=EVE["fg"], activebackground=EVE["border_hi"],
-                                   activeforeground=EVE["fg_bright"], relief=tk.FLAT, cursor="hand2",
-                                   command=reset_view)
-        reset_view_btn.pack(side=tk.LEFT, padx=(10, 0))
-        self._stage_state["reset_view_btn"] = reset_view_btn
-
-        def reset_template():
-            """Remet la colonie que le générateur a faite, en gardant chaque réglage.
-
-            Demandé sur la planète de l'outil web : *« reset the template to the
-            default one ... the first one generated »*. Laisse tomber les
-            déplacements, les structures ajoutées ou retirées et une suggestion de
-            stockage appliquée ; garde tous les réglages du panneau, ce qui le
-            distingue de « Start over ». Pas de dialogue, comme les autres
-            réglages.
-            """
-            preview = self.current_preview
-            if preview is None or doc.get("source") != "draft":
-                return
-            doc["template"] = preview
-            doc["hand_edited"] = False
-            doc["filed"] = False
-            doc["config"] = self._stage_config()
-            _stage_refusal(None)
-            self._draw_map(map_canvas, doc["template"], view_state)
-            _refresh_budget()
-            _refresh_json()
-            self._history.record(doc["template"], "Reset template", kind="edit")
-
-        # Présent seulement pour une colonie du brouillon : une colonie venue de
-        # la bibliothèque ou d'un fichier n'a pas de colonie générée où revenir.
-        reset_template_btn = tk.Button(
-            btn_bar, text="↶ Reset template", font=("Segoe UI", _fs(9), "bold"),
-            bg=EVE["bg_card"], fg=EVE["fg"], activebackground=EVE["border_hi"],
-            activeforeground=EVE["fg_bright"], disabledforeground=EVE["fg_dim"],
-            relief=tk.FLAT, cursor="hand2", command=reset_template)
-        reset_template_btn.pack(side=tk.LEFT, padx=(10, 0))
-        # Pas encore view_state : il est lié plus bas, sur le même dict.
-        self._stage_state["reset_template_btn"] = reset_template_btn
-
-        def save_to_library():
-            # doc["template"], et pas celui avec lequel cette fenêtre s'est ouverte : ce
-            # qui est à l'écran maintenant — déplacé, ou suivi depuis les réglages — est
-            # ce que l'utilisateur veut dire par « enregistre ça ».
-            suggested = doc["template"].get("Cmt") or self.product_var.get()
-            if self._save_template_to_library(doc["template"], suggested, popup):
-                # Elle est dans la bibliothèque : plus rien à protéger.
-                doc["filed"] = True
-
-        tk.Button(btn_bar, text="💾 Save to Library", font=("Segoe UI", _fs(9), "bold"),
-                  bg=EVE["bg_card"], fg=EVE["fg"], activebackground=EVE["border_hi"],
-                  activeforeground=EVE["fg_bright"], relief=tk.FLAT, cursor="hand2",
-                  command=save_to_library).pack(side=tk.LEFT, padx=(10, 0))
-
-        # À côté de Save, et non dans les réglages : les compteurs qu'on veut
-        # abandonner sont ceux qu'on a sous les yeux, et un brouillon qu'on a
-        # peaufiné jusque dans une impasse n'a pas d'autre sortie.
-        tk.Button(btn_bar, text="↺ Start over", font=("Segoe UI", _fs(9), "bold"),
-                  bg=EVE["bg_card"], fg=EVE["fg"], activebackground=EVE["border_hi"],
-                  activeforeground=EVE["fg_bright"], relief=tk.FLAT, cursor="hand2",
-                  command=self._start_over).pack(side=tk.LEFT, padx=(10, 0))
-
-        def route_storage():
-            """Relie chaque launch pad et entrepôt aux usines qu'il peut nourrir.
-
-            Pour un entrepôt arrivé sans route — une colonie importée, ou posée
-            en jeu. EVE n'admet aucune route entre deux entrepôts : un hub ne se
-            rend utile qu'en nourrissant les usines. Portage du bouton de
-            « Structures & budget » dans l'outil web.
-            """
-            try:
-                routed = route_hubs(parse_colony(doc["template"]))
-            except (ParseError, EditError) as exc:
-                # Le refus se lit sur la planète, comme celui d'un réglage.
-                _stage_refusal(str(exc))
-                return
-            added = len(routed.routes) - len(doc["template"].get("R", []))
-            doc["template"] = routed.to_template()
-            # Des routes qu'aucun générateur n'écrit : un rebuild les perdrait,
-            # exactement comme il perdrait un glisser.
-            doc["hand_edited"] = True
-            _stage_refusal(None)
-            self._draw_map(map_canvas, doc["template"], view_state)
-            _refresh_budget()
-            _refresh_json()
-            self._history.record(doc["template"], f"Routed storage ({added} routes)",
-                                 kind="edit")
-            messagebox.showinfo(
-                "Route storage to factories",
-                f"Added {added} {'route' if added == 1 else 'routes'}.\n\n"
-                "Storage facilities do not receive imports: on each visit, move "
-                "the inputs into them with an Expedited Transfer from a launch pad.",
-                parent=popup)
-
-        tk.Button(btn_bar, text="🔗 Route storage", font=("Segoe UI", _fs(9), "bold"),
-                  bg=EVE["bg_card"], fg=EVE["fg"], activebackground=EVE["border_hi"],
-                  activeforeground=EVE["fg_bright"], relief=tk.FLAT, cursor="hand2",
-                  command=route_storage).pack(side=tk.LEFT, padx=(10, 0))
-
-        # Permanent, pas soulevé par un clic. Qu'EVE signale une implantation
-        # qu'il ne peut pas poser ou qu'il la réécrive en silence tient à une
-        # seule case de sa fenêtre d'import, et quand cette fenêtre est ouverte
-        # l'outil n'a plus rien à dire. C'est donc dit ici, à côté des boutons
-        # qui livrent le template, et dit que la colonie ouverte ait un problème
-        # ou non : le lecteur part vers le jeu de toute façon, et le réglage est
-        # mauvais pour *tout* template, pas seulement pour ceux qui sont serrés.
-        #
-        # Le filet porte le poids pour que la phrase reste de la prose : plus
-        # fort que l'astuce voisine, plus discret qu'une erreur, parce que rien
-        # n'est encore allé de travers.
-        _import_notice(top_frame, EVE["bg_deep"]).pack(fill=tk.X, pady=(0, 6))
-
-        # Deux chiffres plutôt qu'un verdict. À 0,2 CPU par km, même le plus grand
-        # déplacement possible sur une petite colonie ne peut pas franchir la ligne du
-        # budget : un déplacement se lirait donc comme s'il ne s'était rien passé.
-        budget_var = tk.StringVar()
-        budget_lbl = tk.Label(btn_bar, textvariable=budget_var, font=("Consolas", _fs(8)),
-                              bg=EVE["bg_deep"], fg=EVE["fg_dim"])
-        budget_lbl.pack(side=tk.RIGHT, padx=(10, 0))
-
-        def _stage_refusal(text):
-            """Peint sur la planète ce que le dernier réglage n'a pas su faire."""
-            notice = view_state.get("notice")
-            if notice is not None:
-                try:
-                    notice.set_refusal(text)
-                except tk.TclError:
-                    pass
-
-        def _counters_can_act():
-            """Les compteurs savent-ils faire quelque chose de cette colonie.
-
-            Une colonie P0 → P2 avance par jeux entiers depuis le 2026-09-13 : le
-            bandeau les compte en jeux, et son bouton en passe le nombre. Seule
-            une colonie sans ratio de jeu — deux produits avancés, une usine
-            high-tech — reste verrouillée. L'écart y reste montré, mais sans
-            bouton : un bouton qui ne pourrait qu'échouer est pire que pas de
-            bouton. La même question que `editability`, comme dans l'outil web.
-            """
-            try:
-                return editability(parse_colony(doc["template"]))["factories"] is None
-            except (ParseError, EditError):
-                return False
-
-        def _refresh_budget(tpl=None, moving=False):
-            try:
-                a = analyze_template(tpl if tpl is not None else doc["template"],
-                                     self._layout_options())
-            except Exception:
-                budget_var.set("")
-                return
-            over = a["cpu_used"] > a["cpu_max"] or a["power_used"] > a["power_max"]
-            budget_var.set(f"CPU {a['cpu_used']:,}/{a['cpu_max']:,}   "
-                           f"PWR {a['power_used']:,}/{a['power_max']:,}")
-            budget_lbl.config(fg=EVE["red"] if over
-                              else (EVE["accent_text"] if moving else EVE["fg_dim"]))
-            # La minuterie lit *cette* analyse, celle de la colonie réellement
-            # sur la carte, jamais celle de l'aperçu du panneau de configuration.
-            # Partager une seule analyse avec la jauge est ce qui les rend
-            # incapables de se contredire, plutôt que simplement peu susceptibles
-            # de le faire : les compteurs de pads changent le stockage, et la
-            # fenêtre annonçait sinon une colonie qui n'existait plus.
-            timer = view_state.get("timer")
-            notice = view_state.get("notice")
-            if not moving:
-                try:
-                    if timer is not None:
-                        timer.update(a, self.interval_var.get())
-                    if notice is not None:
-                        # Les compteurs se verrouillent sur une colonie sans
-                        # ratio de jeu : l'écart reste montré, sans bouton.
-                        # Les pins comptent une colonie P0 → P2 en jeux.
-                        shown = tpl if tpl is not None else doc["template"]
-                        notice.update(a, can_act=_counters_can_act(),
-                                      pins=shown.get("P", []),
-                                      storage=_storage_offer(a, shown))
-                except tk.TclError:
-                    pass
-                except Exception as exc:
-                    _debug(f"stage overlay refresh failed: {exc}")
-                _sync_reset_template()
-                # Le panneau de gauche décrit la colonie de la scène, comme la
-                # jauge et la minuterie : il lisait l'aperçu du brouillon, et
-                # après la suggestion de stockage il continuait d'annoncer 39,9 h
-                # sous une minuterie à 87,7 h. Redessiné seulement quand
-                # l'analyse a changé, ce qui coupe court à tout aller-retour
-                # entre ce rappel et _update_bom.
-                routes_now = doc["template"].get("R") or []
-                if tpl is None and (view_state.get("analysis") != a
-                                    or view_state.get("report_routes") != routes_now):
-                    view_state["analysis"] = a
-                    # Une route ajoutée ne change pas toujours l'analyse, et la
-                    # liste des routes du panneau doit la montrer quand même.
-                    view_state["report_routes"] = copy.deepcopy(routes_now)
-                    try:
-                        self._redraw_report()
-                    except Exception as exc:
-                        _debug(f"report redraw from stage failed: {exc}")
-
-        def _storage_offer(analysis, shown):
-            """La suggestion de stockage de la colonie montrée, ou None si elle tient sa tournée.
-
-            Hors planificateur P2 mixte, qui dimensionne ses lots sur bufferM3
-            lui-même. Mise en cache par colonie : l'échange de jeux peut coûter
-            deux dixièmes de seconde sur une grosse colonie P2 → P3 à la semaine,
-            et ce rappel part à chaque rafraîchissement.
-            """
-            hours = self.interval_var.get()
-            if doc.get("source") == "mixed" or not analysis["buffer_hours"] < hours:
-                return None
-            yield_per_head = self._layout_options()["yield_per_head"]
-            key = (json.dumps(shown, sort_keys=True, default=str), hours, yield_per_head,
-                   doc.get("source"))
-            cached = view_state.get("storage_offer")
-            if cached is not None and cached[0] == key:
-                return cached[1]
-            offer = None
-            suggestion = storage_suggestion(shown, hours, yield_per_head)
-            if suggestion is not None:
-                switch = None
-                # La dernière réponse quand rien ne tient et que rien ne s'échange :
-                # le même produit depuis le palier au-dessus. Seulement pour la
-                # colonie du brouillon, puisque c'est sa chaîne qui change.
-                if (suggestion.kind == "none" and suggestion.reason == "budget"
-                        and doc.get("source") == "draft"):
-                    switch = higher_tier_chain(self._bom_config())
-                offer = {"suggestion": suggestion, "switch": switch, "requested": hours}
-            view_state["storage_offer"] = (key, offer)
-            return offer
-
-        def _sync_reset_template():
-            """« Reset template » n'existe que pour une colonie du brouillon, et n'agit que si elle a bougé."""
-            button = view_state.get("reset_template_btn")
-            if button is None:
-                return
-            try:
-                if doc.get("source") != "draft":
-                    button.pack_forget()
-                    return
-                if not button.winfo_ismapped():
-                    button.pack(side=tk.LEFT, padx=(10, 0),
-                                after=view_state.get("reset_view_btn") or None)
-                preview = self.current_preview
-                changed = preview is not None and doc["template"] != preview
-                button.config(state=tk.NORMAL if changed else tk.DISABLED)
-                # Montré ou caché, le bouton change la place de l'astuce sans
-                # que la barre elle-même change de taille.
-                btn_bar.after_idle(_fit_hint)
-            except tk.TclError:
-                pass
-
-        zoom_label = tk.Label(btn_bar, text="Drag a building to move it · Scroll: Zoom · Drag: Pan",
-                              font=("Segoe UI", _fs(8)),
-                              bg=EVE["bg_deep"], fg=EVE["fg_dim"])
-        zoom_label.pack(side=tk.RIGHT)
-
-        # L'astuce prend la place qui reste entre les boutons et le budget. Elle
-        # était déjà rognée en plein mot à la largeur d'ouverture, et « Reset
-        # template » lui a pris encore 110 px : la plus longue formulation qui
-        # tient gagne, plutôt qu'une phrase coupée au milieu d'un mot.
-        hint_texts = ("Drag a building to move it · Scroll: Zoom · Drag: Pan",
-                      "Drag a building to move it · Scroll: Zoom",
-                      "Drag: move · Scroll: zoom", "")
-        hint_font = tkfont.Font(font=zoom_label.cget("font"))
-
-        def _fit_hint(_event=None):
-            try:
-                left = max((w.winfo_x() + w.winfo_width() for w in btn_bar.winfo_children()
-                            if isinstance(w, tk.Button) and w.winfo_ismapped()), default=0)
-                room = budget_lbl.winfo_x() - 10 - left - 8
-                # Avant la première disposition, la place peut être négative : rien.
-                text = next((t for t in hint_texts if hint_font.measure(t) <= room), "")
-                if zoom_label.cget("text") != text:
-                    zoom_label.config(text=text)
-            except tk.TclError:
-                pass
-
-        btn_bar.bind("<Configure>", _fit_hint, add="+")
-        budget_lbl.bind("<Configure>", _fit_hint, add="+")
-
-        json_text = scrolledtext.ScrolledText(top_frame, height=10, wrap=tk.WORD,
-                                              bg=EVE["bg_input"], fg=EVE["json_fg"],
-                                              font=("Consolas", _fs(10)), relief=tk.FLAT,
-                                              insertbackground=EVE["json_fg"])
-        json_text.pack(fill=tk.X)
-        json_text.insert("1.0", json.dumps(template, default=str))
-
-        def _refresh_json():
-            json_text.delete("1.0", tk.END)
-            json_text.insert("1.0", json.dumps(doc["template"], default=str))
-
-        map_frame = ttk.Frame(container)
-        map_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
-
-        map_canvas = tk.Canvas(map_frame, bg=MAP_SPACE, highlightthickness=0, cursor="fleur")
-        map_canvas.pack(fill=tk.BOTH, expand=True)
-
-        # Le même dict que celui que `_clear_stage` démonte : la minuterie, la
-        # notice et la boucle d'animation s'y rangent, et vivent hors de la
-        # hiérarchie du cadre.
-        view_state = self._stage_state
-        view_state.update({"zoom": 1.0, "pan_x": 0, "pan_y": 0,
-                           "drag_start_x": 0, "drag_start_y": 0,
-                           "redraw_job": None, "fit": None})
-
-        # La minuterie flotte au-dessus de la carte plutôt que sous elle : le
-        # chiffre est de ceux qu'on veut en regardant la planète. Enfant de
-        # map_frame et non du canvas — le canvas se vide à chaque redessin, un
-        # widget posé dessus survit, et `place()` le laisse par-dessus le dessin.
-        view_state["timer"] = FactoryTimer(map_frame, sys.modules[__name__])
-
-        # Même raison que la minuterie : on veut ce réglage en regardant la
-        # planète. Elle prend le coin haut-gauche, et la notice descend d'autant
-        # — une alerte se lit avant le reste, mais elle est passagère et la
-        # barre est permanente.
-        self._collect_bar = CollectBar(map_frame, BUILD_COLLECTION_INTERVALS,
-                                       self.interval_var, self._set_interval)
-        view_state["collect_bar"] = self._collect_bar
-
-        def _apply_balance(delta):
-            """Ajoute ou retire juste ce qu'il faut d'usines pour coller au sol.
-
-            Passe par les mêmes éditions que les compteurs : les structures déjà
-            posées gardent leur place, ce qui a pu être fait est gardé si la
-            place manque en route, et la raison s'affiche sur la planète.
-            """
-            try:
-                model = parse_colony(doc["template"])
-            except (ParseError, EditError) as exc:
-                _debug(f"balance apply refused: {exc}")
-                return
-            op = add_factory if delta > 0 else remove_factory
-            applied = 0
-            for _ in range(abs(delta)):
-                try:
-                    model = op(model)
-                except EditError as exc:
-                    # Garder ce qui a été fait et dire pourquoi ça s'arrête là ;
-                    # tout annuler punirait un travail à moitié valable.
-                    _debug(f"balance apply stopped after {applied}: {exc}")
-                    break
-                applied += 1
-            if not applied:
-                return
-            doc["template"] = model.to_template()
-            self._draw_map(map_canvas, doc["template"], view_state)
-            _refresh_budget()
-            _refresh_json()
-            verb = "Added" if delta > 0 else "Removed"
-            self._history.record(doc["template"],
-                                 f"{verb} {applied} to match the ground", kind="edit")
-
-        def _apply_storage(suggestion):
-            """Pose la colonie que la suggestion de stockage a calculée.
-
-            Le chemin d'un glisser : les entrepôts et leurs routes, ou les jeux
-            retirés, ne sont écrits par aucun générateur, donc un rebuild les
-            perdrait — la colonie devient arrangée à la main.
-            """
-            if suggestion is None or suggestion.template is None:
-                return
-            doc["template"] = suggestion.template
-            doc["hand_edited"] = True
-            doc["filed"] = False
-            _stage_refusal(None)
-            self._draw_map(map_canvas, doc["template"], view_state)
-            _refresh_budget()
-            _refresh_json()
-            noun = "facility" if suggestion.count == 1 else "facilities"
-            if suggestion.kind == "trade":
-                sets = "set" if suggestion.sets == 1 else "sets"
-                label = (f"Removed {suggestion.sets} production {sets}, "
-                         f"added {suggestion.count} storage {noun}")
-            else:
-                label = f"Added {suggestion.count} storage {noun}"
-            self._history.record(doc["template"], label, kind="edit")
-
-        def _switch_chain(chain_name):
-            """Le même produit depuis le palier au-dessus : c'est la chaîne du panneau qui change."""
-            self._variant_pick = None
-            self._set_chain(chain_name)
-            self._on_chain_changed()
-
-        view_state["notice"] = StageNotice(map_frame, on_apply=_apply_balance,
-                                           top=self._collect_bar.height() + 6,
-                                           on_storage=_apply_storage,
-                                           on_switch=_switch_chain)
-
-        # Le panoramique déplace les objets déjà dessinés (tag « map ») — aucun redessin,
-        # aucun scintillement. Le zoom les met à l'échelle sur place pour un retour
-        # instantané, puis un unique redessin différé restaure des épaisseurs de trait
-        # et des tailles d'icônes nettes.
-        def _schedule_crisp_redraw(delay=120):
-            if view_state["redraw_job"]:
-                popup.after_cancel(view_state["redraw_job"])
-
-            def _do():
-                view_state["redraw_job"] = None
-                self._draw_map(map_canvas, doc["template"], view_state)
-
-            view_state["redraw_job"] = popup.after(delay, _do)
-
-        def _hide_map_tooltip():
-            """L'infobulle est désormais une fenêtre : le panoramique et le glisser
-            doivent donc la fermer explicitement — il n'y a plus de tag de canvas
-            à supprimer."""
-            unfocus = view_state.get("unfocus")
-            if unfocus is not None:
-                unfocus()
-            for key in ("tooltip_win", "details_win"):
-                tip = view_state.pop(key, None)
-                if tip is not None:
-                    try:
-                        tip.destroy()
-                    except Exception:
-                        pass
-
-        # ── Déplacer une structure ────────────────────────────────────────
-        # Validé une seule fois, au relâchement. Chaque image réécrirait le document des
-        # dizaines de fois pour un seul glisser. Échap abandonne complètement le geste,
-        # et un appui qui n'a jamais bougé reste un appui ordinaire.
-        grab = {"pin": None, "moved": False, "model": None}
-
-        def on_structure_grab(event, pin_idx):
-            _hide_map_tooltip()
-            map_canvas.delete("signal")
-            try:
-                grab["model"] = parse_colony(doc["template"])
-            except ParseError:
-                # Toutes les colonies que produisent les générateurs ne sont pas des
-                # arbres hub-et-bras. Celles-là s'affichent très bien mais ne peuvent pas
-                # être réanalysées, donc elles ne sont pas déplaçables — on retombe sur le
-                # panoramique plutôt que de rendre l'appui totalement inerte.
-                grab["model"] = None
-                grab["pin"] = None
-                return None
-            grab["pin"] = pin_idx
-            grab["moved"] = False
-            view_state["dragging_pin"] = pin_idx
-            return "break"
-
-        def on_structure_drag(event):
-            if grab["pin"] is None:
-                return None
-            grab["moved"] = True
-            la, lo = view_state["untransform"](event.x, event.y)
-            try:
-                moved = move_pin(grab["model"], grab["pin"], la, lo)
-            except EditError:
-                return "break"
-            # Le plateau, les chiffres et les marques d'encombrement lisent tous une
-            # même colonie provisoire, pour que le budget bouge *pendant* le glisser
-            # plutôt que de sauter au relâchement du pointeur.
-            provisional = moved.to_template()
-            self._draw_map(map_canvas, provisional, view_state)
-            _refresh_budget(provisional, moving=True)
-            return "break"
-
-        def on_structure_drop(event):
-            if grab["pin"] is None:
-                return None
-            pin_idx, moved_at_all = grab["pin"], grab["moved"]
-            grab["pin"] = None
-            # Plus rien en main : le prochain dessin n'écrit plus la raison.
-            view_state["dragging_pin"] = None
-            if not moved_at_all:
-                # Finir là où on a commencé, c'est qu'il ne s'est rien passé : valider un
-                # déplacement nul marquerait le document modifié pour un simple clic.
-                return "break"
-            la, lo = view_state["untransform"](event.x, event.y)
-            try:
-                doc["template"] = move_pin(grab["model"], pin_idx, la, lo).to_template()
-            except EditError as exc:
-                _debug(f"structure drop refused: {exc}")
-                self._draw_map(map_canvas, doc["template"], view_state)
-                return "break"
-            self._draw_map(map_canvas, doc["template"], view_state)
-            _refresh_budget()
-            _refresh_json()
-            # La raison d'être de l'historique : une colonie arrangée à la main ne
-            # vivait que dans cette fenêtre, et la fermer jetait le travail.
-            kind = STRUCT_TYPE_TO_NAME.get(
-                doc["template"]["P"][pin_idx].get("T")) or "structure"
-            doc["hand_edited"] = True
-            # Ce n'est plus ce que le fichier contient.
-            doc["filed"] = False
-            self._history.record(doc["template"], f"Moved {kind}", kind="edit")
-            return "break"
-
-        def on_escape(_event=None):
-            if grab["pin"] is None:
-                return
-            grab["pin"] = None
-            view_state["dragging_pin"] = None
-            self._draw_map(map_canvas, doc["template"], view_state)
-            _refresh_budget()
-
-        view_state["on_structure_grab"] = on_structure_grab
-        view_state["on_structure_drag"] = on_structure_drag
-        view_state["on_structure_drop"] = on_structure_drop
-        popup.bind("<Escape>", on_escape)
-        # Poignées pour tests/map_smoke.py, qui pilote cette carte depuis l'intérieur de
-        # mainloop() et n'a aucun autre moyen d'atteindre le document ouvert.
-        map_canvas._pi_view_state = view_state
-        map_canvas._pi_doc = doc
-
-        # ── Suivi des réglages ────────────────────────────────────────────
-        # Tant que cette fenêtre est ouverte, changer les pads ou les usines sur le
-        # panneau principal la redessine ici plutôt que d'obliger à régénérer. C'est la
-        # projection à échelle fixe qui rend ça regardable : une colonie qui gagne deux
-        # usines grandit dans l'espace disponible au lieu de faire sauter toute la carte
-        # vers un nouveau cadrage.
-        def follow(template, config=None):
-            """Répercute un réglage sans écraser une colonie arrangée à la main.
-
-            Tant que personne n'a déplacé de structure, il n'y a aucune mise en
-            page à protéger et le document est simplement remplacé — c'est ce que
-            cette fenêtre a toujours fait, et c'est juste. Une fois une structure
-            déplacée, remplacer le document annulait le déplacement : *« pourquoi
-            tu annules mes changements — tu annules mes déplacements de
-            bâtiments. »*
-
-            Une reconstruction est silencieuse : une colonie qui se redessine
-            visiblement n'a pas besoin qu'on lui ajoute une phrase.
-            """
-            if not popup.winfo_exists():
-                return False
-
-            # Lu avant d'être remplacé : le plan et l'édition se comparent tous
-            # deux à la configuration qui a produit le document actuel.
-            before = doc.get("config") or {}
-            plan = REBUILD
-            if config is not None and doc.get("config") is not None:
-                plan = plan_for(before, config, doc.get("hand_edited", False))
-            if config is not None:
-                doc["config"] = config
-
-            if plan == INERT:
-                # Le réglage juge la colonie sans la remodeler ; les afficheurs
-                # le relisent, la carte ne bouge pas.
-                _refresh_budget()
-                return True
-
-            if plan == REBUILD:
-                doc["template"] = template
-                doc["hand_edited"] = False
-                doc["filed"] = False
-                doc["source"] = "draft"
-                _stage_refusal(None)
-            else:
-                try:
-                    model = parse_colony(doc["template"])
-                except (ParseError, EditError) as exc:
-                    _debug(f"stage plan fell back to rebuild: {exc}")
-                    doc["template"] = template
-                    doc["hand_edited"] = False
-                    doc["filed"] = False
-                    doc["source"] = "draft"
-                    plan = REBUILD
-                else:
-                    if plan == REFUSE:
-                        # Couleur d'avertissement, pas de danger : rien ne va mal
-                        # dans la colonie, le contrôle ne sait simplement pas
-                        # agir dessus.
-                        _stage_refusal("Arm length cannot be changed on a colony "
-                                       "you have arranged by hand — move the "
-                                       "structures, or rebuild it.")
-                        return True
-                    if plan == RETUNE:
-                        model, why = apply_retune(model, config or {})
-                    else:
-                        model, why = apply_edit(model, before, config or {})
-                    doc["template"] = model.to_template()
-                    _stage_refusal(why)
-
-            self._draw_map(map_canvas, doc["template"], view_state)
-            _refresh_budget()
-            _refresh_json()
-            return True
-
-        self._live_popup = follow
-
-        # ── Flux ──────────────────────────────────────────────────────────
-        # Une période de tirets par tour, pour que le défilement boucle sans
-        # couture : les liens font 5 pleins / 4 vides, les signaux 2 / 8. Rien
-        # n'est redessiné — seul le décalage d'objets déjà sur le canvas bouge.
-        #
-        # Aux vitesses de l'outil web (renderer.css) : un lien avance de 9 px en
-        # 1,6 s, une perle de route de 20 px en 1 s. Le bureau faisait défiler
-        # les deux à 18 px/s, le lien trois fois trop vite. La phase compte les
-        # tours de 55 ms ; le décalage en pixels en est tiré, et tronqué, puisque
-        # Tk ne prend qu'un entier.
-        def _animate(phase=0):
-            elapsed = phase * 55
-            try:
-                map_canvas.itemconfig("link", dashoffset=-(int(elapsed * 9 / 1600) % 9))
-                map_canvas.itemconfig("signal", dashoffset=-(int(elapsed * 20 / 1000)
-                                                             % sum(ROUTE_DASH)))
-            except tk.TclError:
-                return          # canvas disparu : le popup a été fermé
-            view_state["anim_job"] = popup.after(55, _animate, phase + 1)
-
-        _animate()
-
-        def on_scroll(event):
-            factor = 1.15 if event.delta > 0 else 1 / 1.15
-            new_zoom = max(0.3, min(3.0, view_state["zoom"] * factor))
-            factor = new_zoom / view_state["zoom"]
-            if factor == 1.0:
-                return
-            view_state["zoom"] = new_zoom
-            # Mettre à l'échelle autour du centre du canvas met aussi à l'échelle le décalage de panoramique.
-            view_state["pan_x"] *= factor
-            view_state["pan_y"] *= factor
-            cw = map_canvas.winfo_width()
-            ch = map_canvas.winfo_height()
-            cw = 700 if cw <= 1 else cw
-            ch = 500 if ch <= 1 else ch
-            map_canvas.scale("map", cw / 2, ch / 2, factor, factor)
-            _schedule_crisp_redraw()
-
-        def on_drag_start(event):
-            _hide_map_tooltip()
-            view_state["drag_start_x"] = event.x
-            view_state["drag_start_y"] = event.y
-
-        def on_drag(event):
-            # Une structure saisie s'approprie le geste ; sinon, c'est un panoramique.
-            if grab["pin"] is not None:
-                on_structure_drag(event)
-                return
-            dx = event.x - view_state["drag_start_x"]
-            dy = event.y - view_state["drag_start_y"]
-            view_state["drag_start_x"] = event.x
-            view_state["drag_start_y"] = event.y
-            view_state["pan_x"] += dx
-            view_state["pan_y"] += dy
-            map_canvas.move("map", dx, dy)
-
-        map_canvas.bind("<MouseWheel>", on_scroll)
-        map_canvas.bind("<Button-4>", lambda e: on_scroll(type('obj', (object,), {'delta': 120})))
-        map_canvas.bind("<Button-5>", lambda e: on_scroll(type('obj', (object,), {'delta': -120})))
-        map_canvas.bind("<Button-1>", on_drag_start)
-        map_canvas.bind("<B1-Motion>", on_drag)
-        map_canvas.bind("<ButtonRelease-1>", on_structure_drop)
-
-        popup.update_idletasks()
-        self._draw_map(map_canvas, doc["template"], view_state)
-        _refresh_budget()
-        map_canvas.bind("<Configure>",
-                        lambda e: self._draw_map(map_canvas, doc["template"], view_state))
-        
-        popup.lift()
-        popup.focus_force()
+        StageView(self, template, source).build()
 
     def _add_resize_handles(self, window, handle_size=8):
         """Ajoute des poignées de redimensionnement sur les bords d'une fenêtre sans décoration."""
@@ -6994,894 +6377,13 @@ class PIGeneratorApp:
     def _draw_map(self, canvas, template, view_state=None, chrome=True):
         """Dessine la carte visuelle du template (pins, liens) avec zoom et panoramique.
 
-        `chrome` porte ce qui explique la carte sans en faire partie : le
-        compteur de pins. Faux pour la planète vide de l'accueil, où il n'y a
-        aucune colonie à décompter.
+        Le corps vit dans `src/ui/map_render.draw_map` depuis le 2026-09-22. La
+        méthode reste : une quinzaine d'appels la connaissent sous ce nom, et
+        `chrome` garde le même sens — ce qui explique la carte sans en faire
+        partie, c'est-à-dire le compteur de pins, faux pour la planète vide de
+        l'accueil.
         """
-        canvas.delete("all")
-        # Un widget non affiché renvoie 1, pas 0, donc le `or 700` gardait ce 1 et toute
-        # la carte se dessinait dans une boîte d'un pixel. Rien ne le montrait avant
-        # l'arrivée de la planète : à cw=1, l'artwork tombait sous sa taille minimale et
-        # était sauté, si bien qu'un template fraîchement ouvert n'avait pas de planète
-        # tant qu'un premier panoramique ne forçait pas un redessin à la vraie taille.
-        cw = canvas.winfo_width()
-        ch = canvas.winfo_height()
-        cw = 700 if cw <= 1 else cw
-        ch = 500 if ch <= 1 else ch
-        
-        if view_state is None:
-            view_state = {"zoom": 1.0, "pan_x": 0, "pan_y": 0}
-        # Le survol ne survit pas à un redessin : ses objets viennent d'être
-        # effacés. On oublie donc ce qu'il faudrait restaurer, et on ferme ses
-        # fenêtres ; le prochain passage du pointeur le rallume.
-        pending = view_state.pop("unfocus_job", None)
-        if pending is not None:
-            try:
-                canvas.after_cancel(pending)
-            except tk.TclError:
-                pass
-        view_state.pop("focus_restore", None)
-        view_state["focus_pin"] = None
-        for key in ("tooltip_win", "details_win"):
-            tip = view_state.pop(key, None)
-            if tip is not None:
-                try:
-                    tip.destroy()
-                except tk.TclError:
-                    pass
-        zoom = view_state.get("zoom", 1.0)
-        pan_x = view_state.get("pan_x", 0)
-        pan_y = view_state.get("pan_y", 0)
-
-        pins = template.get("P", [])
-        links = template.get("L", [])
-        if not pins:
-            return
-
-        # ── Implantation de la planète à l'échelle réelle ─────────────────
-        # On projette les vraies coordonnées planétaires de chaque pin (La/Lo, en radians)
-        # sur le canvas, pour que l'aperçu colle à l'espacement en jeu. Deux choses le
-        # rendent fidèle :
-        #   1. La longitude est comprimée par sin(La) — un pas de longitude couvre moins
-        #      de surface à mesure qu'on s'éloigne de l'équateur (géométrie de la sphère).
-        #   2. Les icônes de bâtiment sont dimensionnées d'après l'espacement réel entre
-        #      bâtiments (et non par un plafond fixe), donc le rapport bâtiment/écart est
-        #      le même qu'en jeu.
-        # L'amas est ensuite mis à l'échelle uniformément pour tenir dans la fenêtre (un
-        # pur zoom, que l'utilisateur peut encore ajuster) — les proportions relatives
-        # sont préservées exactement.
-        # La colonie est dessinée à échelle fixe sur la planète, pas ajustée à la
-        # fenêtre. Une colonie est un bout de terrain et doit se lire comme tel :
-        # remplir le canvas avec six bâtiments rendait chacun plus gros que le monde
-        # sur lequel il est posé, et en étaler quatorze en faisait des miettes.
-        disc = min(cw, ch) * PLANET_SPAN
-
-        # Le cadrage est calculé une fois puis conservé. L'ajustement automatique dérive
-        # l'échelle de l'étendue du template : juste pour un premier coup d'œil, faux dès
-        # l'instant où une structure peut être déplacée — chaque image d'un glisser
-        # changerait l'étendue, et toute la colonie nagerait pendant qu'un seul bâtiment
-        # bouge. Recalculé uniquement quand le canvas change de forme, ou sur Reset View.
-        fit = view_state.get("fit")
-        if fit is None or fit["cw"] != cw or fit["ch"] != ch:
-            lats = [float(p.get("La", 0.0)) for p in pins]
-            lons = [float(p.get("Lo", 0.0)) for p in pins]
-            lat_min, lat_max = min(lats), max(lats)
-            lon_min, lon_max = min(lons), max(lons)
-            # Longitude → la distance de surface rétrécit en sin(colatitude) ; à peu près
-            # constant sur un petit amas, donc un seul facteur à la latitude moyenne garde
-            # le rapport d'aspect juste.
-            lon_compress = max(0.05, math.sin((lat_min + lat_max) / 2.0))
-
-            # Un espacement de générateur vaut toujours le même nombre de pixels.
-            scale = (disc * SPACING_SPAN) / BASE_SPACING
-
-            # Centré sur le milieu de la colonie plutôt que sur son coin, pour qu'une
-            # implantation déséquilibrée se pose quand même au milieu de la planète.
-            lon_mid = (lon_min + lon_max) / 2.0
-            lat_mid = (lat_min + lat_max) / 2.0
-            fit = {"cw": cw, "ch": ch, "lat_min": lat_min, "lon_min": lon_min,
-                   "lon_compress": lon_compress, "scale": scale,
-                   "off_x": cw / 2.0 - (lon_mid - lon_min) * lon_compress * scale,
-                   "off_y": ch / 2.0 - (lat_mid - lat_min) * scale,
-                   "node_radius": max(4.0, disc * SPACING_SPAN * PLATE_RATIO)}
-            view_state["fit"] = fit
-
-        lat_min = fit["lat_min"]
-        lon_min = fit["lon_min"]
-        lon_compress = fit["lon_compress"]
-        scale = fit["scale"]
-        off_x, off_y = fit["off_x"], fit["off_y"]
-
-        def project(la, lo):
-            """Coordonnées planète → pixels non zoomés.
-
-            « La » est un angle polaire mesuré depuis le pôle nord : 0 au pôle,
-            pi/2 à l'équateur, et il croît vers le *sud*. pin_angle le dit déjà,
-            et cos(La) est la composante z de la normale de surface. Cette
-            fonction disait le contraire — elle dessinait La croissant vers le
-            haut de l'écran — donc toute colonie était rendue en miroir de ce que
-            le jeu tient, et un template dessiné en cœur s'importait à l'envers.
-            """
-            return (off_x + (float(lo) - lon_min) * lon_compress * scale,
-                    off_y + (float(la) - lat_min) * scale)
-
-        positions = {}
-        for i, pin in enumerate(pins):
-            # Lo → x (est-ouest) ; La → y, dans le même sens : La croît vers le sud,
-            # et le sud est vers le bas de l'écran.
-            positions[i] = project(pin.get("La", 0.0), pin.get("Lo", 0.0))
-
-        # La taille des bâtiments vient de l'espacement fixe, pas de la paire la plus
-        # serrée du template : elle ne doit pas rétrécir parce qu'un glisser a
-        # brièvement posé deux bâtiments l'un sur l'autre.
-        node_radius = fit["node_radius"]
-
-        def transform(x, y):
-            cx_canvas = cw / 2
-            cy_canvas = ch / 2
-            tx = cx_canvas + (x - cx_canvas) * zoom + pan_x
-            ty = cy_canvas + (y - cy_canvas) * zoom + pan_y
-            return tx, ty
-
-        def untransform(tx, ty):
-            """Pixels écran → coordonnées planète : l'inverse exact de project+transform.
-
-            C'est ce qui permet à un glisser de reposer une structure là où le
-            pointeur l'a lâchée plutôt qu'à un décalage près.
-
-            Le panoramique et le zoom sont relus dans view_state à chaque appel,
-            jamais capturés au moment du dessin : déplacer la carte ne redessine
-            rien (canvas.move suffit), donc des valeurs figées au dessin sont
-            périmées dès le premier glissement de la vue — et la structure
-            sautait alors du décalage accumulé.
-            """
-            live_zoom = view_state.get("zoom", 1.0)
-            live_pan_x = view_state.get("pan_x", 0)
-            live_pan_y = view_state.get("pan_y", 0)
-            cx_canvas, cy_canvas = cw / 2, ch / 2
-            x = (tx - live_pan_x - cx_canvas) / live_zoom + cx_canvas
-            y = (ty - live_pan_y - cy_canvas) / live_zoom + cy_canvas
-            # « top » et « La » croissent tous deux vers le bas, donc la latitude
-            # n'a besoin d'aucune inversion de signe ; elle en portait une, pour
-            # coller à une projection qui était elle-même inversée.
-            return (lat_min + (y - off_y) / scale,
-                    lon_min + (x - off_x) / (lon_compress * scale))
-
-        view_state["untransform"] = untransform
-
-        # ── La planète, sous tout le reste ────────────────────────────────
-        # L'artwork est LA caractéristique ; tout le reste est dessiné par-dessus, donc
-        # il descend en premier et n'attrape jamais un clic. Dimensionné sur le plateau
-        # plutôt que sur la colonie : la planète est le décor, pas un contenant.
-        # Volontairement NI zoomé NI panoramiqué : la planète est le fond sur lequel on
-        # regarde la colonie, et un fond qui glisse et enfle à chaque geste, c'est du
-        # décor qui rivalise avec ce qu'on essaie de lire.
-        # Elle est aussi exclue du tag « map » ci-dessous, qui est exactement ce que le
-        # panoramique et le zoom déplacent.
-        art = get_planet_art(template.get("Pln"), min(cw, ch) * PLANET_SPAN)
-        if art is not None:
-            canvas.create_image(cw / 2, ch / 2, image=art, tags=("planet",),
-                                state=tk.DISABLED)
-            # Tk lâche une image dès que plus rien ne la référence côté Python.
-            view_state["_art_ref"] = art
-
-        # ── Liens physiques ───────────────────────────────────────────────
-        # Des tirets cyan dessinés uniquement depuis L. Une route ne devient jamais un
-        # trait ici. Le motif fait 5 pleins / 4 vides, et l'animation avance dashoffset
-        # d'une période entière pour que le défilement boucle sans couture.
-        link_width = max(1, int(2 * zoom))
-        link_items = []   # (objet, pin source 0-based, pin destination 0-based)
-
-        for lk in links:
-            src_1b = lk.get("S", 0)
-            dst_1b = lk.get("D", 0)
-            src_0b = src_1b - 1
-            dst_0b = dst_1b - 1
-
-            if src_0b in positions and dst_0b in positions:
-                x1, y1 = positions[src_0b]
-                x2, y2 = positions[dst_0b]
-                tx1, ty1 = transform(x1, y1)
-                tx2, ty2 = transform(x2, y2)
-                link_items.append((
-                    canvas.create_line(tx1, ty1, tx2, ty2, fill=LINK_CYAN,
-                                       width=link_width, dash=(5, 4),
-                                       capstyle=tk.ROUND, tags=("link",)),
-                    src_0b, dst_0b))
-
-        def draw_gear_icon(cx, cy, size, color="#ffffff", tags=()):
-            teeth = 8
-            outer_r = size * 0.85
-            inner_r = size * 0.55
-            tooth_depth = size * 0.2
-
-            points = []
-            for i in range(teeth * 2):
-                angle = math.pi * i / teeth - math.pi / 2
-                if i % 2 == 0:
-                    r = outer_r
-                else:
-                    r = outer_r - tooth_depth
-                px = cx + r * math.cos(angle)
-                py = cy + r * math.sin(angle)
-                points.extend([px, py])
-
-            canvas.create_polygon(points, fill=color, outline=color, width=1, tags=tags)
-            canvas.create_oval(cx - inner_r * 0.5, cy - inner_r * 0.5,
-                             cx + inner_r * 0.5, cy + inner_r * 0.5,
-                             fill="#1a1a1a", outline=color, width=max(1, int(size * 0.08)),
-                             tags=tags)
-
-        def draw_rocket_icon(cx, cy, size, color="#ffffff", tags=()):
-            w = size * 0.35
-            h = size * 0.85
-
-            points = [
-                cx, cy - h * 0.5,
-                cx + w * 0.4, cy - h * 0.25,
-                cx + w * 0.4, cy + h * 0.3,
-                cx + w * 0.6, cy + h * 0.5,
-                cx + w * 0.15, cy + h * 0.35,
-                cx, cy + h * 0.45,
-                cx - w * 0.15, cy + h * 0.35,
-                cx - w * 0.6, cy + h * 0.5,
-                cx - w * 0.4, cy + h * 0.3,
-                cx - w * 0.4, cy - h * 0.25,
-            ]
-            canvas.create_polygon(points, fill=color, outline=color, width=1, tags=tags)
-
-            wr = size * 0.12
-            canvas.create_oval(cx - wr, cy - h * 0.1 - wr,
-                             cx + wr, cy - h * 0.1 + wr,
-                             fill="#1a1a1a", outline=color, width=1, tags=tags)
-
-        def draw_crosshair_icon(cx, cy, size, color="#ffffff", tags=()):
-            r1 = size * 0.8
-            canvas.create_oval(cx - r1, cy - r1, cx + r1, cy + r1,
-                             fill="", outline=color, width=max(1, int(size * 0.1)), tags=tags)
-            r2 = size * 0.45
-            canvas.create_oval(cx - r2, cy - r2, cx + r2, cy + r2,
-                             fill="", outline=color, width=max(1, int(size * 0.1)), tags=tags)
-            lw = max(1, int(size * 0.1))
-            canvas.create_line(cx, cy - r1, cx, cy + r1, fill=color, width=lw, tags=tags)
-            canvas.create_line(cx - r1, cy, cx + r1, cy, fill=color, width=lw, tags=tags)
-
-        def draw_storage_icon(cx, cy, size, color="#ffffff", tags=()):
-            for i, factor in enumerate([0.8, 0.55, 0.3]):
-                r = size * factor
-                fill = "" if i < 2 else color
-                canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
-                                 fill=fill, outline=color, width=max(1, int(size * 0.08)),
-                                 tags=tags)
-
-        def draw_htf_icon(cx, cy, size, color="#ffffff", tags=()):
-            draw_gear_icon(cx, cy, size * 0.9, color, tags=tags)
-            aw = size * 0.25
-            ah = size * 0.4
-            points = [
-                cx, cy - ah,
-                cx + aw, cy,
-                cx + aw * 0.4, cy,
-                cx + aw * 0.4, cy + ah * 0.5,
-                cx - aw * 0.4, cy + ah * 0.5,
-                cx - aw * 0.4, cy,
-                cx - aw, cy,
-            ]
-            canvas.create_polygon(points, fill="#1a1a1a", outline=color, width=1, tags=tags)
-
-        # ── Flux de marchandises par pin ──────────────────────────────────
-        # Modèle par extrémités : la source d'une route est P[0] et sa destination
-        # finale P[-1] ; les pins intermédiaires sont des relais de routage, pas des
-        # consommateurs. Sert aux infobulles de survol et à la détection d'import des
-        # Launch Pads ci-dessous.
-        # (Une route qui quitte un LP avec une marchandise qu'aucune structure de la
-        # planète ne produit signifie que le joueur doit l'importer lui-même.)
-        lp_idx0 = {i for i, p in enumerate(pins)
-                   if STRUCT_TYPE_TO_NAME.get(p.get("T")) == "Launch Pad"}
-        produced_tids = {p.get("S") for p in pins if p.get("S")}
-        lp_imports = {}   # idx de pin LP (base 0) -> {tid marchandise -> {pin dest -> qté}}
-        pin_in = {}       # idx de pin (base 0) -> {tid marchandise -> qté reçue /cycle}
-        pin_out = {}      # idx de pin (base 0) -> {tid marchandise -> qté envoyée /cycle}
-        for rt in template.get("R", []):
-            rpath = rt.get("P") or []
-            if len(rpath) < 2:
-                continue
-            src0, dst0 = rpath[0] - 1, rpath[-1] - 1
-            tid = rt.get("T")
-            qty = rt.get("Q", 0)
-            pin_out.setdefault(src0, {})
-            pin_out[src0][tid] = pin_out[src0].get(tid, 0) + qty
-            pin_in.setdefault(dst0, {})
-            pin_in[dst0][tid] = pin_in[dst0].get(tid, 0) + qty
-            if src0 in lp_idx0 and dst0 not in lp_idx0 and tid not in produced_tids:
-                lp_imports.setdefault(src0, {}).setdefault(tid, {})[dst0] = qty
-
-        # « Cycles avant Launch Pad plein » ne vaut que pour les planètes purement
-        # usine : pas de Storage Facility (tampon supplémentaire), et pas d'extraction
-        # ni de P0→P1 — c'est-à-dire ni Extractor Control Unit ni Basic Industry
-        # Facility. Ce qui reste tourne entièrement sur le cycle d'une heure des
-        # bâtiments Advanced / High-Tech, donc le nombre de cycles se traduit
-        # directement en temps réel.
-        _present = {STRUCT_TYPE_TO_NAME.get(p.get("T")) for p in pins}
-        show_lp_fill = not (_present & {"Storage Facility",
-                                        "Extractor Control Unit",
-                                        "Basic Industry Facility"})
-
-        def _commodity(tid):
-            return ID_TO_COMMODITY.get(tid, f"type {tid}")
-
-        def _flow_lines(flows):
-            """Lignes indentées « <nom>  —  <qté> /cycle », triées par nom."""
-            return [f"   {_commodity(tid)}  —  {qty:,} /cycle"
-                    for tid, qty in sorted(flows.items(),
-                                           key=lambda kv: _commodity(kv[0]))]
-
-        def _cycles_when(cycles):
-            # 1 cycle == 1 heure pour les bâtiments Advanced / High-Tech.
-            if cycles >= 48:
-                return f"~{cycles / 24:.0f} d"
-            if cycles >= 1:
-                return f"~{cycles:.0f} h"
-            return "<1 h"
-
-        def _lp_fill_lines(ins, outs):
-            """Bloc de chronométrage du tampon d'un Launch Pad, sur une planète purement usine.
-
-            Par marchandise, net = ce qui entre par route − ce qui en sort :
-              • net > 0  → produit fini qui S'ENTASSE → « LP plein dans N cycles »
-              • net < 0  → intrant brut DISTRIBUÉ → « Pad plein tient N cycles »
-            Un LP de sortie (produit qui s'accumule) affiche le décompte de
-            remplissage ; un LP purement d'entrée (qui ne fait que distribuer des
-            matériaux) affiche combien de temps une charge pleine de 10 000 m³
-            tient avant d'affamer les usines. Un LP à double rôle, qui fait les
-            deux, affiche le décompte de remplissage — on suppose ses imports
-            maintenus au niveau. Tous les bâtiments concernés tournent sur un
-            cycle d'une heure, donc cycles == heures.
-            """
-            if not show_lp_fill:
-                return []
-            gains, drains = {}, {}
-            gain_vol = drain_vol = 0.0
-            for tid in set(ins) | set(outs):
-                net = ins.get(tid, 0) - outs.get(tid, 0)
-                if net > 0:
-                    gains[tid] = net
-                    gain_vol += net * ID_TO_VOLUME.get(tid, 0.0)
-                elif net < 0:
-                    drains[tid] = -net
-                    drain_vol += (-net) * ID_TO_VOLUME.get(tid, 0.0)
-            if gain_vol > 0:              # LP de sortie — le produit fini s'accumule
-                cycles = int(LAUNCHPAD_CAPACITY_M3 // gain_vol)
-                header = f"LP fills in {cycles:,} cycles  ({_cycles_when(cycles)})"
-                flows = gains
-            elif drain_vol > 0:           # LP d'entrée — une charge pleine de 10 000 m³ se vide
-                cycles = int(LAUNCHPAD_CAPACITY_M3 // drain_vol)
-                header = f"Full pad lasts {cycles:,} cycles  ({_cycles_when(cycles)})"
-                flows = drains
-            else:
-                return []
-            lines = ["────────────────────────", header]
-            for tid, qty in sorted(flows.items(), key=lambda kv: _commodity(kv[0])):
-                lines.append(f"   {cycles * qty:,} {_commodity(tid)}")
-            return lines
-
-        def _pin_tooltip_lines(pin_idx):
-            """Texte d'infobulle du pin sous le curseur, adapté au type de bâtiment."""
-            pin = pins[pin_idx]
-            sname = STRUCT_TYPE_TO_NAME.get(pin.get("T"))
-            ins = pin_in.get(pin_idx, {})
-            outs = pin_out.get(pin_idx, {})
-
-            if sname == "Launch Pad":
-                imports = lp_imports.get(pin_idx, {})
-                lines = ["Launch Pad", "⬆  Send to this Launch Pad:"]
-                if imports:
-                    for tid, dests in sorted(imports.items(),
-                                             key=lambda kv: _commodity(kv[0])):
-                        lines.append(f"   {_commodity(tid)}  —  {sum(dests.values()):,} /cycle")
-                else:
-                    lines.append("   nothing — collection / export only")
-                lines += _lp_fill_lines(ins, outs)
-                return lines
-
-            if sname == "Extractor Control Unit":
-                lines = ["Extractor Control Unit"]
-                extracted = pin.get("S")
-                if extracted:
-                    lines.append(f"Extracts:  {_commodity(extracted)}")
-                heads = pin.get("H", 0)
-                if heads:
-                    lines.append(f"Heads:  {heads}")
-                return lines
-
-            if sname == "Storage Facility":
-                lines = ["Storage Facility"]
-                if ins:
-                    lines.append("Receives:")
-                    lines += _flow_lines(ins)
-                if outs:
-                    lines.append("Sends out:")
-                    lines += _flow_lines(outs)
-                if not ins and not outs:
-                    lines.append("   no routes")
-                return lines
-
-            if sname in ("Basic Industry Facility", "Advanced Industry Facility",
-                         "High-Tech Industry Facility"):
-                lines = [sname]
-                product = pin.get("S")
-                if product:
-                    out_qty = outs.get(product)
-                    if out_qty:
-                        lines.append(f"Produces:  {_commodity(product)}  —  {out_qty:,} /cycle")
-                    else:
-                        lines.append(f"Produces:  {_commodity(product)}")
-                if ins:
-                    lines.append("Consumes:")
-                    lines += _flow_lines(ins)
-                return lines
-
-            # Type de structure non reconnu (rendu par un « ? » gris)
-            return [f"Unknown structure (type {pin.get('T')})"]
-
-        # ── Le survol d'un bâtiment ───────────────────────────────────────
-        # Porté de l'outil web (TemplateOverlay, renderer.css), à la demande : le
-        # bâtiment survolé prend un anneau bleu et une lueur, ceux qui lui sont
-        # reliés un liseré bleuté, et tout le reste s'efface ; ses liens
-        # s'éclaircissent et s'épaississent pendant que les autres pâlissent, et
-        # chaque route qui passe par lui défile en perles, de bout en bout.
-        #
-        # Tk n'a pas de canal alpha, et Windows ignore le motif sur le remplissage
-        # comme sur le contour d'un ovale — mesuré avant d'écrire ceci. Il
-        # l'honore sur une ligne et sur un polygone. D'où les équivalences :
-        # l'opacité 0,12 d'un lien pâli devient le motif gray12 ; les 28 % d'un
-        # bâtiment effacé, une plaque vidée de son remplissage et un glyphe en
-        # gray25 — la perle d'une route se voit alors au travers, comme sur le
-        # web ; la lueur de l'actif, deux disques polygonaux en gray12 et gray25
-        # posés sous sa plaque ; le halo d'une perle, un trait large en gray25.
-        pin_plates = {}   # pin 0-based -> objet plaque
-        pin_glyph_spec = {}   # objet image -> (structure, px, couleur)
-        link_active = _blend(LINK_CYAN, "#ffffff", 0.45)
-        connected_edge = _blend("#1f2a3c", FOCUS_BLUE, 0.62)
-
-        def _describe_pin(pin_idx):
-            """Une ligne, comme le `title` d'un bâtiment dans l'outil web (describePin)."""
-            pin = pins[pin_idx]
-            kind = STRUCT_TYPE_TO_NAME.get(pin.get("T")) or "Unknown structure"
-            parts = [kind]
-            if pin.get("S"):
-                parts.append(_commodity(pin.get("S")))
-            if kind == "Extractor Control Unit":
-                parts.append(f"{pin.get('H', 0) or 0} heads")
-            if pin_idx in crowded:
-                parts.append(CROWDED_REASON)
-            return " — ".join(parts)
-
-        def _hide_pin_tooltip(_event=None):
-            for key in ("tooltip_win", "details_win"):
-                tip = view_state.pop(key, None)
-                if tip is not None:
-                    try:
-                        tip.destroy()
-                    except Exception:
-                        pass
-
-        def _floating(lines, font, border, alpha=True):
-            """Une petite fenêtre sans décor, qui ne prend jamais le focus.
-
-            Une fenêtre plutôt que des objets de canvas pour la translucidité :
-            un rectangle de canvas n'a pas de canal alpha en Tk. Elle ne voit
-            jamais le pointeur, donc elle ne peut pas voler le <Leave> qui la
-            fait disparaître.
-            """
-            tip = tk.Toplevel(canvas)
-            tip.overrideredirect(True)
-            tip.attributes("-topmost", True)
-            if alpha:
-                try:
-                    tip.attributes("-alpha", max(0.35, self.alpha * 0.86))
-                except Exception:
-                    pass
-            tip.configure(bg=border)
-            tk.Label(tip, text="\n".join(lines), justify=tk.LEFT,
-                     bg=EVE["bg_panel"], fg=EVE["fg_bright"], font=font,
-                     padx=_px(8), pady=_px(5), anchor=tk.W).pack(padx=1, pady=1)
-            tip.update_idletasks()
-            return tip
-
-        def _show_pin_tooltip(event, pin_idx):
-            """Le nom près du pointeur, et le détail dans le coin de la carte.
-
-            Le détail s'ouvrait à côté du pointeur, et recouvrait justement les
-            routes que le survol venait d'allumer. L'outil web a tranché pareil :
-            une ligne au pointeur, le reste dans un panneau en bas à droite. Le
-            panneau se pose au-dessus du décompte de pins, qui garde son coin.
-            """
-            _hide_pin_tooltip()
-            left, top = canvas.winfo_rootx(), canvas.winfo_rooty()
-            right, bottom = left + canvas.winfo_width(), top + canvas.winfo_height()
-
-            label = _floating([_describe_pin(pin_idx)], ("Segoe UI", _fs(8)),
-                              EVE["border_hi"], alpha=False)
-            w, h = label.winfo_reqwidth(), label.winfo_reqheight()
-            x = min(left + event.x + _px(12), right - w - 8)
-            y = min(top + event.y + _px(18), bottom - h - 8)
-            label.geometry(f"+{int(max(x, left + 8))}+{int(max(y, top + 8))}")
-            view_state["tooltip_win"] = label
-
-            details = _floating(_pin_tooltip_lines(pin_idx), ("Segoe UI", _fs(9)),
-                                EVE["accent"])
-            w, h = details.winfo_reqwidth(), details.winfo_reqheight()
-            details.geometry(f"+{int(max(left + 8, right - w - 12))}"
-                             f"+{int(max(top + 8, bottom - h - _px(34)))}")
-            view_state["details_win"] = details
-
-        # ── Signaux de route ──────────────────────────────────────────────
-        # Mouvement directionnel des marchandises, montré uniquement tant qu'une
-        # structure donne son contexte au réseau — toutes les routes d'un coup, ce
-        # serait une botte de foin colorée.
-        # Le tracé est une vraie donnée de route EVE ; seuls la couleur et le
-        # défilement sont de nous.
-        def _live_pin_center(pin_idx):
-            """Où le bâtiment est *maintenant* à l'écran, d'après le canvas.
-
-            Pas via transform() : celui-ci fige le panoramique du moment du
-            dessin, or déplacer la carte ne redessine pas. Les signaux tracés
-            après un déplacement partaient donc de l'ancienne position et
-            filaient à côté de la colonie. La boîte du pin, elle, a bougé avec
-            lui, donc elle est toujours juste.
-            """
-            box = canvas.bbox(f"pin{pin_idx}")
-            if box is None:
-                return None
-            return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
-
-        def _show_route_signals(pin_idx):
-            canvas.delete("signal")
-            focused_1b = pin_idx + 1
-            halo_width = max(4, int(round(ROUTE_HALO_PX * zoom)))
-            bead_width = max(2, int(round(ROUTE_BEAD_PX * zoom)))
-            for route in template.get("R", []):
-                path = route.get("P") or []
-                if focused_1b not in path:
-                    continue
-                bead = commodity_color(route.get("T"), lightness=ROUTE_BEAD_LIGHTNESS)
-                halo = commodity_color(route.get("T"), lightness=ROUTE_HALO_LIGHTNESS)
-                for step in range(len(path) - 1):
-                    src, dst = path[step] - 1, path[step + 1] - 1
-                    if src not in positions or dst not in positions:
-                        continue
-                    start = _live_pin_center(src)
-                    end = _live_pin_center(dst)
-                    if start is None or end is None:
-                        continue
-                    # Tagués « map » dès leur naissance. Ils sont dessinés au survol, bien
-                    # après que le dessin a tagué tout le reste ; sans ça, ils restaient
-                    # immobiles pendant que la colonie filait en panoramique sous eux.
-                    #
-                    # La bande d'abord, puis les perles qui défilent dessus ; voir
-                    # ROUTE_HALO_PX pour pourquoi la bande est continue sur le
-                    # bureau. Une plaque effacée laisse passer les deux, comme au
-                    # travers des 28 % du web.
-                    canvas.create_line(start[0], start[1], end[0], end[1], fill=halo,
-                                       width=halo_width, dash=ROUTE_HALO_DASH or "",
-                                       stipple=ROUTE_HALO_STIPPLE,
-                                       capstyle=tk.ROUND,
-                                       tags=("signal", "signal_halo", "map"),
-                                       state=tk.DISABLED)
-                    canvas.create_line(start[0], start[1], end[0], end[1], fill=bead,
-                                       width=bead_width, dash=ROUTE_DASH,
-                                       capstyle=tk.ROUND, tags=("signal", "map"),
-                                       state=tk.DISABLED)
-            # Sous les bâtiments, au-dessus des liens et de la planète : un signal ne
-            # doit jamais recouvrir la structure dont il explique le réseau.
-            if canvas.find_withtag("pinlayer"):
-                canvas.tag_lower("signal", "pinlayer")
-
-        _STYLE_KEYS = {"line": ("fill", "width", "stipple"),
-                       "polygon": ("fill", "outline", "stipple"),
-                       "oval": ("fill", "outline", "width", "state"),
-                       "text": ("fill",),
-                       "image": ("image",)}
-
-        def _clear_focus():
-            for item, style in view_state.pop("focus_restore", []):
-                try:
-                    canvas.itemconfig(item, **style)
-                except tk.TclError:
-                    pass
-            canvas.addtag_withtag("link", "link_dim")
-            canvas.dtag("link_dim", "link_dim")
-            canvas.delete("focusglow")
-            canvas.delete("focusfade")
-            view_state["focus_pin"] = None
-
-        def _apply_focus(focus):
-            """Actif, relié ou effacé : les trois états du web, sur le canvas."""
-            restore = []
-
-            def remember(item):
-                keys = _STYLE_KEYS.get(canvas.type(item), ())
-                restore.append((item, {k: canvas.itemcget(item, k) for k in keys}))
-
-            connected = set()
-            for item, src, dst in link_items:
-                if focus in (src, dst):
-                    connected.add(dst if src == focus else src)
-            for item, src, dst in link_items:
-                remember(item)
-                if focus in (src, dst):
-                    canvas.itemconfig(item, fill=link_active,
-                                      width=max(2, int(round(LINK_ACTIVE_PX * zoom))))
-                else:
-                    # Pâli, et à l'arrêt comme sur le web : hors du tag que
-                    # l'animation fait défiler.
-                    canvas.itemconfig(item, stipple="gray12")
-                    canvas.dtag(item, "link")
-                    canvas.addtag_withtag("link_dim", item)
-
-            for idx, plate in pin_plates.items():
-                if idx == focus:
-                    remember(plate)
-                    x0, y0, x1, y1 = canvas.coords(plate)
-                    cx_, cy_, radius = (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2
-                    canvas.itemconfig(plate, outline=FOCUS_BLUE,
-                                      width=max(2, int(round(2 * zoom))))
-                    # La lueur puis l'anneau doux, du plus large au plus serré,
-                    # chacun glissé juste sous la plaque — au-dessus des perles.
-                    for extra, pattern in ((9 * zoom, "gray12"), (3 * zoom, "gray25")):
-                        ring = radius + extra
-                        points = []
-                        for k in range(36):
-                            angle = 2 * math.pi * k / 36
-                            points += [cx_ + ring * math.cos(angle),
-                                       cy_ + ring * math.sin(angle)]
-                        glow = canvas.create_polygon(points, fill=FOCUS_BLUE, outline="",
-                                                     stipple=pattern, state=tk.DISABLED,
-                                                     tags=("focusglow", "map"))
-                        canvas.tag_lower(glow, plate)
-                elif idx in connected:
-                    remember(plate)
-                    canvas.itemconfig(plate, outline=connected_edge)
-                else:
-                    for item in canvas.find_withtag(f"pin{idx}"):
-                        remember(item)
-                        kind = canvas.type(item)
-                        if item == plate:
-                            # La plaque à 28 % : un disque polygonal en gray25 de sa
-                            # propre couleur, glissé à sa place pendant qu'elle se
-                            # cache. Vider l'ovale laissait un anneau clair plus
-                            # voyant que la plaque même. Il porte le tag du pin : le
-                            # pointeur l'attrape sur toute sa surface.
-                            x0, y0, x1, y1 = canvas.coords(plate)
-                            cx_, cy_, radius = (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2
-                            points = []
-                            for k in range(36):
-                                angle = 2 * math.pi * k / 36
-                                points += [cx_ + radius * math.cos(angle),
-                                           cy_ + radius * math.sin(angle)]
-                            fade = canvas.create_polygon(
-                                points, fill=canvas.itemcget(plate, "fill") or EVE["bg_panel"],
-                                outline="", stipple="gray25",
-                                tags=(f"pin{idx}", "focusfade", "map"))
-                            canvas.tag_lower(fade, plate)
-                            canvas.itemconfig(plate, state=tk.HIDDEN)
-                        elif kind == "image":
-                            # Le glyphe du client : même icône, alpha à 28 %.
-                            # Sans cette branche il restait seul en pleine
-                            # lumière au milieu d'une colonie effacée.
-                            spec = pin_glyph_spec.get(item)
-                            if spec is not None:
-                                pale = get_struct_glyph(*spec, dim=True)
-                                if pale is not None:
-                                    canvas.itemconfig(item, image=pale)
-                        elif kind == "line":
-                            canvas.itemconfig(item, stipple="gray25")
-                        elif kind == "polygon":
-                            # Le contour d'un polygone reste plein sous un
-                            # remplissage en motif : le glyphe gardait ses
-                            # arêtes blanches et ne pâlissait pas.
-                            canvas.itemconfig(item, stipple="gray25", outline="")
-                        elif kind == "oval":
-                            canvas.itemconfig(item, fill="", outline=_blend(
-                                canvas.itemcget(item, "outline") or "#ffffff", "#000000", 0.6))
-                        elif kind == "text":
-                            canvas.itemconfig(item, fill=_blend(
-                                canvas.itemcget(item, "fill") or "#ffffff", "#000000", 0.6))
-            view_state["focus_restore"] = restore
-            view_state["focus_pin"] = focus
-
-        def _unfocus_now():
-            view_state.pop("unfocus_job", None)
-            _hide_pin_tooltip()
-            canvas.delete("signal")
-            _clear_focus()
-
-        view_state["unfocus"] = _unfocus_now
-
-        def _hover_pin(i, event=None):
-            """Tout ce que fait le survol d'un bâtiment, en un seul point d'entrée.
-
-            Le rappel <Enter> passe par ici, et les tests aussi : Tk n'envoie
-            <Enter> que quand l'objet sous le pointeur change, ce qu'un
-            évènement synthétique ne sait pas provoquer deux fois de suite.
-            """
-            if event is None:
-                center = _live_pin_center(i) or (0, 0)
-
-                class _At:
-                    x, y = int(center[0]), int(center[1])
-                event = _At
-            _unfocus_now()
-            _show_route_signals(i)
-            _apply_focus(i)
-            _show_pin_tooltip(event, i)
-
-        view_state["hover_pin"] = _hover_pin
-
-        # ── Encombrement ──────────────────────────────────────────────────
-        # Un cercle rouge en pointillés au rayon d'espacement minimal sur chaque
-        # structure trop serrée : il ne doit contenir aucune autre structure. Il
-        # persiste — une colonie laissée avec des bâtiments les uns sur les autres ne
-        # doit pas avoir l'air d'aller bien après coup, exactement comme une colonie
-        # hors budget.
-        crowded = set(crowded_pins(pins))
-        for pin_idx in crowded:
-            if pin_idx not in positions:
-                continue
-            cx_, cy_ = transform(*positions[pin_idx])
-            ring = MIN_SEPARATION * scale * zoom
-            canvas.create_oval(cx_ - ring, cy_ - ring, cx_ + ring, cy_ + ring,
-                               outline=EVE["red"], width=max(1, int(1.5 * zoom)),
-                               dash=(4, 3), tags=("crowd",), state=tk.DISABLED)
-            # La raison écrite, sous la seule structure en main : sur chacune ce
-            # serait du bruit, et une infobulle n'apparaît jamais en plein
-            # glisser. Portage de `crowding-reason` de l'outil web.
-            if pin_idx == view_state.get("dragging_pin"):
-                label = canvas.create_text(cx_, cy_ + ring + _px(6), anchor=tk.N,
-                                           text=CROWDED_REASON, fill=EVE["red"],
-                                           font=("Segoe UI", _fs(9)),
-                                           tags=("crowd", "crowd_reason"),
-                                           state=tk.DISABLED)
-                x0, y0, x1, y1 = canvas.bbox(label)
-                plate = canvas.create_rectangle(x0 - _px(6), y0 - _px(2),
-                                                x1 + _px(6), y1 + _px(2),
-                                                fill=EVE["bg_panel"], outline="",
-                                                tags=("crowd", "crowd_reason"),
-                                                state=tk.DISABLED)
-                canvas.tag_lower(plate, label)
-
-        for pin_idx, (x, y) in positions.items():
-            pin = pins[pin_idx]
-            sname = STRUCT_TYPE_TO_NAME.get(pin.get("T"))
-            # Les structures connues s'affichent en blanc ; les type ids inconnus en « ? » gris
-            stroke = "#ffffff" if sname else "#888888"
-            # Un bâtiment trop serré le dit sur lui-même, pas seulement via son cercle.
-            if pin_idx in crowded:
-                stroke = EVE["red"]
-            pin_tag = f"pin{pin_idx}"
-            tags = (pin_tag, "pinlayer")
-
-            tx, ty = transform(x, y)
-            r = node_radius * zoom
-
-            # Pas de halo en pointillés au repos. Il entourait autrefois chaque
-            # structure, ce qui ne disait rien — et maintenant qu'un cercle pointillé
-            # veut dire « trop près », en mettre un sur chaque bâtiment noierait le seul
-            # cercle qui porte du sens.
-            #
-            # Une plaque sombre à liseré fin, pas un disque blanc vif : la plaque est
-            # posée sur de l'artwork désormais, et un gros anneau blanc disputait
-            # l'attention à la planète — et gagnait. C'est le glyphe qui porte
-            # l'identité ; la plaque n'a qu'à rester lisible sur ce qu'il y a derrière.
-            pin_plates[pin_idx] = canvas.create_oval(
-                tx - r, ty - r, tx + r, ty + r,
-                fill=EVE["bg_panel"],
-                outline=EVE["red"] if pin_idx in crowded else EVE["border_hi"],
-                width=max(1, int(1.4 * zoom)), tags=tags)
-
-            # L'icône du client, à 0,67 du diamètre de la plaque. Ces icônes
-            # remplissent leur propre cadre jusqu'au bord : à pleine largeur,
-            # leur anneau extérieur débordait la plaque sur la planète, et à
-            # 0,88 il se confondait avec son liseré en un double anneau. Mesuré
-            # sur quatre rendus de la vraie carte.
-            glyph_px = int(round(r * 1.34))
-            glyph = get_struct_glyph(sname, glyph_px, stroke)
-            if glyph is not None:
-                item = canvas.create_image(tx, ty, image=glyph, tags=tags)
-                # Ce que le survol doit savoir pour refabriquer le même glyphe
-                # en pâle : une image de canvas n'a pas de motif à lui appliquer.
-                pin_glyph_spec[item] = (sname, glyph_px, stroke)
-            else:
-                # Sans PIL ni dossier d'icônes, les formes vectorielles. Une
-                # plaque sans glyphe ne dit pas quel bâtiment elle est.
-                icon_size = r * 0.58
-                if sname == "Launch Pad":
-                    draw_rocket_icon(tx, ty, icon_size, stroke, tags=tags)
-                elif sname == "Storage Facility":
-                    draw_storage_icon(tx, ty, icon_size, stroke, tags=tags)
-                elif sname == "Extractor Control Unit":
-                    draw_crosshair_icon(tx, ty, icon_size, stroke, tags=tags)
-                elif sname == "High-Tech Industry Facility":
-                    draw_htf_icon(tx, ty, icon_size, stroke, tags=tags)
-                elif sname in ("Basic Industry Facility", "Advanced Industry Facility"):
-                    draw_gear_icon(tx, ty, icon_size, stroke, tags=tags)
-                else:
-                    font_size = max(8, int(r * 0.5))
-                    canvas.create_text(tx, ty, text="?", fill=stroke,
-                                     font=("Segoe UI Symbol", font_size, "bold"),
-                                     tags=tags)
-
-            # Le nombre de têtes, sur l'extracteur qui les porte. C'est le
-            # chiffre qui décide de tout le reste de la colonie — ce que le sol
-            # donne, donc combien d'usines tournent — et il ne se lisait que
-            # dans l'infobulle, au survol, une structure à la fois.
-            heads = pin.get("H") or 0
-            if sname == "Extractor Control Unit" and heads:
-                badge_r = max(_px(7), r * 0.42)
-                bx, by = tx, ty + r * 0.92
-                canvas.create_oval(bx - badge_r, by - badge_r,
-                                   bx + badge_r, by + badge_r,
-                                   fill=EVE["accent"], outline=EVE["bg_deep"],
-                                   width=max(1, int(1.5 * zoom)), tags=tags)
-                canvas.create_text(bx, by, text=str(heads), fill=EVE["bg_deep"],
-                                   font=("Segoe UI", max(7, int(badge_r * 1.1)),
-                                         "bold"),
-                                   tags=tags)
-
-            # Passer de la plaque au glyphe d'un même bâtiment, c'est quitter un
-            # objet pour un autre : Tk envoie <Leave> puis <Enter>. Le retrait est
-            # donc différé de 40 ms, et annulé si le même bâtiment revient — sans
-            # quoi la lueur et les perles clignotaient à chaque pixel.
-            def _enter(e, i=pin_idx):
-                job = view_state.pop("unfocus_job", None)
-                if job is not None:
-                    canvas.after_cancel(job)
-                if view_state.get("focus_pin") == i and canvas.find_withtag("signal"):
-                    return
-                _hover_pin(i, e)
-
-            def _leave(_e):
-                job = view_state.pop("unfocus_job", None)
-                if job is not None:
-                    canvas.after_cancel(job)
-                view_state["unfocus_job"] = canvas.after(40, _unfocus_now)
-
-            canvas.tag_bind(pin_tag, "<Enter>", _enter)
-            canvas.tag_bind(pin_tag, "<Leave>", _leave)
-            # Un appui sur une structure est un déplacement, pas un panoramique. Le
-            # « break » empêche le binding de panoramique du canvas de s'approprier
-            # aussi ce geste.
-            # Seul l'appui est attaché à la structure. Le mouvement et le relâchement
-            # vivent sur le canvas : un glisser redessine le plateau à chaque image, ce
-            # qui détruit l'objet même sur lequel le geste a commencé, et un binding
-            # d'objet mourrait avec lui en plein déplacement.
-            on_grab = view_state.get("on_structure_grab")
-            if on_grab is not None:
-                canvas.tag_bind(pin_tag, "<Button-1>",
-                                lambda e, i=pin_idx: on_grab(e, i))
-
-        # Tout ce qui a été dessiné jusqu'ici est le template lui-même — on le tague pour
-        # que panoramique et zoom le déplacent/mettent à l'échelle en bloc. Le
-        # décompte ci-dessous, lui, reste fixe.
-        canvas.addtag_all("map")
-        # …sauf la planète. « map » est exactement l'ensemble que le panoramique déplace
-        # et que le zoom met à l'échelle : l'en exclure est précisément ce qui la fige.
-        canvas.dtag("planet", "map")
-
-        # « 1 pins • 0 links » sur un pad décoratif se lirait comme un rapport sur
-        # une colonie qui n'existe pas.
-        if not chrome:
-            return
-
-        # En bas à droite, et non en haut : le haut-droit porte désormais la
-        # fenêtre de minuterie, qui flotte au-dessus du canevas et recouvrait ce
-        # décompte. Chaque coin de la carte n'a plus qu'une seule chose — notices
-        # en haut à gauche, minuterie en haut à droite, décompte en bas à droite.
-        zoom_pct = int(zoom * 100)
-        canvas.create_text(cw - 12, ch - 12,
-                           text=f"{len(pins)} pins  •  {len(links)} links  •  {zoom_pct}%",
-                           fill=EVE["fg_dim"], font=("Segoe UI", _fs(9)), anchor=tk.SE)
+        draw_map(self, canvas, template, view_state, chrome)
 
     def _open_region_scanner(self):
         """Ouvre le Proximity Scout dans sa propre fenêtre.
@@ -7956,634 +6458,10 @@ class PIGeneratorApp:
         """Le contenu du Proximity Scout, dans la fenêtre ou dans l'écran.
 
         `body` est le cadre qui reçoit tout ; `dialog_parent` la fenêtre à
-        laquelle accrocher les boîtes de dialogue.
+        laquelle accrocher les boîtes de dialogue. Le corps vit dans
+        `src/ui/scout_panel.build_scout` depuis le 2026-09-22.
         """
-        popup = dialog_parent
-        cfg = _load_window_config()
-        # On restaure le dernier état de recherche
-        _last_system = cfg.get("scanner_last_system", "Jita")
-        _last_jumps  = cfg.get("scanner_last_jumps", 3)
-
-        # ── Barre de contrôle du haut ─────────────────────────────────
-        top = tk.Frame(body, bg=EVE["bg_card"],
-                       highlightbackground=EVE["border"], highlightthickness=1)
-        top.pack(fill=tk.X, pady=(0, 6))
-
-        tk.Label(top, text="SYSTEM", bg=EVE["bg_card"], fg=EVE["accent_text"],
-                 font=("Segoe UI", _fs(8), "bold")).pack(side=tk.LEFT, padx=(10, 4), pady=8)
-
-        sys_var = tk.StringVar(value=_last_system)
-        sys_entry = tk.Entry(top, textvariable=sys_var,
-                             bg=EVE["bg_input"], fg=EVE["fg_bright"],
-                             insertbackground=EVE["accent"], relief=tk.FLAT,
-                             font=("Segoe UI", _fs(11)), width=16)
-        sys_entry.pack(side=tk.LEFT, pady=6)
-
-        tk.Label(top, text="JUMPS", bg=EVE["bg_card"], fg=EVE["accent_text"],
-                 font=("Segoe UI", _fs(8), "bold")).pack(side=tk.LEFT, padx=(14, 4))
-        jumps_var = tk.IntVar(value=_last_jumps)
-        jumps_spin = ttk.Spinbox(top, from_=0, to=10, textvariable=jumps_var,
-                                 width=4, font=("Segoe UI", _fs(10)))
-        jumps_spin.pack(side=tk.LEFT, pady=6)
-
-        status_var = tk.StringVar(value="Enter a system name and click Scan")
-        scan_btn = tk.Button(top, text="⟳  SCAN", font=("Segoe UI", _fs(10), "bold"),
-                             bg=EVE["accent_dim"], fg=EVE["fg_bright"],
-                             activebackground=EVE["accent"], activeforeground="white",
-                             relief=tk.FLAT, cursor="hand2", padx=14)
-        scan_btn.pack(side=tk.RIGHT, padx=10, pady=6)
-
-        tk.Label(top, textvariable=status_var, bg=EVE["bg_card"],
-                 fg=EVE["fg_dim"], font=("Segoe UI", _fs(9))).pack(side=tk.LEFT, padx=10)
-
-        # ── Liste de complétion (posée sur body, pas sur top) ─────────
-        ac_frame = tk.Frame(body, bg=EVE["bg_card"],
-                            highlightbackground=EVE["accent"], highlightthickness=1)
-        ac_lb = tk.Listbox(ac_frame, bg=EVE["bg_input"], fg=EVE["fg_bright"],
-                           selectbackground=EVE["accent_dim"], selectforeground="white",
-                           font=("Segoe UI", _fs(10)), relief=tk.FLAT, height=6,
-                           activestyle="none", borderwidth=0)
-        ac_lb.pack(fill=tk.BOTH, expand=True)
-        ac_frame.place_forget()
-
-        def _show_ac():
-            """Positionne et affiche la liste déroulante d'autocomplétion sous le champ système."""
-            popup.update_idletasks()
-            ex = sys_entry.winfo_x() + top.winfo_x() + body.winfo_x()
-            ey = sys_entry.winfo_y() + top.winfo_y() + body.winfo_y() + sys_entry.winfo_height()
-            ac_frame.place(x=ex, y=ey, width=180)
-            ac_frame.lift()
-
-        def _hide_ac():
-            """Masque la liste déroulante d'autocomplétion."""
-            ac_frame.place_forget()
-
-        def _on_key(e=None):
-            """Filtre les systèmes correspondant à la saisie et met à jour la liste d'autocomplétion."""
-            q = sys_var.get().strip()
-            if len(q) < 2:
-                _hide_ac(); return
-            # L'instantané permet aussi la correspondance en milieu de nom, ce dont le
-            # vieux balayage par préfixe de la liste téléchargée était incapable :
-            # « anoo » trouve désormais Tanoo.
-            universe = _offline_universe()
-            if universe is not None:
-                matches = universe.suggest(q, limit=10)
-            else:
-                matches = [n for n in _SYSTEM_NAMES_CACHE
-                           if n.upper().startswith(q.upper())][:10]
-            if not matches:
-                _hide_ac(); return
-            ac_lb.delete(0, tk.END)
-            for m in matches:
-                ac_lb.insert(tk.END, m)
-            _show_ac()
-
-        def _on_ac_pick(e=None):
-            """Insère le système sélectionné dans le champ et ferme l'autocomplétion."""
-            sel = ac_lb.curselection()
-            if sel:
-                sys_var.set(ac_lb.get(sel[0]))
-            _hide_ac()
-            sys_entry.focus_set()
-
-        sys_entry.bind("<KeyRelease>", _on_key)
-        sys_entry.bind("<Return>", lambda e: (_hide_ac(), do_scan()))
-        sys_entry.bind("<Escape>", lambda e: _hide_ac())
-        ac_lb.bind("<ButtonRelease-1>", _on_ac_pick)
-        ac_lb.bind("<Return>", _on_ac_pick)
-        ac_lb.bind("<Escape>", lambda e: (_hide_ac(), sys_entry.focus_set()))
-
-        # ── Habillage par type de planète ─────────────────────────────
-        PLANET_COLORS = {
-            "Barren":    "#9a8060", "Gas":      "#5090b0", "Ice":      "#80b8d0",
-            "Lava":      "#c04020", "Oceanic":  "#2060b0", "Plasma":   "#9040b0",
-            "Storm":     "#406888", "Temperate":"#408840", "Unknown":  "#505070",
-        }
-        # Les huit vrais types de planète. Tout ce que l'ESI rapporte comme autre chose
-        # (planètes brisées et compagnie) ne peut pas héberger de PI, donc ça n'apparaît jamais.
-        PLANET_ORDER = ["Barren", "Gas", "Ice", "Lava", "Oceanic",
-                        "Plasma", "Storm", "Temperate"]
-
-        # ── Filtre par type de planète ────────────────────────────────
-        # On écarte tout résidu d'une sélection sauvegardée (p. ex. « Unknown ») ; un
-        # résultat vide veut dire « tout montrer » plutôt qu'une vue sans issue.
-        active_types = {t for t in (cfg.get("scanner_planet_filter") or ()) if t in PLANET_ORDER}
-        if not active_types:
-            active_types = set(PLANET_ORDER)
-        # Les types que le produit choisi rend utilisables. Tout, tant qu'on
-        # n'a rien choisi — le Scout sert aussi à regarder sans idée précise.
-        allowed_types = set(PLANET_ORDER)
-        # Résultats du dernier scan, gardés pour que filtrer redessine sans rescanner
-        last_results = {"data": None}
-
-        # ── Extraire quoi ? ───────────────────────────────────────────────
-        # Seule l'extraction a une exigence de planète qui vaille la peine d'être
-        # scannée : une colonie-usine importe ses intrants et tournera sur n'importe quel
-        # caillou. Ceci propose donc les P1 de P0 → P1 et restreint le filtre aux
-        # planètes qui portent effectivement leur matière première.
-        want = tk.Frame(body, bg=EVE["bg_card"],
-                        highlightbackground=EVE["border"], highlightthickness=1)
-        want.pack(fill=tk.X, pady=(0, 6))
-        tk.Label(want, text="EXTRACT", bg=EVE["bg_card"], fg=EVE["accent_text"],
-                 font=("Segoe UI", _fs(8), "bold")).pack(side=tk.LEFT,
-                                                         padx=(10, 6), pady=6)
-        ANY_P1 = "anything — show every planet"
-        p1_var = tk.StringVar(value=ANY_P1)
-        p1_combo = ttk.Combobox(want, textvariable=p1_var, state="readonly",
-                                font=("Segoe UI", _fs(9)),
-                                values=[ANY_P1] + sorted(RECIPES_P0_P1))
-        p1_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10), pady=6)
-
-        filt = tk.Frame(body, bg=EVE["bg_card"],
-                        highlightbackground=EVE["border"], highlightthickness=1)
-        filt.pack(fill=tk.X, pady=(0, 6))
-
-        tk.Label(filt, text="SHOW", bg=EVE["bg_card"], fg=EVE["accent_text"],
-                 font=("Segoe UI", _fs(8), "bold")).pack(side=tk.LEFT, padx=(10, 6), pady=6)
-
-        type_btns = {}
-
-        def _paint_filter_btns():
-            """Colore chaque bouton de type : actif, éteint, ou hors-sujet.
-
-            « Éteint » et « impossible » doivent se distinguer : le premier est
-            un choix, le second dit que cette planète ne peut pas produire ce
-            qui a été demandé.
-            """
-            for t, b in type_btns.items():
-                usable = t in allowed_types
-                on = usable and t in active_types
-                if not usable:
-                    b.config(bg=EVE["bg_deep"], fg=EVE["border"])
-                else:
-                    b.config(bg=PLANET_COLORS[t] if on else EVE["bg_input"],
-                             fg=EVE["bg_deep"] if on else EVE["fg_dim"])
-
-        def _apply_filter():
-            """Sauvegarde la sélection et redessine les résultats déjà scannés."""
-            _paint_filter_btns()
-            _update_window_config("scanner_planet_filter", sorted(active_types))
-            if last_results["data"] is not None:
-                _render_results(last_results["data"])
-
-        def _toggle_type(t):
-            if t in active_types:
-                active_types.discard(t)
-            else:
-                active_types.add(t)
-            _apply_filter()
-
-        def _all_types():
-            # « Tous » veut dire tous les types que le produit choisi peut réellement utiliser.
-            active_types.clear()
-            active_types.update(allowed_types)
-            _apply_filter()
-
-        def _on_p1_pick(_event=None):
-            """Restreint les types de planète à ceux qui portent la matière première de ce P1.
-
-            Les autres sont décochés *et* désactivés : les laisser cliquables
-            proposerait des planètes incapables de faire tourner la colonie en
-            cours de planification, soit exactement l'inverse de ce à quoi sert
-            ce choix.
-            """
-            product = p1_var.get()
-            allowed_types.clear()
-            if product == ANY_P1:
-                allowed_types.update(PLANET_ORDER)
-            else:
-                allowed_types.update(
-                    self._planets_for_extraction(product, EXTRACTION_CHAIN))
-            active_types.clear()
-            active_types.update(allowed_types)
-            for planet_type, button in type_btns.items():
-                usable = planet_type in allowed_types
-                button.config(state=tk.NORMAL if usable else tk.DISABLED,
-                              cursor="hand2" if usable else "")
-            _apply_filter()
-
-        p1_combo.bind("<<ComboboxSelected>>", _on_p1_pick)
-
-        for t in PLANET_ORDER:
-            b = tk.Button(filt, text=t.upper(), font=("Segoe UI", _fs(8), "bold"),
-                          relief=tk.FLAT, cursor="hand2", padx=4, pady=1,
-                          borderwidth=0, highlightthickness=0,
-                          command=lambda t=t: _toggle_type(t))
-            b.pack(side=tk.LEFT, padx=1, pady=6)
-            type_btns[t] = b
-
-        tk.Button(filt, text="ALL", font=("Segoe UI", _fs(8), "bold"),
-                  bg=EVE["bg_input"], fg=EVE["accent_text"], relief=tk.FLAT,
-                  cursor="hand2", padx=8, pady=1, borderwidth=0,
-                  highlightthickness=0, command=_all_types).pack(side=tk.RIGHT, padx=(4, 10))
-
-        _paint_filter_btns()
-
-        # ── Zone de résultats défilante ───────────────────────────────
-        results_outer = tk.Frame(body, bg=EVE["bg_deep"])
-        results_outer.pack(fill=tk.BOTH, expand=True)
-
-        r_canvas = tk.Canvas(results_outer, bg=EVE["bg_deep"], highlightthickness=0)
-        r_scroll = ttk.Scrollbar(results_outer, orient=tk.VERTICAL, command=r_canvas.yview)
-        r_canvas.configure(yscrollcommand=r_scroll.set)
-        r_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        r_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        cards_frame = tk.Frame(r_canvas, bg=EVE["bg_deep"])
-        cards_win = r_canvas.create_window((0, 0), window=cards_frame, anchor="nw")
-
-        # Redimensionnement bridé — évite la tempête de mise en page quand on tire le bord
-        _resize_pending = [None]
-
-        def _sync_scroll(reset=False):
-            """Recale la région de défilement sur le contenu réel et interdit de défiler au-delà.
-
-            La région doit toujours démarrer à 0 et faire au moins la hauteur
-            visible : sinon le canvas garde une position héritée d'un contenu
-            plus long et on se retrouve à défiler dans le vide au-dessus de la
-            liste.
-            """
-            cards_frame.update_idletasks()
-            view_h = max(1, r_canvas.winfo_height())
-            content_h = cards_frame.winfo_reqheight()
-            width = max(1, r_canvas.winfo_width())
-            r_canvas.configure(scrollregion=(0, 0, width, max(content_h, view_h)))
-            if reset or content_h <= view_h:
-                r_canvas.yview_moveto(0)
-            else:
-                # On réémet la position courante pour que le canvas la borne dans la
-                # région qu'il vient d'obtenir (Tk ne borne que sur une commande de vue).
-                r_canvas.yview_moveto(r_canvas.yview()[0])
-
-        def _on_cards_conf(e):
-            _sync_scroll()
-
-        def _on_canvas_resize(e):
-            if _resize_pending[0]:
-                popup.after_cancel(_resize_pending[0])
-
-            def _apply(w=e.width):
-                r_canvas.itemconfig(cards_win, width=w)
-                _sync_scroll()
-            _resize_pending[0] = popup.after(80, _apply)
-
-        cards_frame.bind("<Configure>", _on_cards_conf)
-        r_canvas.bind("<Configure>", _on_canvas_resize)
-
-        def _mw(e):
-            # Rien à faire défiler quand le contenu tient — sinon la vue dérive
-            # au-dessus du haut de la liste, dans le vide.
-            if cards_frame.winfo_reqheight() <= r_canvas.winfo_height():
-                return "break"
-            r_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        r_canvas.bind("<Enter>", lambda e: r_canvas.bind_all("<MouseWheel>", _mw))
-        r_canvas.bind("<Leave>", lambda e: r_canvas.unbind_all("<MouseWheel>"))
-
-        def _sec_color(sec):
-            """Retourne la couleur selon le statut de sécurité : vert hi-sec, orange lo-sec, rouge null-sec."""
-            if sec >= 0.5:  return "#5aaa5a"
-            if sec >= 0.1:  return "#e0a030"
-            return "#cc4444"
-
-        CARD_H = _px(46)
-        ICON_PX = _px(36)
-
-        def _make_planet_card(parent, planet_data):
-            """Carte compacte d'une planète : vignette, nom, type et rayon — rien d'autre."""
-            ptype   = planet_data.get("type", "Unknown")
-            pname   = planet_data.get("name", "")
-            pradius = planet_data.get("radius", 0)
-            color   = PLANET_COLORS.get(ptype, "#505070")
-
-            state = {"hovered": False}
-            card = tk.Canvas(parent, bg=EVE["bg_card"], height=CARD_H,
-                             highlightthickness=0)
-
-            def _draw(hovered=None):
-                if hovered is not None:
-                    state["hovered"] = hovered
-                card.delete("all")
-                w = card.winfo_width() or 380
-                h = CARD_H
-
-                card.create_rectangle(
-                    0, 0, w - 1, h - 1,
-                    outline=EVE["border_hi"] if state["hovered"] else color,
-                    fill=EVE["bg_card"], width=2 if state["hovered"] else 1)
-                card.create_rectangle(0, 0, 4, h, outline="", fill=color)
-
-                icon = get_planet_icon(ptype, ICON_PX)
-                if icon is not None:
-                    card.create_image(32, h // 2, image=icon)
-                else:
-                    card.create_oval(32 - 15, h // 2 - 15, 32 + 15, h // 2 + 15,
-                                     fill=color, outline=_lighten(color, 30))
-
-                card.create_text(58, 9, anchor=tk.NW, text=pname,
-                                 fill=EVE["fg_bright"], font=("Segoe UI", _fs(11)))
-                card.create_text(58, 27, anchor=tk.NW, text=ptype.upper(),
-                                 fill=color, font=("Segoe UI", _fs(8), "bold"))
-
-                r_text = f"{int(pradius):,} km" if pradius else "—"
-                # L'invite prend la place du rayon au survol : le nombre est ce qu'on
-                # scanne, l'action est ce qu'on fait une fois qu'on l'a.
-                if state["hovered"]:
-                    card.create_text(w - 12, h // 2, anchor=tk.E,
-                                     text="▶  BUILD HERE",
-                                     fill=EVE["accent_text"], font=("Segoe UI", _fs(9), "bold"))
-                else:
-                    card.create_text(w - 12, h // 2, anchor=tk.E, text=r_text,
-                                     fill="#e8d48a" if pradius else EVE["fg_dim"],
-                                     font=("Consolas", _fs(13), "bold"))
-
-            # <Configure> se déclenche quand le canvas obtient enfin sa vraie largeur
-            card.bind("<Configure>", lambda e: _draw())
-            card.bind("<Enter>", lambda e: (_draw(hovered=True),
-                                            card.config(cursor="hand2")))
-            card.bind("<Leave>", lambda e: _draw(hovered=False))
-            card.bind("<Button-1>",
-                      lambda e: self._build_on_scouted_planet(
-                          ptype, pradius, pname, popup,
-                          product=None if p1_var.get() == ANY_P1 else p1_var.get(),
-                          chain=None if p1_var.get() == ANY_P1 else EXTRACTION_CHAIN))
-
-            return card
-
-        def _render_results(systems_data):
-            """Peuple la zone de résultats avec les sections système et cartes planète filtrées."""
-            for w in cards_frame.winfo_children():
-                w.destroy()
-            last_results["data"] = systems_data
-
-            if not systems_data:
-                tk.Label(cards_frame, text="No systems found.",
-                         bg=EVE["bg_deep"], fg=EVE["fg_dim"],
-                         font=("Segoe UI", _fs(11))).pack(pady=40)
-                status_var.set("No results.")
-                _sync_scroll(reset=True)
-                return
-
-            filtering = len(active_types) < len(PLANET_ORDER)
-
-            def _keep(planets):
-                return [p for p in planets if p.get("type", "Unknown") in active_types]
-
-            # Tri des systèmes : l'origine d'abord, puis par distance en sauts, puis alphabétique
-            def sys_sort_key(item):
-                sid, sdata = item
-                jd = sdata.get("jump_dist", 99)
-                return (jd, sdata.get("name", ""))
-            sys_list = sorted(systems_data.items(), key=sys_sort_key)
-
-            total_planets = 0
-            shown_systems = 0
-            # collapsed_state suit les systèmes ouverts (True = déplié)
-            collapsed_state = {}
-
-            def _make_system_section(sid, sdata):
-                nonlocal total_planets, shown_systems
-                # Seules les planètes qui passent le filtre de type atteignent l'UI, donc
-                # les compteurs de l'en-tête et les cartes en dessous concordent toujours.
-                planets = _keep(sdata.get("planets", []))
-                if not planets:
-                    return
-                sec   = sdata.get("security", 0)
-                sname = sdata.get("name", str(sid))
-                jdist = sdata.get("jump_dist", 0)
-                total_planets += len(planets)
-                shown_systems += 1
-
-                # Replié par défaut, mais un filtre signifie que l'utilisateur traque des
-                # planètes précises — on les montre sans un clic de plus.
-                collapsed_state[sid] = filtering
-
-                section = tk.Frame(cards_frame, bg=EVE["bg_deep"])
-                section.pack(fill=tk.X, pady=(4, 0))
-
-                # ── En-tête de système (cliquable pour plier/déplier) ─────
-                hdr = tk.Frame(section, bg=EVE["bg_card"],
-                               highlightbackground=EVE["border"], highlightthickness=1,
-                               cursor="hand2")
-                hdr.pack(fill=tk.X)
-
-                arrow_var = tk.StringVar(value="▼" if filtering else "▶")
-                arrow_lbl = tk.Label(hdr, textvariable=arrow_var,
-                                     bg=EVE["bg_card"], fg=EVE["accent_text"],
-                                     font=("Segoe UI", _fs(9), "bold"), width=2)
-                arrow_lbl.pack(side=tk.LEFT, padx=(8, 2), pady=6)
-
-                tk.Label(hdr, text=sname, bg=EVE["bg_card"],
-                         fg=EVE["fg_bright"],
-                         font=("Segoe UI", _fs(10), "bold")).pack(side=tk.LEFT, padx=4)
-                tk.Label(hdr, text=f"{sec:.2f}", bg=EVE["bg_card"],
-                         fg=_sec_color(sec),
-                         font=("Segoe UI", _fs(9))).pack(side=tk.LEFT)
-
-                planet_types_str = "  ·  ".join(
-                    sorted(set(p.get("type","?") for p in planets)))
-                tk.Label(hdr, text=f"  {planet_types_str}",
-                         bg=EVE["bg_card"], fg=EVE["fg_dim"],
-                         font=("Segoe UI", _fs(8))).pack(side=tk.LEFT)
-
-                jlbl = f"  {jdist} jump{'s' if jdist!=1 else ''}" if jdist else "  ★ origin"
-                tk.Label(hdr, text=jlbl + f"  ·  {len(planets)}p",
-                         bg=EVE["bg_card"], fg=EVE["fg_dim"],
-                         font=("Segoe UI", _fs(8))).pack(side=tk.RIGHT, padx=10)
-
-                # ── Conteneur des fiches de planète ───────────────────
-                cards_container = tk.Frame(section, bg=EVE["bg_deep"])
-                if filtering:
-                    cards_container.pack(fill=tk.X, pady=(2, 0))
-
-                def _toggle(e=None, sc=cards_container, sid=sid, av=arrow_var):
-                    if collapsed_state[sid]:
-                        # actuellement déplié → on replie
-                        sc.pack_forget()
-                        av.set("▶")
-                        collapsed_state[sid] = False
-                    else:
-                        # actuellement replié → on déplie
-                        sc.pack(fill=tk.X, pady=(2, 0))
-                        av.set("▼")
-                        collapsed_state[sid] = True
-                    _sync_scroll()
-
-                for w in [hdr, arrow_lbl]:
-                    w.bind("<Button-1>", _toggle)
-
-                for planet in sorted(planets, key=lambda p: p.get("type", "")):
-                    card = _make_planet_card(cards_container, planet)
-                    card.pack(fill=tk.X, padx=4, pady=2)
-
-            for sid, sdata in sys_list:
-                _make_system_section(sid, sdata)
-
-            if not total_planets:
-                tk.Label(cards_frame, text="No planet matches the type filter.",
-                         bg=EVE["bg_deep"], fg=EVE["fg_dim"],
-                         font=("Segoe UI", _fs(11))).pack(pady=40)
-                status_var.set("No planet matches the type filter.")
-            else:
-                status_var.set(f"{total_planets} planets · {shown_systems} systems")
-
-            # Nouveau contenu : retour en haut, avec la région de défilement reconstruite pour lui
-            _sync_scroll(reset=True)
-
-        def do_scan():
-            """Lance le scan ESI en arrière-plan : résout le système, charge ou construit le cache, affiche les résultats."""
-            if getattr(scan_btn, "_scanning", False):
-                return
-            scan_btn._scanning = True
-            _hide_ac()
-
-            sys_name = sys_var.get().strip()
-            try:
-                jumps = max(0, min(10, int(jumps_var.get())))
-            except (tk.TclError, ValueError):
-                status_var.set("Invalid jump count.")
-                scan_btn._scanning = False
-                return
-
-            if not sys_name:
-                status_var.set("Enter a system name first.")
-                scan_btn._scanning = False
-                return
-
-            scan_btn.config(text="● SCANNING…", bg=EVE["orange"], fg=EVE["bg_deep"])
-            status_var.set(f"Resolving '{sys_name}'…")
-
-            def _reset_btn():
-                scan_btn._scanning = False
-                scan_btn.config(text="⟳  SCAN", bg=EVE["accent_dim"], fg=EVE["fg_bright"])
-
-            def _bg():
-                try:
-                    # L'instantané SDE livré répond à toutes les questions d'un scan — noms,
-                    # stargates, types de planète et rayons — donc quand il est là, rien ici
-                    # ne touche au réseau, et rien n'est mis en cache sur disque non plus :
-                    # la source est déjà locale.
-                    universe = _offline_universe()
-                    if universe is not None:
-                        start_id = universe.resolve(sys_name)
-                        if not start_id:
-                            popup.after(0, lambda: status_var.set(f"'{sys_name}' not found."))
-                            popup.after(0, _reset_btn)
-                            return
-                        popup.after(0, lambda: status_var.set("Walking the jump network…"))
-                        systems_data = universe.scan(start_id, jumps)
-                        popup.after(0, lambda: _render_results(systems_data))
-                        _update_window_config("scanner_last_system", sys_name)
-                        _update_window_config("scanner_last_jumps", jumps)
-                        return
-
-                    # Les rayons doivent être chargés avant de scanner (et avant de lire un
-                    # cache, dont les rayons manquants sont complétés à partir d'eux)
-                    _ensure_planet_radii()
-                    start_id = _esi_resolve_system(sys_name)
-                    if not start_id:
-                        popup.after(0, lambda: status_var.set(f"'{sys_name}' not found."))
-                        popup.after(0, _reset_btn)
-                        return
-
-                    cache_key = f"system_{start_id}_j{jumps}"
-                    cached = _load_scan_cache(cache_key)
-
-                    if cached:
-                        systems_data = cached["systems"]
-                        popup.after(0, lambda: status_var.set("Loaded from cache…"))
-                    else:
-                        popup.after(0, lambda: status_var.set("Mapping jump network…"))
-
-                        # Parcours en largeur : ids de systèmes + distances en sauts en une seule passe
-                        dist_map = {start_id: 0}
-                        frontier = {start_id}
-                        all_ids = {start_id}
-                        # Charges utiles des systèmes récupérées pendant le parcours, réutilisées
-                        # par le scan de planètes ci-dessous pour ne télécharger chaque système qu'une fois.
-                        sys_payloads = {}
-
-                        for depth in range(1, jumps + 1):
-                            if not frontier: break
-                            next_f = set()
-
-                            def _get_gates(sid):
-                                try:
-                                    data = _esi_fetch(f"/universe/systems/{sid}/")
-                                    sys_payloads[sid] = data
-                                    return data.get("stargates", [])
-                                except Exception:
-                                    return []
-
-                            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
-                                gate_results = list(ex.map(_get_gates, list(frontier)))
-
-                            all_gates = [g for gl in gate_results for g in gl]
-
-                            def _get_dest(sg_id):
-                                try:
-                                    return _esi_fetch(f"/universe/stargates/{sg_id}/").get(
-                                        "destination", {}).get("system_id")
-                                except Exception:
-                                    return None
-
-                            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
-                                dests = list(ex.map(_get_dest, all_gates))
-
-                            for dst in dests:
-                                if dst and dst not in all_ids:
-                                    dist_map[dst] = depth
-                                    next_f.add(dst)
-                                    all_ids.add(dst)
-                            frontier = next_f
-
-                        n = len(all_ids)
-                        popup.after(0, lambda: status_var.set(f"Scanning {n} systems…"))
-                        systems_data = _fetch_planets_for_systems(
-                            list(all_ids),
-                            lambda m: popup.after(0, lambda msg=m: status_var.set(msg)),
-                            preloaded=sys_payloads)
-
-                        # On attache les distances en sauts au dict de données de chaque système
-                        for sid_key in systems_data:
-                            sid_int = int(sid_key) if isinstance(sid_key, str) else sid_key
-                            systems_data[sid_key]["jump_dist"] = dist_map.get(sid_int, jumps)
-
-                        _save_scan_cache(cache_key, systems_data)
-
-                    popup.after(0, lambda: _render_results(systems_data))
-                    _update_window_config("scanner_last_system", sys_name)
-                    _update_window_config("scanner_last_jumps", jumps)
-
-                except Exception as e:
-                    _debug(f"Proximity Scout scan error: {e}")
-                    traceback.print_exc()
-                    popup.after(0, lambda msg=str(e): status_var.set(f"Error: {msg}"))
-                finally:
-                    popup.after(0, _reset_btn)
-
-            threading.Thread(target=_bg, daemon=True).start()
-
-        scan_btn.config(command=do_scan)
-
-        # Préchauffage en arrière-plan. Avec l'instantané présent, ce n'est qu'une analyse
-        # de 2,6 Mo et aucun réseau ; les téléchargements ESI ne servent qu'au chemin de
-        # secours, donc les demander quand même téléchargerait 8 Mo de rayons que
-        # personne ne va lire.
-        if _offline_universe() is None:
-            threading.Thread(target=_ensure_system_names, daemon=True).start()
-            threading.Thread(target=_ensure_planet_radii, daemon=True).start()
-        else:
-            threading.Thread(target=_offline_universe, daemon=True).start()
-
-        # Mettre au premier plan appartient à la fenêtre flottante. Dans le rail,
-        # `dialog_parent` est la fenêtre principale : la soulever à chaque venue
-        # sur l'écran volerait le focus sans que personne l'ait demandé.
-        if popup is not self.root:
-            popup.lift()
-            popup.focus_force()
-        sys_entry.focus_set()
-
+        build_scout(self, body, dialog_parent)
 
 
 def main():

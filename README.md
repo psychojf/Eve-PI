@@ -311,6 +311,9 @@ PI/
 │   │   ├── eve_time.py          # EVE clock formatting
 │   │   └── history.py           # Always-on record of what you were working on
 │   └── ui/
+│       ├── stage_view.py        # The open colony and everything that acts on it
+│       ├── map_render.py        # The board: the colony drawn on its planet
+│       ├── scout_panel.py       # The Proximity Scout panel, window or screen
 │       ├── screens.py           # The rail's destinations and their order
 │       ├── more_tools.py        # The MORE TOOLS window
 │       ├── collect_bar.py       # The floating COLLECT EVERY bar

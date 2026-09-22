@@ -219,8 +219,9 @@ Work down the numbered panels:
        has one link fewer than it has structures: the tight
        ones are free, Ring pays about 93 CPU for its spokes,
        Spiral about 25 and it is the first to overload a link
-       on a bulky chain. Your choice is remembered between
-       sessions.
+       on a bulky chain. Every session opens on Standard: a
+       shape is a choice you make for one colony, and finding
+       the last one laid over the next was not the point.
 
      Set counts myself — tick this to place exact numbers of
        extractors, heads, factories, pads and arm length.
@@ -323,8 +324,10 @@ Work down the numbered panels:
          adds in CPU and power. Measured in game up to level
          2; above that the figure is marked as an estimate.
 
-     Your yield choice is remembered between sessions; the
-     manual counts are not.
+     Your yield choice is remembered between sessions. The
+     manual counts are not, and neither are the shape nor the
+     collection interval: those two open on Standard and 24h
+     every time.
 
 -----------------------------------------------------------
 COLLECT EVERY — ON THE PLANET
@@ -333,7 +336,8 @@ COLLECT EVERY — ON THE PLANET
 The collection interval floats on the planet itself, top
 left, as a small bar: 6h · 12h · 24h · 48h · 72h · 168h.
 Drag it by the ⠿ handle if it sits over something you want
-to see.
+to see. It opens on 24h every session — the interval you
+picked last time is not carried over.
 
 It is there rather than in the settings column because its
 answer is written on the planet — in the drop-off panel, in
