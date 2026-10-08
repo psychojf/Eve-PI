@@ -57,6 +57,12 @@ def circular_alpha(size):
 
 
 def build(source_path, target_path):
+    """Recadre une planète sur son disque, lui pose un masque alpha rond et
+    l'écrit en WebP.
+
+    Renvoie la taille écrite, pour que `main` puisse annoncer ce que les images
+    ajoutent à l'exe.
+    """
     with Image.open(source_path) as image:
         cx, cy, radius = disc_circle(image)
         # Un carré centré sur le disque, et non un collage centré d'un recadrage
@@ -72,6 +78,7 @@ def build(source_path, target_path):
 
 
 def main():
+    """Convertit chaque artwork « -hd.png » du webtool en `data/planets/<type>.webp`."""
     if not os.path.isdir(SOURCE_DIR):
         print(f"Source artwork not found: {SOURCE_DIR}", file=sys.stderr)
         return 1

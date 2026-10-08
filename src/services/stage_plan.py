@@ -25,11 +25,22 @@ RETUNE = "retune"      # un champ du template auquel on ré-accorde la carte
 EDIT = "edit"          # une édition qui garde les structures déjà posées
 REBUILD = "rebuild"    # une autre colonie : rien d'honnête à conserver
 REFUSE = "refuse"      # le contrôle ne sait pas agir ici
+RESHAPE = "reshape"    # la même colonie, redessinée dans la forme demandée
 
-# Le produit, la chaîne et la planète décident *quelle* colonie c'est. La forme
-# (layout_shapes) repose chaque structure : aucune position posée à la main ne
-# peut survivre à un changement de forme, c'est donc une reconstruction.
-_RESHAPING = ("product_name", "chain_name", "planet_type", "shape")
+# Le produit, la chaîne et la planète décident *quelle* colonie c'est.
+_RESHAPING = ("product_name", "chain_name", "planet_type")
+
+# Une nouvelle forme redessine la même colonie au lieu d'en bâtir une autre.
+# C'était une reconstruction, au motif qu'une forme repose chaque structure et
+# qu'aucune position posée à la main n'y survit. Vrai des positions, faux du
+# reste : `apply_shape` prend n'importe quel template, garde ses structures et
+# re-route ce qu'il avait, alors que reconstruire jetait l'entrepôt et les
+# compteurs qu'un redessin aurait gardés. Signalé dans l'outil web :
+# *« if i chose another shape then i have to start from scratch »* (portage du
+# `planForShape` de l'outil web, 2026-09-20). « standard » reste une
+# reconstruction : ce n'est pas une forme qu'on applique, c'est ce que le
+# générateur pose quand on n'en demande aucune.
+_SHAPE = "shape"
 
 # Des champs du template : la carte s'y ré-accorde sans qu'aucun pin ne bouge.
 # Le rayon n'atteint qu'un seul endroit — `links_cost`, qui facture chaque lien à
@@ -52,7 +63,7 @@ _REFUSING = ("arm_length",)
 # déjà mot pour mot des chaînes à géométrie figée.
 _JUDGING = ("collection_hours",)
 
-_ALL = _RESHAPING + _RETUNING + _EDITING + _REFUSING + _JUDGING
+_ALL = _RESHAPING + (_SHAPE,) + _RETUNING + _EDITING + _REFUSING + _JUDGING
 
 
 def changed_fields(before, after):
@@ -61,7 +72,7 @@ def changed_fields(before, after):
 
 
 def plan_for(before, after, hand_edited):
-    """Trie un changement de réglage en l'un des cinq plans.
+    """Trie un changement de réglage en l'un des six plans.
 
     « hand_edited » est la seule chose qui rende la question intéressante. Tant
     que personne n'a déplacé de structure, il n'y a aucune mise en page à
@@ -80,6 +91,8 @@ def plan_for(before, after, hand_edited):
         return REBUILD
     if changed & set(_RESHAPING):
         return REBUILD
+    if _SHAPE in changed:
+        return REBUILD if after.get(_SHAPE) in (None, "standard") else RESHAPE
     if changed & set(_REFUSING):
         return REFUSE
     if changed & set(_EDITING):

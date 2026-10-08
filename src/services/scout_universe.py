@@ -55,6 +55,9 @@ class ScoutUniverse:
     """Un instantané du SDE, indexé pour être interrogé sans réseau."""
 
     def __init__(self, payload):
+        """Indexe l'instantané une fois, pour que chaque recherche du scout
+        soit locale et immédiate.
+        """
         self.sde_build = payload.get("sde", {}).get("buildNumber")
         self.sde_released = payload.get("sde", {}).get("releaseDate")
         systems = payload.get("systems", [])
@@ -73,10 +76,12 @@ class ScoutUniverse:
 
     @property
     def system_count(self):
+        """Le nombre de systèmes ; les tests s'en servent pour reconnaître un instantané tronqué."""
         return len(self._by_id)
 
     @property
     def planet_count(self):
+        """Le nombre de planètes de l'instantané, tous systèmes confondus."""
         return sum(len(record[_PLANETS]) for record in self._by_id.values())
 
     def resolve(self, system_name):

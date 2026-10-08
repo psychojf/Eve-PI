@@ -31,6 +31,12 @@ class MixedP2Error(ValueError):
     """Refus explicite du planificateur mixte, avec un code lisible par l'appelant."""
 
     def __init__(self, code, message, **details):
+        """`code` est stable et testé ; `message` est pour l'utilisateur ;
+        `details` pour le débogage.
+
+        Un code plutôt que le texte : les tests et l'interface réagissent au
+        genre de refus sans dépendre d'une phrase qui peut changer.
+        """
         super().__init__(message)
         self.code = code
         self.details = details
@@ -74,6 +80,11 @@ def normalize_assignments(assignments, factory_count, fallback_product):
 
 
 def _validate_assignment(product_name):
+    """Refuse un produit inconnu ou qui n'est pas un P2.
+
+    Seuls les P2 ont une recette P1 → P2 ; toute autre affectation poserait une
+    usine sans schéma valide.
+    """
     if NAME_TO_ID.get(product_name) is None:
         raise MixedP2Error("unknown-product",
                            f"Unknown mixed P2 product: {product_name}.",
@@ -84,6 +95,9 @@ def _validate_assignment(product_name):
 
 
 def _route_shape_error(factory_index, reason, **details):
+    """Le refus « route-shape » : l'usine n°`factory_index` ne peut pas être
+    routée sans risque.
+    """
     return MixedP2Error(
         "route-shape",
         f"Factory {factory_index} cannot be assigned safely: {reason}.",

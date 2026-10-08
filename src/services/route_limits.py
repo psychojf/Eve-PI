@@ -23,19 +23,18 @@ Un template peut porter le niveau d'un lien (« Lv ») : importé en jeu le
 l'usage de la colonie — 23 075 tf / 18 764 MW — était au chiffre près celui
 calculé ici.
 """
-import math
 from typing import NamedTuple
 
-from src.pi_data import (LINK_CPU_BASE, LINK_CPU_PER_KM, LINK_POWER_BASE,
-                         LINK_POWER_PER_KM)
-from src.services.template_service import (LINK_CAPACITY_M3H, STRUCT_ID_TO_NAME, _bfs_path,
-                                           link_flows, pin_angle,
-                                           template_radius)
+# `link_cost_at_level` et ses modificateurs vivent dans template_service, pour
+# que `links_cost` facture un lien à son niveau ; réexportés ici, où on les
+# cherche.
+from src.services.template_service import (LINK_CAPACITY_M3H, LINK_CPU_LEVEL_MODIFIER,  # noqa: F401
+                                           LINK_POWER_LEVEL_MODIFIER, STRUCT_ID_TO_NAME,
+                                           _bfs_path, link_cost_at_level, link_flows,
+                                           pin_angle, template_radius)
 
 MAX_ROUTE_STRUCTURES = 7
 
-LINK_CPU_LEVEL_MODIFIER = 1.4
-LINK_POWER_LEVEL_MODIFIER = 1.2
 # Le niveau le plus haut que des relevés en jeu confirment.
 VERIFIED_LINK_LEVEL = 2
 
@@ -58,15 +57,8 @@ def long_routes_note(found):
             f"build {'them' if many else 'it'} (route {number}: {structures})")
 
 
-def link_cost_at_level(distance_km, level):
-    """(CPU, MW) d'un lien de cette longueur à ce niveau d'amélioration."""
-    cpu = LINK_CPU_BASE + LINK_CPU_PER_KM * distance_km * (level + 1) ** LINK_CPU_LEVEL_MODIFIER
-    power = (LINK_POWER_BASE
-             + LINK_POWER_PER_KM * distance_km * (level + 1) ** LINK_POWER_LEVEL_MODIFIER)
-    return math.ceil(cpu - 1e-9), math.ceil(power - 1e-9)
-
-
 def link_capacity_at_level(level):
+    """Débit d'un lien, en m³/h, à ce niveau : il double à chaque amélioration."""
     return LINK_CAPACITY_M3H * 2 ** level
 
 
@@ -132,6 +124,11 @@ def fit_routes(template, from_index=0):
     count = len(pins)
 
     def is_hub(one_based):
+        """Vrai si le pin à cet indice 1-based est un pad ou un entrepôt.
+
+        Les indices viennent des routes : un indice hors de la colonie répond
+        faux au lieu de lever.
+        """
         return (1 <= one_based <= count
                 and STRUCT_ID_TO_NAME.get(pins[one_based - 1].get("T")) in _HUB_STRUCTURES)
 

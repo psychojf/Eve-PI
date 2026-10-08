@@ -19,7 +19,7 @@ Examples of unacceptable behavior by participants include:
 - The use of sexualized language or imagery and unwelcome sexual attention or advances
 - Trolling, insulting or derogatory comments, and personal or political attacks
 - Public or private harassment
-- Publishing othersprivate information, such as a physical or electronic address, without explicit permission
+- Publishing others' private information, such as a physical or electronic address, without explicit permission
 - Other conduct which could reasonably be considered inappropriate in a professional setting
 
 ## Enforcement Responsibilities
@@ -28,7 +28,7 @@ Project maintainers are responsible for clarifying and enforcing this code of co
 
 ## Reporting Guidelines
 
-If you are subject to or witness unacceptable behavior, please report it by opening a private issue or contacting the project maintainers directly through the repository's communication channel.
+If you are subject to or witness unacceptable behavior, please report it by contacting the project maintainer directly on the project's [Discord](https://discord.gg/zBkQ5rXWc).
 
 All reports will be handled promptly and with discretion. Retaliation against anyone who reports an incident in good faith is prohibited.
 

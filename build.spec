@@ -39,6 +39,10 @@ a = Analysis(
         # Les vignettes du Scout, une par type de planète.
         ('data/planet_icons', 'data/planet_icons'),
 
+        # Les masques des glyphes de structures (51 Ko) : sans eux, la carte
+        # retombe sur ses formes vectorielles dessinées à la main.
+        ('data/pi_icons', 'data/pi_icons'),
+
         # `planet_radii.json` (8,3 Mo) et `system_names.json` ne sont
         # délibérément PAS embarqués. Ce sont les caches du chemin de secours
         # ESI, et ce chemin ne s'ouvre que si l'instantané SDE manque — voir
@@ -58,10 +62,12 @@ a = Analysis(
         'src.services.grace', 'src.services.factory_runtime',
         'src.services.grow_to_supply', 'src.services.history',
         'src.services.sourcing', 'src.services.eve_time',
-        'src.services.storage_suggestion',
+        'src.services.storage_suggestion', 'src.services.layout_shapes',
+        'src.services.route_limits', 'src.services.template_doctor',
         # Les écrans et panneaux flottants.
         'src.ui.screens', 'src.ui.factory_timer', 'src.ui.stage_notice',
-        'src.ui.collect_bar',
+        'src.ui.collect_bar', 'src.ui.stage_view', 'src.ui.map_render',
+        'src.ui.scout_panel',
     ],
     hookspath=[],
     hooksconfig={},

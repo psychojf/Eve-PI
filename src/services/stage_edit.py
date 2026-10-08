@@ -18,6 +18,7 @@ from src.services.colony_model import (EditError, add_extractor, add_factory,
                                        set_heads, set_radius_km,
                                        set_yield_per_head)
 from src.services.grow_to_supply import grow_to_supply
+from src.services.layout_shapes import STANDARD, apply_shape
 
 # Le compteur du panneau, et l'opération qui le sert sans rien reposer.
 _COUNTERS = (
@@ -121,3 +122,35 @@ def apply_edit(model, before, after):
             refusal = refusal or growth.refused
 
     return model, refusal
+
+
+def stage_takes_shape(source, shape, planner_colony):
+    """La colonie de la scène est-elle de celles où se pose la forme du panneau.
+
+    Pas une colonie venue d'ailleurs, qui n'a pas de forme à elle ; pas
+    « standard », la mise en page du générateur, qu'on ne ré-applique pas à une
+    colonie éditée ; et pas celle d'une ligne de « Ways to build this » ou du
+    planificateur P2 mixte (`planner_colony`), qui ne prennent jamais de forme
+    — la liste n'offre alors que Standard, mais une forme choisie avant y
+    reste. Miroir de `stageTakesShape` dans l'outil web.
+    """
+    return source == "draft" and bool(shape) and shape != STANDARD and not planner_colony
+
+
+def shaped_for_stage(template, shape, refusal=None):
+    """La colonie redessinée dans la forme du panneau, et quoi dire quand elle ne peut l'être.
+
+    Portage du `shapedForStage` de l'outil web (2026-09-20) : *« if i add/remove
+    storage or launch pad or factories, is it possible to redraw the template
+    correctly, i mean, the shape i choosen »*. Lancé après chaque édition qui
+    change les structures, pour qu'un entrepôt ajouté à une étoile atterrisse
+    dans l'étoile plutôt qu'à côté d'un pad.
+
+    `apply_shape` juge et ne détruit rien : une forme qui ne tient plus rend la
+    colonie intacte avec la raison, peinte sur la planète. Le refus de
+    l'édition passe devant : il parle du changement qu'on vient de demander, la
+    note de forme ne parle que de son dessin. À la scène de dire d'abord si la
+    forme s'applique (`stage_takes_shape`, et rien de posé à la main).
+    """
+    shaped, note = apply_shape(template, shape)
+    return shaped, refusal or note

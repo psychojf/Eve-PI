@@ -51,6 +51,7 @@ class History:
     """Liste bornée d'états de template, la plus récente d'abord."""
 
     def __init__(self, path):
+        """Ouvre l'historique stocké dans `path` ; un fichier illisible repart à vide."""
         self.path = path
         self._entries = []      # dicts bruts, le plus récent en tête
         self._load()
@@ -69,6 +70,12 @@ class History:
             self._entries = []
 
     def _save(self):
+        """Réécrit tout le fichier, atomiquement.
+
+        Une erreur d'écriture est avalée : l'historique est un filet de
+        sécurité, et un disque plein ou un dossier en lecture seule ne doivent
+        pas faire échouer le geste qui l'a déclenché.
+        """
         try:
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
             tmp = self.path + ".tmp"
@@ -94,6 +101,7 @@ class History:
         return out
 
     def latest(self):
+        """L'entrée la plus récente, ou None si l'historique est vide."""
         entries = self.entries()
         return entries[0] if entries else None
 
@@ -127,9 +135,11 @@ class History:
         return entry_id
 
     def delete(self, entry_id):
+        """Oublie une entrée par son id ; un id inconnu ne fait rien."""
         self._entries = [e for e in self._entries if e.get("id") != entry_id]
         self._save()
 
     def clear(self):
+        """Oublie toutes les entrées et réécrit le fichier vide."""
         self._entries = []
         self._save()

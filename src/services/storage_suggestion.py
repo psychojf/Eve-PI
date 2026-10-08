@@ -11,6 +11,11 @@ production contre de la place : le moins de jeux de production retirés qui
 laissent le stockage atteindre l'intervalle. Et quand il n'y a rien à échanger,
 `higher_tier_chain` propose le même produit fabriqué à partir du palier du
 dessus.
+
+Depuis le portage du 2026-09-22 (outil web, 2026-09-19), chaque colonie que la
+recherche touche est routée comme le fait « Route storage to factories » : la
+suggestion mesurait une colonie et en appliquait une autre, qui demandait
+encore ce bouton pour tenir les heures annoncées.
 """
 from __future__ import annotations
 
@@ -21,7 +26,7 @@ from typing import NamedTuple, Optional
 
 from src.services.colony_model import (EditError, ParseError, add_hub, parse_colony,
                                        production_set_count, production_set_members,
-                                       remove_production_set)
+                                       remove_production_set, route_hubs)
 from src.services.template_service import (CHAINS, ID_TO_NAME, TemplateService,
                                            analyze_template)
 
@@ -66,8 +71,31 @@ class ChainSwitch(NamedTuple):
 
 
 def _fits_budget(analysis):
+    """Vrai si la colonie analysée tient dans le CPU et le PWR de son Command Center."""
     return (analysis["cpu_used"] <= analysis["cpu_max"]
             and analysis["power_used"] <= analysis["power_max"])
+
+
+def _route_all(model):
+    """Chaque launch pad et entrepôt relié aux usines qu'il peut nourrir, ou la colonie telle quelle.
+
+    Ce que fait « Route storage to factories », fait ici pour que la suggestion
+    appliquée ne laisse pas ce bouton encore à presser. add_hub route
+    l'entrepôt qu'il ajoute, mais les pads déjà posés gardent les routes du
+    générateur — une marchandise chacun — et une usine ne puise que dans un
+    stock qui a une route vers elle. Sur les 2 864 colonies que Build sait
+    générer, router le reste vaut des heures sur 144 des 1 456 à qui l'on
+    propose du stockage : une P1 → P3 lisait 85,1 h avec l'entrepôt posé et
+    98,7 h une fois les pads routés. Ça ne coûte jamais d'heures, et une route
+    ne coûte ni CPU ni énergie. Miroir de `routeAll` dans l'outil web.
+
+    route_hubs refuse quand il n'ajoute rien, ce qui ici n'est pas un échec :
+    la colonie est déjà routée.
+    """
+    try:
+        return route_hubs(model)
+    except EditError:
+        return model
 
 
 def _grow_storage(start, start_hours, options):
@@ -80,7 +108,7 @@ def _grow_storage(start, start_hours, options):
     best = None
     for count in range(1, MOST_STORAGE_TRIED + 1):
         try:
-            model = add_hub(model, "Storage Facility")
+            model = _route_all(add_hub(model, "Storage Facility"))
         except EditError:
             return best, "room"
         grown = model.to_template()
@@ -98,19 +126,20 @@ def _grow_storage(start, start_hours, options):
 def storage_suggestion(template, collection_hours, yield_per_head):
     """Combien d'entrepôts amèneraient une colonie à son intervalle de ramassage.
 
-    Ajoute des entrepôts un à un avec add_hub, qui route aussi chacun vers les
-    usines qui mangent un import — sans quoi le stockage ne compterait pas — et
-    garde le moins qui tiennent l'intervalle. S'arrête au budget, faute de
-    place, ou dès qu'un de plus n'achète rien : le stockage n'allonge une
-    tournée que quand ce qui s'épuise en premier peut y être tenu, et la sortie
-    d'un mineur qui attend au launch pad ne le peut pas.
+    Route d'abord la colonie — voir `_route_all`, et `count` 0 pour celles à
+    qui rien d'autre ne manque — puis ajoute des entrepôts un à un avec
+    add_hub, en routant après chacun, et garde le moins qui tiennent
+    l'intervalle. S'arrête au budget, faute de place, ou dès qu'un de plus
+    n'achète rien : le stockage n'allonge une tournée que quand ce qui s'épuise
+    en premier peut y être tenu, et la sortie d'un mineur qui attend au launch
+    pad ne le peut pas.
 
     Quand pas même un entrepôt ne tient dans le budget, échange de la production
     contre de la place : 120 colonies P1 → P3 à 168 h manquaient de CPU pour un
     seul ; un jeu retiré en achète deux et 175 h à 75 % de la sortie.
 
     None quand la colonie tient déjà l'intervalle, ou que l'éditeur ne sait pas
-    lire son implantation.
+    lire son implantation. Miroir de `storageSuggestion` dans l'outil web.
     """
     options = {"collection_hours": collection_hours, "yield_per_head": yield_per_head}
     base = analyze_template(template, options)
@@ -121,14 +150,34 @@ def storage_suggestion(template, collection_hours, yield_per_head):
     except ParseError:
         return None
 
-    best, stopped = _grow_storage(model, base["buffer_hours"], options)
+    # Router ce qui est déjà là vient d'abord, et suffit parfois : 48 des
+    # colonies que Build génère ne manquent leur intervalle que parce que les
+    # pads nourrissent une marchandise chacun — une P1 → P3 à 48 h lit 29,9 h
+    # sans routes et 54,8 h routée. Y proposer un entrepôt, ce serait demander du
+    # CPU, de l'énergie et une place pour acheter ce qu'une route donne gratis.
+    routed = _route_all(model)
+    routed_template = routed.to_template()
+    routed_analysis = analyze_template(routed_template, options)
+    if routed_analysis["buffer_hours"] >= collection_hours:
+        return StorageSuggestion("reaches", count=0, hours=routed_analysis["buffer_hours"],
+                                 template=routed_template)
+
+    best, stopped = _grow_storage(routed, routed_analysis["buffer_hours"], options)
     if best is not None:
         count, hours, grown = best
         return StorageSuggestion("reaches" if hours >= collection_hours else "most",
                                  count=count, hours=hours, template=grown)
+    # Router sans atteindre l'intervalle, quand aucun entrepôt ne s'ajoute
+    # par-dessus, vaut mieux que le refus d'avant : des heures pour rien, et la
+    # colonie garde toutes ses usines. Seulement quand le chiffre a bougé, pour
+    # que le bouton n'apparaisse jamais sans rien derrière.
+    routing_alone = (StorageSuggestion("most", count=0, hours=routed_analysis["buffer_hours"],
+                                       template=routed_template)
+                     if routed_analysis["buffer_hours"] > base["buffer_hours"] else None)
     if stopped != "budget":
-        return StorageSuggestion("none", reason=stopped)
-    return (_trade_for_storage(model, base, options)
+        return routing_alone or StorageSuggestion("none", reason=stopped)
+    return (_trade_for_storage(routed, base, options)
+            or routing_alone
             or StorageSuggestion("none", reason="budget"))
 
 
@@ -145,7 +194,10 @@ def _trade_for_storage(model, base, options):
     best = None
     for removed in range(1, sets):
         try:
-            working = remove_production_set(working)
+            # Routée de nouveau après la coupe : retirer un jeu libère les pads
+            # qui le nourrissaient, et les heures d'où l'on mesure doivent être
+            # les vraies de la colonie rognée.
+            working = _route_all(remove_production_set(working))
         except EditError:
             break
         trimmed = analyze_template(working.to_template(), options)
@@ -203,6 +255,9 @@ def higher_tier_chain(config):
     options = config.get("layout") or {}
 
     def made(chain_name):
+        """L'analyse de la colonie que cette chaîne générerait, ou None si elle
+        ne se bâtit pas.
+        """
         template = service.generate({**config, "chain_name": chain_name})
         if template is None:
             return None

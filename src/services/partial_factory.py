@@ -3,14 +3,14 @@
 Portage de `WEBTOOL/src/core/generators/partial-factory.ts`.
 
 Volontairement PAS une option sur `_gen_p1_to_p3_template` ni sur
-`_build_p4_template`. Ces generateurs sont gardes par les baselines golden et
-par la suite de parite du webtool, et la forme mixte est une autre colonie,
-pas une variation des formes figees. Chaque dimension, chaque arrondi et chaque
+`_build_p4_template`. Ces générateurs sont gardés par les baselines golden et
+par la suite de parité du webtool, et la forme mixte est une autre colonie,
+pas une variation des formes figées. Chaque dimension, chaque arrondi et chaque
 calcul de budget vient d'ici de `template_service`, donc les deux s'accordent
 sur le jeu sans partager de chemin de code.
 
-Refuse net les plans uniformes : tout importer, ou tout fabriquer a la meme
-profondeur, c'est une des chaines existantes, qui se genere deja correctement
+Refuse net les plans uniformes : tout importer, ou tout fabriquer à la même
+profondeur, c'est une des chaînes existantes, qui se génère déjà correctement
 ailleurs. `variants.py` y aiguille ces cas et n'appelle jamais ce module.
 """
 import math
@@ -26,7 +26,7 @@ from src.services.template_service import (BASE_SPACING, CENTER_LAT,
                                            _place_factory_row, _try_budget,
                                            get_tier)
 
-# Le meme plafond que la recherche de `_gen_p1_to_p3_template`.
+# Le même plafond que la recherche de `_gen_p1_to_p3_template`.
 MAX_FACTORY_SEARCH = 20
 
 FACTORY = "Advanced Industry Facility"
@@ -35,10 +35,10 @@ LAUNCH_PAD = "Launch Pad"
 
 
 def _push_row(pins, latitude, count, arm_length, structure_type_id, schematic_id):
-    """Pose une rangee d'usines identiques et renvoie ses pins sous forme de bras.
+    """Pose une rangée d'usines identiques et renvoie ses pins sous forme de bras.
 
-    Les deux formes ci-dessous batissent toutes leurs rangees par ici, donc la
-    geometrie d'une rangee ne peut pas deriver entre la branche P3 et la P4.
+    Les deux formes ci-dessous bâtissent toutes leurs rangées par ici, donc la
+    géométrie d'une rangée ne peut pas dériver entre la branche P3 et la P4.
     """
     positions, local_arms = _place_factory_row(latitude, 0, count, BASE_SPACING,
                                                arm_length)
@@ -50,7 +50,7 @@ def _push_row(pins, latitude, count, arm_length, structure_type_id, schematic_id
 
 
 def _link_row(links, arms, anchor):
-    """Accroche une rangee a son ancre, chaque bras une chaine qui part vers l'exterieur."""
+    """Accroche une rangée à son ancre, chaque bras une chaîne qui part vers l'extérieur."""
     for arm in arms:
         if not arm:
             continue
@@ -60,9 +60,9 @@ def _link_row(links, arms, anchor):
 
 
 def _push_routes(routes, links, arms, pad, direction, quantity, type_id, pin_count):
-    """Route une marchandise entre une rangee et un pad, une route par usine.
+    """Route une marchandise entre une rangée et un pad, une route par usine.
 
-    `direction` se lit du point de vue de la rangee : « in » porte la
+    `direction` se lit du point de vue de la rangée : « in » porte la
     marchandise du `pad` vers chaque usine, « out » la porte dans l'autre sens.
     """
     for arm in arms:
@@ -74,21 +74,21 @@ def _push_routes(routes, links, arms, pad, direction, quantity, type_id, pin_cou
 
 
 def _spread_to_spare_pads(feeds, launch_pad_pins, hub):
-    """Donne des intrants amenes a charger aux pads qu'aucune rangee n'utilise.
+    """Donne des intrants amenés à charger aux pads qu'aucune rangée n'utilise.
 
-    `feeds` liste, rangee par rangee, le pad d'ou part chaque intrant amene ;
-    chaque liste est modifiee en place. La recherche pose trois pads des que le
-    budget le permet, quel que soit le nombre de rangees a ancrer, et un pad sur
-    aucune route ne contient rien en jeu. Ce pad est deja paye : il sert de
-    stockage plutot que d'etre retire. Mesure sur Data Chips en CC5, la rangee
+    `feeds` liste, rangée par rangée, le pad d'où part chaque intrant amené ;
+    chaque liste est modifiée en place. La recherche pose trois pads dès que le
+    budget le permet, quel que soit le nombre de rangées à ancrer, et un pad sur
+    aucune route ne contient rien en jeu. Ce pad est déjà payé : il sert de
+    stockage plutôt que d'être retiré. Mesuré sur Data Chips en CC5, la rangée
     de Microfiber Shielding tenait 23,5 h sur son seul pad d'ancrage et tient
-    47 h une fois ses deux P1 repartis, sans une usine ni un lien de plus.
+    47 h une fois ses deux P1 répartis, sans une usine ni un lien de plus.
 
-    Deux passes, dans l'ordre des rangees. D'abord une rangee qui puise au hub
-    passe entiere sur un pad libre, car le hub porte deja chaque intrant et la
-    sortie du produit, et un meme pin ne fait qu'un reservoir. Ensuite une
-    rangee qui tire tous ses intrants d'un meme pad en envoie le reste sur un
-    pad libre, pour que chaque P1 ait si possible un pad a lui, comme dans
+    Deux passes, dans l'ordre des rangées. D'abord une rangée qui puise au hub
+    passe entière sur un pad libre, car le hub porte déjà chaque intrant et la
+    sortie du produit, et un même pin ne fait qu'un réservoir. Ensuite une
+    rangée qui tire tous ses intrants d'un même pad en envoie le reste sur un
+    pad libre, pour que chaque P1 ait si possible un pad à lui, comme dans
     `_gen_p1_to_p3_template`.
 
     Miroir de `spreadToSparePads` dans `partial-factory.ts` (branche
@@ -106,10 +106,10 @@ def _spread_to_spare_pads(feeds, launch_pad_pins, hub):
 
 
 def _latitude_pool(count):
-    """Latitudes pour `count` rangees, en s'ecartant de l'equateur.
+    """Latitudes pour `count` rangées, en s'écartant de l'équateur.
 
-    Les trois premieres sont celles qu'occupe aussi l'echine de launch pads. Une
-    rangee et un pad partagent une latitude sans se heurter, parce que
+    Les trois premières sont celles qu'occupe aussi l'échine de launch pads. Une
+    rangée et un pad partagent une latitude sans se heurter, parce que
     `_place_factory_row` se centre sur la longitude 0 et n'y pose jamais de pin.
     """
     latitudes = [CENTER_LAT]
@@ -125,7 +125,7 @@ def _latitude_pool(count):
 def generate_partial_factory(config, plan):
     """Colonie qui fabrique une partie de ses intrants et fait venir le reste.
 
-    `config` est la config ordinaire des generateurs ; `plan` associe a chaque
+    `config` est la config ordinaire des générateurs ; `plan` associe à chaque
     intrant direct du produit l'un de « import », « make-from-p2 »,
     « make-from-p1 ».
     """
@@ -160,23 +160,23 @@ def generate_partial_factory(config, plan):
         if None in (factory_tid, launch_pad_tid, planet_tid, product_tid):
             return None
 
-        # Usines de chaque intrant fabrique, par usine de produit.
+        # Usines de chaque intrant fabriqué, par usine de produit.
         ratios = [max(1, math.ceil(quantity / made_recipes[index]["output"]))
                   for index, (_, quantity) in enumerate(made)]
 
         # On cherche la longueur de bras autant que le nombre d'usines.
         #
-        # Une rangee tient `2 * arm` usines, et une colonie partielle manque
-        # d'usines plutot que de budget : fabriquer un P2 au lieu de deux libere
-        # environ un tiers du command center, et au bras de quatre par defaut la
-        # rangee est pleine bien avant que le budget le soit. Mesure sur Data
-        # Chips en CC5, la version a bras fixe s'arretait a quatre usines de
-        # produit avec 8 235 de CPU encore inutilise — soit tout l'interet de la
-        # variante jete a la poubelle.
+        # Une rangée tient `2 * arm` usines, et une colonie partielle manque
+        # d'usines plutôt que de budget : fabriquer un P2 au lieu de deux libère
+        # environ un tiers du command center, et au bras de quatre par défaut la
+        # rangée est pleine bien avant que le budget le soit. Mesuré sur Data
+        # Chips en CC5, la version à bras fixe s'arrêtait à quatre usines de
+        # produit avec 8 235 de CPU encore inutilisé — soit tout l'intérêt de la
+        # variante jeté à la poubelle.
         #
-        # Le plus large gagne, et a egalite le bras le plus court : une colonie
-        # pas plus large que necessaire se lit mieux sur la planete, et
-        # `_place_factory_row` ne pose de toute facon jamais plus que arm_len
+        # Le plus large gagne, et à égalité le bras le plus court : une colonie
+        # pas plus large que nécessaire se lit mieux sur la planète, et
+        # `_place_factory_row` ne pose de toute façon jamais plus que arm_len
         # par bras.
         launch_pad_count = 0
         product_count = 0
@@ -205,9 +205,9 @@ def generate_partial_factory(config, plan):
         if product_count == 0:
             return None
 
-        # Les latitudes de rangee de `_gen_p1_to_p3_template`, pour la meme
-        # raison : elles laissent la longitude 0 libre a chaque latitude pour
-        # l'echine de launch pads.
+        # Les latitudes de rangée de `_gen_p1_to_p3_template`, pour la même
+        # raison : elles laissent la longitude 0 libre à chaque latitude pour
+        # l'échine de launch pads.
         row_latitudes = [CENTER_LAT + BASE_SPACING, CENTER_LAT - BASE_SPACING]
 
         pins = []
@@ -236,9 +236,9 @@ def generate_partial_factory(config, plan):
         for index in range(1, launch_pad_count):
             links.append({"D": hub, "Lv": 0, "S": launch_pad_pins[index]})
 
-        # Chaque rangee fabriquee pend au pad qui partage sa latitude, donc son
-        # lien vers ce pad fait un espacement plutot qu'une diagonale. La rangee
-        # de produit et toute rangee sans pad propre pendent au hub.
+        # Chaque rangée fabriquée pend au pad qui partage sa latitude, donc son
+        # lien vers ce pad fait un espacement plutôt qu'une diagonale. La rangée
+        # de produit et toute rangée sans pad propre pendent au hub.
         row_anchors = [launch_pad_pins[1] if len(launch_pad_pins) > 1 else hub,
                        launch_pad_pins[2] if len(launch_pad_pins) > 2 else hub]
         for index, arms in enumerate(made_arms):
@@ -249,7 +249,7 @@ def generate_partial_factory(config, plan):
         routes = []
         pin_count = len(pins)
 
-        # P1 en entree, depuis le pad qui ancre la rangee qui les mange, ou un
+        # P1 en entrée, depuis le pad qui ancre la rangée qui les mange, ou un
         # pad que rien d'autre n'utilise.
         p1_sources = []
         for index in range(len(made)):
@@ -266,16 +266,16 @@ def generate_partial_factory(config, plan):
                 _push_routes(routes, links, made_arms[index], source, "in",
                              p1_quantity, p1_tid, pin_count)
 
-        # P2 fabrique en sortie vers le hub, ou la rangee de produit puise.
+        # P2 fabriqué en sortie vers le hub, où la rangée de produit puise.
         for index, (name, _) in enumerate(made):
             made_recipe = made_recipes[index]
             type_id = NAME_TO_ID.get(name)
             _push_routes(routes, links, made_arms[index], hub, "out",
                          made_recipe["output"], type_id, pin_count)
 
-        # Tous les intrants du produit sortent du hub, fabriques comme importes.
+        # Tous les intrants du produit sortent du hub, fabriqués comme importés.
         # C'est la forme que produit `_gen_p1_to_p3_template`, donc une colonie
-        # qui importe un P2 se lit en jeu exactement comme une qui l'a fabrique.
+        # qui importe un P2 se lit en jeu exactement comme une qui l'a fabriqué.
         for name, quantity in recipe["input"]:
             type_id = NAME_TO_ID.get(name)
             if type_id is None:
@@ -303,17 +303,17 @@ def generate_partial_factory(config, plan):
 
 
 def _generate_partial_p4(config, plan):
-    """Colonie P4 qui batit une partie de ses P3 et fait venir les autres.
+    """Colonie P4 qui bâtit une partie de ses P3 et fait venir les autres.
 
-    Les trois etats que peut prendre un enfant P3 sont tout l'interet : amene
-    tout fait, bati ici a partir de P2 importes, ou bati ici a partir de P1
-    importes. Un intrant P1 d'un P4 est toujours amene, parce que le fabriquer
+    Les trois états que peut prendre un enfant P3 sont tout l'intérêt : amené
+    tout fait, bâti ici à partir de P2 importés, ou bâti ici à partir de P1
+    importés. Un intrant P1 d'un P4 est toujours amené, parce que le fabriquer
     voudrait dire des extracteurs, donc une autre colonie.
 
-    Les rangees viennent d'un vivier qui s'ecarte de l'equateur plutot que de la
-    paire fixe qu'utilise la forme P3, parce qu'un P4 a besoin d'une rangee par
-    P3 fabrique plus deux de plus pour chaque P3 bati depuis les P1 : jusqu'a
-    huit dans les formes que l'enumerateur emet.
+    Les rangées viennent d'un vivier qui s'écarte de l'équateur plutôt que de la
+    paire fixe qu'utilise la forme P3, parce qu'un P4 a besoin d'une rangée par
+    P3 fabriqué plus deux de plus pour chaque P3 bâti depuis les P1 : jusqu'à
+    huit dans les formes que l'énumérateur émet.
     """
     product_name = config["product_name"]
     planet_type = config["planet_type"]
@@ -340,7 +340,7 @@ def _generate_partial_p4(config, plan):
         type_id = NAME_TO_ID.get(name)
         if type_id is None:
             return None
-        # Un intrant P1 est toujours amene, quoi que le plan en dise.
+        # Un intrant P1 est toujours amené, quoi que le plan en dise.
         requested = plan.get(name, "import") if get_tier(name) == "P3" else "import"
         p3_recipe = RECIPES_P2_P3.get(name)
         if requested == "import" or p3_recipe is None:
@@ -372,9 +372,9 @@ def _generate_partial_p4(config, plan):
                          "output": p3_recipe["output"],
                          "inputs": p3_recipe["input"], "legs": tuple(legs)})
 
-    # Refuse les plans uniformes. Tous les enfants P3 amenes, c'est
-    # « P3 → P4 (Factory) » ; tous batis depuis des P2, « P2 → P4 (Factory) » ;
-    # tous depuis des P1, « P1 → P4 (Factory) ». Les trois se generent deja
+    # Refuse les plans uniformes. Tous les enfants P3 amenés, c'est
+    # « P3 → P4 (Factory) » ; tous bâtis depuis des P2, « P2 → P4 (Factory) » ;
+    # tous depuis des P1, « P1 → P4 (Factory) ». Les trois se génèrent déjà
     # ailleurs, et `variants.py` les y envoie.
     depths = {child["source"] for child in children
               if get_tier(child["name"]) == "P3"}
@@ -384,7 +384,7 @@ def _generate_partial_p4(config, plan):
     made_children = [child for child in children if child["source"] != "import"]
 
     def row_sizes(count):
-        """Une rangee pour le produit, une par P3 fabrique, deux de plus par P3 depuis P1."""
+        """Une rangée pour le produit, une par P3 fabriqué, deux de plus par P3 depuis P1."""
         sizes = [count]
         for child in made_children:
             sizes.append(child["per_product"] * count)
@@ -407,16 +407,16 @@ def _generate_partial_p4(config, plan):
                     break
                 advanced = advanced_per_product * count
                 num_links = pads - 1 + advanced + count
-                # La marge du constructeur P4, pas celle a deux etages.
+                # La marge du constructeur P4, pas celle à deux étages.
                 #
-                # Cette forme etale ses rangees sur un vivier de latitudes qui
-                # s'ecarte de l'equateur, et une rangee dont la latitude n'a pas
-                # de pad rejoint le hub : ces liens-la franchissent plusieurs
+                # Cette forme étale ses rangées sur un vivier de latitudes qui
+                # s'écarte de l'équateur, et une rangée dont la latitude n'a pas
+                # de pad rejoint le hub : ces liens-là franchissent plusieurs
                 # espacements, exactement comme ceux de `_build_p4_template`.
-                # Avec la marge a un seul espacement, une colonie sur une
-                # planete de 29 990 km de rayon depassait l'energie de 296 et
-                # EVE refusait l'import — le defaut que
-                # `VariantsImportableEverywhere` a trouve, et que le webtool
+                # Avec la marge à un seul espacement, une colonie sur une
+                # planète de 29 990 km de rayon dépassait l'énergie de 296 et
+                # EVE refusait l'import — le défaut que
+                # `VariantsImportableEverywhere` a trouvé, et que le webtool
                 # porte encore dans `partial-factory.ts`.
                 if _try_budget(pads, advanced, count, num_links, cc_level,
                                diameter, EXTRA_SPACINGS_P4_BUILDER)[0]:
@@ -432,13 +432,13 @@ def _generate_partial_p4(config, plan):
     if product_count == 0:
         return None
 
-    # Les pads occupent les premieres latitudes du meme vivier, pour qu'une
-    # colonie avec moins de rangees que de pads ait quand meme ou les poser.
+    # Les pads occupent les premières latitudes du même vivier, pour qu'une
+    # colonie avec moins de rangées que de pads ait quand même où les poser.
     latitudes = _latitude_pool(max(len(row_sizes(product_count)),
                                    launch_pad_count))
     pins = []
 
-    # La rangee de produit est sur l'equateur, la ou le pad hub se trouve aussi.
+    # La rangée de produit est sur l'équateur, là où le pad hub se trouve aussi.
     product_arms = _push_row(pins, latitudes[0], product_count, arm_length,
                              high_tech_tid, product_tid)
 
@@ -473,7 +473,7 @@ def _generate_partial_p4(config, plan):
     hub = launch_pad_pins[0]
 
     def anchor_for(latitude_index):
-        """Une rangee qui partage une latitude avec un pad y pend ; les autres rejoignent le hub."""
+        """Une rangée qui partage une latitude avec un pad y pend ; les autres rejoignent le hub."""
         if latitude_index < len(launch_pad_pins):
             return launch_pad_pins[latitude_index]
         return hub
@@ -491,8 +491,8 @@ def _generate_partial_p4(config, plan):
     routes = []
     pin_count = len(pins)
 
-    # D'ou part chaque intrant amene d'une rangee fabriquee : le pad qui ancre
-    # la rangee, ou un pad que rien d'autre n'utilise. Un P3 bati depuis les P1
+    # D'où part chaque intrant amené d'une rangée fabriquée : le pad qui ancre
+    # la rangée, ou un pad que rien d'autre n'utilise. Un P3 bâti depuis les P1
     # n'en a pas : ses P2 sont faits ici et l'attendent au hub, donc le pad qui
     # partage sa latitude restait vide.
     leg_sources = [[anchor_for(row["latitude_index"])] * len(leg["inputs"])
@@ -504,7 +504,7 @@ def _generate_partial_p4(config, plan):
     _spread_to_spare_pads(leg_sources + list(child_sources.values()),
                           launch_pad_pins, hub)
 
-    # P1 en entree de chaque rangee P2.
+    # P1 en entrée de chaque rangée P2.
     for (leg, row), sources in zip(leg_rows, leg_sources):
         for (p1_name, p1_quantity), source in zip(leg["inputs"], sources):
             p1_tid = NAME_TO_ID.get(p1_name)
@@ -513,14 +513,14 @@ def _generate_partial_p4(config, plan):
             _push_routes(routes, links, row["arms"], source, "in", p1_quantity,
                          p1_tid, pin_count)
 
-    # P2 fabrique en sortie vers le hub, ou la rangee P3 qui le mange puise.
+    # P2 fabriqué en sortie vers le hub, où la rangée P3 qui le mange puise.
     for leg, row in leg_rows:
         _push_routes(routes, links, row["arms"], hub, "out", leg["output"],
                      leg["type_id"], pin_count)
 
-    # P2 en entree de chaque rangee P3 fabriquee. Un P3 bati depuis les P1 puise
+    # P2 en entrée de chaque rangée P3 fabriquée. Un P3 bâti depuis les P1 puise
     # les P2 que cette colonie vient de faire, donc il les prend au hub ; un P3
-    # bati depuis des P2 amenes les prend la ou `_spread_to_spare_pads` les a mis.
+    # bâti depuis des P2 amenés les prend là où `_spread_to_spare_pads` les a mis.
     for child in made_children:
         row = child_rows[child["name"]]
         sources = child_sources.get(child["name"], [hub] * len(child["inputs"]))
@@ -531,35 +531,35 @@ def _generate_partial_p4(config, plan):
             _push_routes(routes, links, row["arms"], source, "in", p2_quantity,
                          p2_tid, pin_count)
 
-    # P3 fabrique en sortie vers le hub, ou la rangee de produit puise.
+    # P3 fabriqué en sortie vers le hub, où la rangée de produit puise.
     for child in made_children:
         row = child_rows[child["name"]]
         _push_routes(routes, links, row["arms"], hub, "out", child["output"],
                      child["type_id"], pin_count)
 
     # Chaque HTF a son pad, en tourniquet sur les pads : sa sortie y aboutit et il
-    # y puise d'abord ses intrants amenes, les autres pads servant de
-    # debordement (en jeu, une usine vide ses routes d'entree dans l'ordre de
-    # creation). C'est ce que font les generateurs P4 des chaines. Tout faire
-    # passer par le hub le laissait porter seul les P3 amenes et la sortie de
+    # y puise d'abord ses intrants amenés, les autres pads servant de
+    # débordement (en jeu, une usine vide ses routes d'entrée dans l'ordre de
+    # création). C'est ce que font les générateurs P4 des chaînes. Tout faire
+    # passer par le hub le laissait porter seul les P3 amenés et la sortie de
     # chaque HTF : 6 x 100 m3/h dans 10 000 m3, 16,7 h pour les 21 plans
-    # « Make X from P2 », quand les autres pads restaient a 55,6 h. Mesure sur
-    # 1 242 colonies P4 mixtes : 210 sous 24 h avant, aucune apres, aucune qui
+    # « Make X from P2 », quand les autres pads restaient à 55,6 h. Mesuré sur
+    # 1 242 colonies P4 mixtes : 210 sous 24 h avant, aucune après, aucune qui
     # tienne moins longtemps, sans une usine ni un lien de plus.
     #
-    # Les routes de debordement seules ne suffisaient pas : le modele de
-    # stockage aurait mis les pads en commun et efface l'avertissement, alors
-    # que toute la sortie serait restee au hub. Une seule route de sortie par
-    # usine : qu'EVE partage une sortie entre plusieurs routes n'est pas verifie.
+    # Les routes de débordement seules ne suffisaient pas : le modèle de
+    # stockage aurait mis les pads en commun et effacé l'avertissement, alors
+    # que toute la sortie serait restée au hub. Une seule route de sortie par
+    # usine : qu'EVE partage une sortie entre plusieurs routes n'est pas vérifié.
     #
     # Pas encore dans `partial-factory.ts` (branche `recipe-variants` du
-    # webtool) : a porter, `variants-live-python.spec.ts` le reclame.
+    # webtool) : à porter, `variants-live-python.spec.ts` le réclame.
     product_pins = [pin for arm in product_arms for pin in arm]
     home_pad = {factory: launch_pad_pins[index % len(launch_pad_pins)]
                 for index, factory in enumerate(product_pins)}
 
-    # Intrants du produit. Un P3 fabrique ici n'atterrit qu'au hub, ou ses
-    # rangees le deposent, donc il n'est pris que la.
+    # Intrants du produit. Un P3 fabriqué ici n'atterrit qu'au hub, où ses
+    # rangées le déposent, donc il n'est pris que là.
     for child in children:
         for factory in product_pins:
             if child["source"] == "import":

@@ -17,21 +17,23 @@ Thank you for your interest in contributing! This project is designed to be appr
 
 ## Code Style
 
-- Follow the existing Python style in `PI.py` and any source modules.
+- Follow the existing Python style in `PI.py` and the modules under `src/`.
 - Keep code simple and readable.
-- Add comments for non-obvious logic.
+- Comments and docstrings in this codebase are written in French and explain the why. Text shown in the interface stays in English.
+- Every font size goes through `_fs()`, so the text-size setting reaches it.
+- `src/services` holds the calculations and never imports Tk; `src/ui` and `PI.py` hold the interface. Keep that split.
 - Use meaningful variable and function names.
 
 ## Testing
 
-- Add tests for bug fixes and new features whenever practical.
-- If a tests directory is present, run existing tests before opening a pull request.
-- Explain how to reproduce the issue or validate your fix in the PR description.
+- The test suite is not part of this repository (see `.gitignore`), so there is nothing to run before opening a pull request.
+- Explain how to reproduce the issue or validate your fix in the PR description. For a change to a generated colony, attach the template JSON before and after.
+- The colony engine is shared with the web version of the tool and the two are expected to build identical colonies; say so in the PR if a change alters what the generator outputs.
 
 ## Dependencies
 
-- The project depends on standard Python libraries and optionally on `Pillow` and `pystray` for tray support.
-- If you add a dependency, document it clearly in `README.md` and ensure the package is necessary.
+- The project depends on the Python standard library plus `Pillow`, `pystray` and `certifi` (`requirements.txt`).
+- If you add a dependency, document it clearly in `README.md` and ensure the package is necessary. The tool ships as a single executable, so its size matters.
 
 ## GitHub Workflow
 
@@ -41,9 +43,9 @@ Thank you for your interest in contributing! This project is designed to be appr
 
 ## Documentation
 
-- Update `README.md` or other docs for any user-facing changes.
+- Update `README.md` and `how_to.txt` for any user-facing changes.
 - If you add or modify features, document how to use them clearly.
 
 ## Code of Conduct
 
-By contributing, you agree to follow the projects [Code of Conduct](CODE_OF_CONDUCT.md).
+By contributing, you agree to follow the project's [Code of Conduct](CODE_OF_CONDUCT.md).

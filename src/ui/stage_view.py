@@ -26,12 +26,15 @@ from src.pi_data import BUILD_COLLECTION_INTERVALS
 from src.services.colony_model import (EditError, ParseError, add_factory,
                                        editability, move_pin, parse_colony,
                                        remove_factory, route_hubs)
-from src.services.stage_edit import apply_edit, apply_retune
-from src.services.stage_plan import INERT, REBUILD, REFUSE, RETUNE, plan_for
+from src.services.layout_shapes import SHAPE_MENU, STANDARD, apply_shape
+from src.services.stage_edit import (apply_edit, apply_retune, shaped_for_stage,
+                                     stage_takes_shape)
+from src.services.stage_plan import INERT, REBUILD, REFUSE, RESHAPE, RETUNE, plan_for
 from src.services.storage_suggestion import higher_tier_chain, storage_suggestion
+from src.services.template_doctor import import_note, repair_label, repair_template
 from src.services.template_service import analyze_template
 from src.ui.collect_bar import CollectBar
-from src.ui.factory_timer import FactoryTimer
+from src.ui.factory_timer import FactoryTimer, _tooltip
 from src.ui.stage_notice import StageNotice
 
 
@@ -56,6 +59,7 @@ class StageView:
     """
 
     def __init__(self, app, template, source="draft"):
+        """Retient l'application et le template ; rien n'est dessiné avant `build()`."""
         self.app = app
         self.template = template
         self.source = source
@@ -119,6 +123,14 @@ class StageView:
                     # seule chose qui rende la question du plan intéressante. Tant
                     # que c'est faux, il n'y a aucune mise en page à protéger.
                     "hand_edited": False,
+                    # Vrai dès qu'une structure est où quelqu'un l'a posée plutôt
+                    # qu'où la mise en page l'a mise. La scène garde sa forme à
+                    # travers les éditions, mais redessiner repose *chaque* pin :
+                    # ça doit s'arrêter dès qu'une position appartient à
+                    # quelqu'un. Posé par le seul glisser — `hand_edited` le
+                    # devient aussi pour un entrepôt ou une route, et ne peut
+                    # donc pas répondre. Portage du `handPlaced` de l'outil web.
+                    "hand_placed": False,
                     # Ce qui est sur la scène est-il déjà dans la bibliothèque ?
                     # `hand_edited` protège l'arrangement d'une reconstruction ;
                     # celui-ci répond à une autre question — « perdrait-on quelque
@@ -178,6 +190,35 @@ class StageView:
                   activeforeground=EVE["fg_bright"], relief=tk.FLAT, cursor="hand2",
                   command=self._route_storage).pack(side=tk.LEFT, padx=(10, 0))
 
+        # Un seul bouton pour tout ce qui se répare sans déplacer ni retirer
+        # une structure : les routes de plus de 7 structures ramenées au pad
+        # le plus proche, les liens saturés inscrits à leur niveau. Il dit ce
+        # qu'il fera avant qu'on le presse, et n'existe pas quand il ne
+        # changerait rien. Pas empaqueté ici : `_sync_repair_button` le montre.
+        repair_btn = tk.Button(self.btn_bar, font=("Segoe UI", _fs(9), "bold"),
+                               bg=EVE["bg_card"], fg=EVE["fg"],
+                               activebackground=EVE["border_hi"],
+                               activeforeground=EVE["fg_bright"], relief=tk.FLAT,
+                               cursor="hand2", command=self._repair_for_eve)
+        self.view_state["repair_btn"] = repair_btn
+        _tooltip(repair_btn, "Nothing is moved or removed: long routes load or unload at "
+                             "the nearest launch pad or storage, and overloaded links are "
+                             "written at the level they need.", app)
+
+        # Offert seulement une fois une structure posée à la main, qui est le
+        # moment où la scène cesse de se redessiner d'elle-même. Jusque-là
+        # chaque édition est déjà dans la forme choisie, et le bouton n'aurait
+        # rien à faire. Il dit qu'il repose tout, plutôt que de se donner pour
+        # un rangement. Pas empaqueté ici : `_sync_reshape_button` le montre.
+        reshape_btn = tk.Button(self.btn_bar, font=("Segoe UI", _fs(9), "bold"),
+                                bg=EVE["bg_card"], fg=EVE["fg"],
+                                activebackground=EVE["border_hi"],
+                                activeforeground=EVE["fg_bright"], relief=tk.FLAT,
+                                cursor="hand2", command=self._reshape)
+        self.view_state["reshape_btn"] = reshape_btn
+        _tooltip(reshape_btn, "Every structure goes back onto the shape, including "
+                              "the ones you moved. Nothing is added or removed.", app)
+
         # Permanent, pas soulevé par un clic. Qu'EVE signale une implantation
         # qu'il ne peut pas poser ou qu'il la réécrive en silence tient à une
         # seule case de sa fenêtre d'import, et quand cette fenêtre est ouverte
@@ -208,6 +249,14 @@ class StageView:
 
         self.btn_bar.bind("<Configure>", self._fit_hint, add="+")
         self.budget_lbl.bind("<Configure>", self._fit_hint, add="+")
+        # Les deux boutons empaquetés après coup. `_fit_hint` ne compte que les
+        # boutons affichés, et leur `after_idle` passe avant que Tk n'affiche
+        # celui qu'on vient d'empaqueter : l'astuce restait longue et le rognait
+        # au milieu de sa phrase (« air for EVE — upgrad », mesuré le
+        # 2026-10-08 : 114 px reçus sur 203). <Map> et non <Configure>, qui
+        # arrive lui aussi avant l'affichage.
+        repair_btn.bind("<Map>", self._fit_hint, add="+")
+        reshape_btn.bind("<Map>", self._fit_hint, add="+")
 
         self.json_text = scrolledtext.ScrolledText(
             top_frame, height=10, wrap=tk.WORD, bg=EVE["bg_input"], fg=EVE["json_fg"],
@@ -270,6 +319,9 @@ class StageView:
         self.popup.update_idletasks()
         self.repaint()
         self._refresh_budget()
+        # Rien n'a été refusé encore ; une colonie venue d'ailleurs dit ici ce
+        # qu'EVE en refuserait.
+        self._refusal(None)
         self.map_canvas.bind("<Configure>", lambda e: self.repaint())
 
         self.popup.lift()
@@ -278,6 +330,7 @@ class StageView:
     # ── Les boutons ───────────────────────────────────────────────────────
 
     def _copy_json(self):
+        """Copie la colonie de la scène, telle qu'arrangée, dans le presse-papiers."""
         self.popup.clipboard_clear()
         self.popup.clipboard_append(json.dumps(self.doc["template"], default=str))
         messagebox.showinfo("Copied",
@@ -285,6 +338,7 @@ class StageView:
                             "Paste into EVE Online PI import.", parent=self.popup)
 
     def _reset_view(self):
+        """Remet zoom et panoramique à zéro et laisse le cadrage resuivre la colonie."""
         self.view_state["zoom"] = 1.0
         self.view_state["pan_x"] = 0
         self.view_state["pan_y"] = 0
@@ -307,12 +361,14 @@ class StageView:
             return
         self.doc["template"] = preview
         self.doc["hand_edited"] = False
+        self.doc["hand_placed"] = False
         self.doc["filed"] = False
         self.doc["config"] = self.app._stage_config()
         self._refusal(None)
         self.repaint()
         self._refresh_budget()
         self._refresh_json()
+        self._sync_reshape_button()
         self.app._history.record(self.doc["template"], "Reset template", kind="edit")
 
     def _save_to_library(self):
@@ -339,11 +395,12 @@ class StageView:
             self._refusal(str(exc))
             return
         added = len(routed.routes) - len(self.doc["template"].get("R", []))
-        self.doc["template"] = routed.to_template()
+        template, note = self._shaped(routed.to_template())
+        self.doc["template"] = template
         # Des routes qu'aucun générateur n'écrit : un rebuild les perdrait,
         # exactement comme il perdrait un glisser.
         self.doc["hand_edited"] = True
-        self._refusal(None)
+        self._refusal(note)
         self.repaint()
         self._refresh_budget()
         self._refresh_json()
@@ -356,10 +413,155 @@ class StageView:
             "the inputs into them with an Expedited Transfer from a launch pad.",
             parent=self.popup)
 
+    def _repair(self):
+        """La réparation de la colonie montrée, calculée d'avance pour que le bouton l'annonce.
+
+        Mise en cache par colonie, comme la suggestion de stockage : ce rappel
+        part à chaque rafraîchissement de la jauge.
+        """
+        template = self.doc["template"]
+        options = self.app._layout_options()
+        key = (json.dumps(template, sort_keys=True, default=str),
+               options.get("yield_per_head"))
+        cached = self.view_state.get("repair")
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            repair = repair_template(template, options)
+        except Exception as exc:
+            # Une colonie que l'analyse ne lit pas n'a pas de réparation à offrir.
+            _debug(f"repair not computed: {exc}")
+            repair = None
+        self.view_state["repair"] = (key, repair)
+        return repair
+
+    def _sync_repair_button(self):
+        """« Repair for EVE » n'existe que lorsqu'il changerait quelque chose."""
+        button = self.view_state.get("repair_btn")
+        if button is None:
+            return
+        try:
+            repair = self._repair()
+            label = repair_label(repair) if repair is not None else None
+            if label:
+                button.config(text=f"🩺 {label}")
+                if not button.winfo_ismapped():
+                    button.pack(side=tk.LEFT, padx=(10, 0))
+            elif button.winfo_ismapped():
+                button.pack_forget()
+            self.btn_bar.after_idle(self._fit_hint)
+        except tk.TclError:
+            pass
+
+    def _repair_for_eve(self):
+        """Répare ce qu'EVE refuserait, sans déplacer ni retirer une structure.
+
+        Portage du bouton « Repair for EVE » de la boîte « Game limits » de
+        l'outil web (2026-10-07). Validé comme « Route storage » : des routes
+        et des niveaux qu'aucun générateur n'écrit, donc à protéger d'un
+        rebuild.
+        """
+        repair = self._repair()
+        if repair is None or not repair.changed:
+            return
+        label = repair_label(repair)
+        self.doc["template"] = repair.template
+        self.doc["hand_edited"] = True
+        self.doc["filed"] = False
+        self._refusal(None)
+        self.repaint()
+        self._refresh_budget()
+        self._refresh_json()
+        self.app._history.record(self.doc["template"], label, kind="edit")
+
+    # ── La forme ──────────────────────────────────────────────────────────
+
+    def _shape(self):
+        """La forme que demande le panneau pour cette colonie."""
+        return (self.doc.get("config") or {}).get("shape") or STANDARD
+
+    def _takes_shape(self):
+        """La forme du panneau se pose-t-elle sur la colonie de la scène."""
+        return stage_takes_shape(self.doc.get("source"), self._shape(),
+                                 self.app._variant_pick is not None)
+
+    def _shaped(self, template, refusal=None):
+        """La colonie d'une édition, redessinée dans la forme si rien n'y est posé à la main."""
+        if self.doc.get("hand_placed") or not self._takes_shape():
+            return template, refusal
+        return shaped_for_stage(template, self._shape(), refusal)
+
+    def _reshape(self):
+        """« Draw the … shape again » : la seule édition qui a le droit de reposer un glisser.
+
+        Parce que c'est ce qu'on demande. Une forme qui ne tient plus rend la
+        colonie intacte avec la raison : le refus ne coûte rien et se dit.
+        """
+        if not self._takes_shape():
+            return
+        shaped, note = apply_shape(self.doc["template"], self._shape())
+        self._refusal(note)
+        if shaped is self.doc["template"]:
+            return
+        self.doc["template"] = shaped
+        self.doc["hand_placed"] = False
+        self.doc["filed"] = False
+        self.repaint()
+        self._refresh_budget()
+        self._refresh_json()
+        self._sync_reshape_button()
+        self.app._history.record(
+            self.doc["template"],
+            f"Drew the {SHAPE_MENU.get(self._shape(), self._shape())} shape again",
+            kind="edit")
+
+    def _sync_reshape_button(self):
+        """Le bouton n'existe que pour une colonie en forme dont une structure a été posée à la main."""
+        button = self.view_state.get("reshape_btn")
+        if button is None:
+            return
+        try:
+            if self.doc.get("hand_placed") and self._takes_shape():
+                button.config(text=f"◇ Draw the {SHAPE_MENU.get(self._shape(), self._shape())} "
+                                   "shape again")
+                if not button.winfo_ismapped():
+                    button.pack(side=tk.LEFT, padx=(10, 0))
+            elif button.winfo_ismapped():
+                button.pack_forget()
+            self.btn_bar.after_idle(self._fit_hint)
+        except tk.TclError:
+            pass
+
     # ── Les afficheurs ────────────────────────────────────────────────────
 
+    def _import_note(self):
+        """Ce qu'EVE refuserait d'une colonie venue d'ailleurs, tant que c'est vrai.
+
+        Une colonie collée qui s'ouvre sans un mot alors qu'EVE en refusera
+        une partie : on l'apprendrait en jeu, par « Some template routes
+        failed to build ». L'outil web le dit dans son avis d'import ; ici la
+        colonie s'ouvre droit sur la scène, donc c'est dit sur la planète.
+
+        Relu à chaque fois plutôt que posé une fois : le panneau qui se cale
+        juste après l'ouverture repasse par `follow`, qui effaçait la phrase un
+        tiers de seconde après l'avoir écrite. Et une phrase relue se tait
+        d'elle-même une fois la colonie réparée.
+        """
+        if self.doc.get("source") != "external":
+            return None
+        note = import_note(self.doc["template"], self.app._layout_options())
+        if note is None:
+            return None
+        return f"{note} The notes on the left say what to do about each."
+
     def _refusal(self, text):
-        """Peint sur la planète ce que le dernier réglage n'a pas su faire."""
+        """Peint sur la planète ce que le dernier réglage n'a pas su faire.
+
+        Sans rien à dire d'un réglage, une colonie venue d'ailleurs garde ce
+        qu'EVE en refuserait — voir `_import_note`.
+        """
+        if text is None:
+            text = self._import_note()
         notice = self.view_state.get("notice")
         if notice is not None:
             try:
@@ -383,6 +585,14 @@ class StageView:
             return False
 
     def _refresh_budget(self, tpl=None, moving=False):
+        """Recalcule l'analyse de la colonie affichée et met à jour tout ce qui la lit.
+
+        La jauge CPU/PWR, la minuterie, la notice et le panneau de gauche
+        lisent tous cette même analyse : une seule source, pour qu'ils ne
+        puissent pas se contredire. `tpl` sert au glisser en cours (la colonie
+        provisoire) ; `moving` n'actualise alors que la jauge, le reste attend
+        le relâchement.
+        """
         PI = _pi()
         EVE = PI.EVE
         try:
@@ -421,6 +631,8 @@ class StageView:
             except Exception as exc:
                 _debug(f"stage overlay refresh failed: {exc}")
             self._sync_reset_template()
+            if tpl is None:
+                self._sync_repair_button()
             # Le panneau de gauche décrit la colonie de la scène, comme la
             # jauge et la minuterie : il lisait l'aperçu du brouillon, et
             # après la suggestion de stockage il continuait d'annoncer 39,9 h
@@ -500,8 +712,15 @@ class StageView:
                    "Drag: move · Scroll: zoom", "")
 
     def _fit_hint(self, _event=None):
+        """Affiche la plus longue formulation de l'astuce qui tient dans la
+        place restante.
+        """
         try:
-            left = max((w.winfo_x() + w.winfo_width()
+            # La largeur demandée, pas la largeur obtenue : un bouton arrivé
+            # après l'astuce (« Repair for EVE », « Draw the … shape again »)
+            # est d'abord rogné par elle, et mesurer ce qu'il a reçu laissait
+            # l'astuce en place et le bouton coupé au milieu de sa phrase.
+            left = max((w.winfo_x() + w.winfo_reqwidth()
                         for w in self.btn_bar.winfo_children()
                         if isinstance(w, tk.Button) and w.winfo_ismapped()), default=0)
             room = self.budget_lbl.winfo_x() - 10 - left - 8
@@ -514,6 +733,7 @@ class StageView:
             pass
 
     def _refresh_json(self):
+        """Réécrit le JSON du document dans la zone de texte de la scène."""
         self.json_text.delete("1.0", tk.END)
         self.json_text.insert("1.0", json.dumps(self.doc["template"], default=str))
 
@@ -544,7 +764,9 @@ class StageView:
             applied += 1
         if not applied:
             return
-        self.doc["template"] = model.to_template()
+        template, note = self._shaped(model.to_template())
+        self.doc["template"] = template
+        self._refusal(note)
         self.repaint()
         self._refresh_budget()
         self._refresh_json()
@@ -561,10 +783,15 @@ class StageView:
         """
         if suggestion is None or suggestion.template is None:
             return
-        self.doc["template"] = suggestion.template
+        # Redessinée dans la forme choisie : l'entrepôt atterrit dans le motif
+        # plutôt qu'à côté du pad le moins chargé. Mesuré sur toutes les
+        # colonies à 48 h et 168 h (5 502 suggestions sur une colonie en forme) :
+        # redessiner ne retire jamais une heure à ce que le bouton annonçait.
+        template, note = self._shaped(suggestion.template)
+        self.doc["template"] = template
         self.doc["hand_edited"] = True
         self.doc["filed"] = False
-        self._refusal(None)
+        self._refusal(note)
         self.repaint()
         self._refresh_budget()
         self._refresh_json()
@@ -594,6 +821,7 @@ class StageView:
             self.popup.after_cancel(self.view_state["redraw_job"])
 
         def _do():
+            """Le redessin net, une fois le zoom au repos."""
             self.view_state["redraw_job"] = None
             self.repaint()
 
@@ -615,6 +843,11 @@ class StageView:
                     pass
 
     def _on_structure_grab(self, event, pin_idx):
+        """Prend un bâtiment en main au clic, si la colonie se laisse éditer.
+
+        Le modèle est parsé une fois ici, pas à chaque image du glisser. Le «
+        break » empêche le panoramique du canvas de prendre aussi ce geste.
+        """
         self._hide_map_tooltip()
         self.map_canvas.delete("signal")
         try:
@@ -633,6 +866,12 @@ class StageView:
         return "break"
 
     def _on_structure_drag(self, event):
+        """Suit le pointeur avec une colonie provisoire, sans toucher au document.
+
+        Une position que `move_pin` refuse (coordonnée non finie) laisse le
+        bâtiment à sa dernière place valide au lieu d'interrompre le geste. La
+        proximité n'est jamais refusée : les anneaux rouges la signalent.
+        """
         if self.grab["pin"] is None:
             return None
         self.grab["moved"] = True
@@ -650,6 +889,11 @@ class StageView:
         return "break"
 
     def _on_structure_drop(self, event):
+        """Valide le déplacement au relâchement : document, historique, drapeaux.
+
+        Une seule écriture par geste, quel que soit le nombre d'images du
+        glisser.
+        """
         PI = _pi()
         if self.grab["pin"] is None:
             return None
@@ -676,12 +920,18 @@ class StageView:
         kind = PI.STRUCT_TYPE_TO_NAME.get(
             self.doc["template"]["P"][pin_idx].get("T")) or "structure"
         self.doc["hand_edited"] = True
+        # La seule édition que la forme n'a pas le droit de défaire : elle *est*
+        # une position. Chaque édition suivante laisse les positions en paix,
+        # jusqu'à ce qu'un redessin soit demandé.
+        self.doc["hand_placed"] = True
         # Ce n'est plus ce que le fichier contient.
         self.doc["filed"] = False
+        self._sync_reshape_button()
         self.app._history.record(self.doc["template"], f"Moved {kind}", kind="edit")
         return "break"
 
     def _on_escape(self, _event=None):
+        """Échap abandonne le déplacement en cours : le document n'a jamais changé."""
         if self.grab["pin"] is None:
             return
         self.grab["pin"] = None
@@ -690,6 +940,11 @@ class StageView:
         self._refresh_budget()
 
     def _on_scroll(self, event):
+        """Zoome la carte autour de son centre, borné entre 0,3 et 3.
+
+        Mise à l'échelle immédiate des objets déjà dessinés, puis un redessin
+        net différé : la molette répond sans attendre un dessin complet.
+        """
         factor = 1.15 if event.delta > 0 else 1 / 1.15
         new_zoom = max(0.3, min(3.0, self.view_state["zoom"] * factor))
         factor = new_zoom / self.view_state["zoom"]
@@ -707,6 +962,7 @@ class StageView:
         self._schedule_crisp_redraw()
 
     def _on_drag_start(self, event):
+        """Début d'un panoramique : cache l'infobulle et retient le point de départ."""
         self._hide_map_tooltip()
         self.view_state["drag_start_x"] = event.x
         self.view_state["drag_start_y"] = event.y
@@ -786,12 +1042,28 @@ class StageView:
             self._refresh_budget()
             return True
 
+        if plan == RESHAPE and not self._takes_shape():
+            # Seule une colonie du brouillon porte la forme du panneau ; pour
+            # les autres, une nouvelle forme reste ce qu'elle était : une
+            # reconstruction.
+            plan = REBUILD
         if plan == REBUILD:
             self.doc["template"] = template
             self.doc["hand_edited"] = False
+            self.doc["hand_placed"] = False
             self.doc["filed"] = False
             self.doc["source"] = "draft"
             self._refusal(None)
+        elif plan == RESHAPE:
+            # La même colonie, redessinée : les structures restent, seules les
+            # positions, les liens et les chemins des routes changent. Une
+            # forme qui ne tient plus laisse la colonie intacte et dit pourquoi.
+            shaped, note = apply_shape(self.doc["template"], self._shape())
+            if shaped is not self.doc["template"]:
+                self.doc["template"] = shaped
+                self.doc["hand_placed"] = False
+                self.doc["filed"] = False
+            self._refusal(note)
         else:
             try:
                 model = parse_colony(self.doc["template"])
@@ -799,6 +1071,7 @@ class StageView:
                 _debug(f"stage plan fell back to rebuild: {exc}")
                 self.doc["template"] = template
                 self.doc["hand_edited"] = False
+                self.doc["hand_placed"] = False
                 self.doc["filed"] = False
                 self.doc["source"] = "draft"
                 plan = REBUILD
@@ -812,13 +1085,19 @@ class StageView:
                                   "structures, or rebuild it.")
                     return True
                 if plan == RETUNE:
+                    # Aucun pin ne bouge : rien à redessiner, comme `retune-stage`.
                     model, why = apply_retune(model, config or {})
+                    edited = model.to_template()
                 else:
+                    # Dessinée dans la forme choisie : un compteur qui ajoute
+                    # une structure laisse le motif, pas un hub greffé au flanc.
                     model, why = apply_edit(model, before, config or {})
-                self.doc["template"] = model.to_template()
+                    edited, why = self._shaped(model.to_template(), why)
+                self.doc["template"] = edited
                 self._refusal(why)
 
         self.repaint()
         self._refresh_budget()
         self._refresh_json()
+        self._sync_reshape_button()
         return True

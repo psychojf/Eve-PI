@@ -86,10 +86,16 @@ class CollectBar:
             self.frame.place(relx=0.0, rely=0.0, x=x, y=y, anchor="nw")
 
     def _drag_start(self, event):
+        """Retient le point de saisie et la position de départ de la barre.
+
+        Le glisser se calcule depuis ce point fixe plutôt que par petits
+        deltas : la barre reste sous le curseur au lieu de dériver.
+        """
         self._grab = (event.x_root, event.y_root,
                       self.frame.winfo_x(), self.frame.winfo_y())
 
     def _drag(self, event):
+        """Déplace la barre avec le curseur, sans jamais la laisser sortir de la carte."""
         if not getattr(self, "_grab", None):
             return
         x0, y0, fx, fy = self._grab
@@ -102,6 +108,11 @@ class CollectBar:
     # ── État ──────────────────────────────────────────────────────────────
 
     def _pick(self, hours):
+        """Choisit un intervalle ; recliquer celui en place ne fait rien.
+
+        Chaque choix reconstruit l'aperçu : le refaire pour la valeur déjà
+        active redessinerait la colonie pour rien.
+        """
         if hours == self.variable.get():
             return
         self.on_pick(hours)
@@ -142,6 +153,7 @@ class CollectBar:
         return self.frame.winfo_reqheight()
 
     def destroy(self):
+        """Retire la barre ; tolère un cadre déjà détruit avec la scène."""
         try:
             self.frame.destroy()
         except tk.TclError:

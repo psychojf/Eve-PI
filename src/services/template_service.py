@@ -148,6 +148,26 @@ def link_cost(distance_km):
             math.ceil(LINK_POWER_BASE + LINK_POWER_PER_KM * distance_km))
 
 
+# Les modificateurs du SDE (attributs « CPU Load Level Modifier » et « Power
+# Load Level Modifier » du type Link) ; la formule et ses relevés en jeu sont
+# détaillés dans `route_limits.py`.
+LINK_CPU_LEVEL_MODIFIER = 1.4
+LINK_POWER_LEVEL_MODIFIER = 1.2
+
+
+def link_cost_at_level(distance_km, level):
+    """(CPU, MW) d'un lien de cette longueur à ce niveau d'amélioration.
+
+    Vit ici plutôt que dans `route_limits.py`, qui importe ce module : c'est ce
+    qui permet à `links_cost` de s'en servir sans import circulaire. Même
+    déménagement que `linkCostAtLevel` vers `math.ts` dans l'outil web.
+    """
+    cpu = LINK_CPU_BASE + LINK_CPU_PER_KM * distance_km * (level + 1) ** LINK_CPU_LEVEL_MODIFIER
+    power = (LINK_POWER_BASE
+             + LINK_POWER_PER_KM * distance_km * (level + 1) ** LINK_POWER_LEVEL_MODIFIER)
+    return math.ceil(cpu - 1e-9), math.ceil(power - 1e-9)
+
+
 def radius_from_diameter(diameter_km):
     """Rayon en km à partir du diamètre que transporte le pipeline.
 
@@ -189,7 +209,13 @@ def links_cost(template):
             pw += LINK_POWER_BASE
             continue
         km = pin_angle(pins[src - 1], pins[dst - 1]) * radius
-        c, p = link_cost(km)
+        # Un lien amélioré est facturé à son niveau. Tous étaient comptés au
+        # niveau 0, donc une colonie importée avec un lien « Lv »: 1 affichait
+        # moins de CPU et d'énergie que le jeu — et que l'outil web, qui le
+        # fait depuis le 2026-10-07. Le niveau 0 garde son calcul d'origine, au
+        # bit près, pour ne déplacer aucun budget déjà comparé.
+        level = link.get("Lv") or 0
+        c, p = link_cost_at_level(km, level) if level > 0 else link_cost(km)
         cpu += c
         pw += p
     return cpu, pw
@@ -289,12 +315,20 @@ def _routed_storage(template, imports, exports, yield_per_head):
     parent = {i: i for i, space in enumerate(capacity) if space > 0}
 
     def find(index):
+        """Racine du réservoir d'un stockage (union-find sans compression).
+
+        Une colonie compte quelques dizaines de pins : la compression de chemin
+        ne gagnerait rien de mesurable et rendrait le code moins lisible.
+        """
         root = index
         while parent[root] != root:
             root = parent[root]
         return root
 
     def union(left, right):
+        """Fond deux réservoirs ; la plus petite racine gagne, pour un résultat
+        déterministe.
+        """
         left_root, right_root = find(left), find(right)
         if left_root != right_root:
             parent[max(left_root, right_root)] = min(left_root, right_root)
@@ -303,6 +337,16 @@ def _routed_storage(template, imports, exports, yield_per_head):
     unstored_input = False
 
     def attribute(mapping, side):
+        """Répartit chaque flux d'un côté (« in » ou « out ») entre les
+        stockages qui le servent.
+
+        Pour chaque marchandise, on cherche les routes qui la relient à un
+        stockage, et chaque usine partenaire tire sur les stockages de ses
+        routes au prorata de ce qu'elle mange ou fabrique. Les stockages qui
+        servent la même usine sont fondus en un réservoir. Un intrant sans
+        aucune route depuis un stock lève `unstored_input` : la colonie ne
+        tiendra pas une minute.
+        """
         nonlocal unstored_input
         for commodity, quantity in mapping.items():
             hubs_by_partner = {}
@@ -381,7 +425,7 @@ def analyze_template(template, options=None):
     cc_level = template.get("CmdCtrLv", 0)
 
     counts = {}
-    produced, consumed = {}, {}      # marchandise -> unites/heure
+    produced, consumed = {}, {}      # marchandise -> unités/heure
     p0_supply = 0.0
     heads_total = 0
     cpu = pw = 0
@@ -435,6 +479,7 @@ def analyze_template(template, options=None):
                if q - consumed.get(n, 0) > 1e-9}
 
     def _volume(flows):
+        """Le volume horaire, en m³, d'un ensemble de flux {nom: quantité/h}."""
         return sum(q * COMMODITY_SIZE.get(get_tier(n), 0) for n, q in flows.items())
 
     import_m3_h = _volume(imports)
@@ -1020,6 +1065,11 @@ def infeasible_note(product_name, chain_name, planet_type, cc_level,
     c'est bien le CC. Renvoie None quand la config génère normalement.
     """
     def _fits(overrides):
+        """Vrai si la même génération réussit avec ces compteurs relâchés.
+
+        Toute exception compte comme un échec : on cherche la cause d'un refus,
+        et un générateur qui lève en est une.
+        """
         cfg = dict(layout or {})
         cfg.update(overrides)
         try:
@@ -1075,6 +1125,13 @@ def get_full_supply_chain(product_name, target_chain):
     bom = {}
 
     def resolve(name, qty, depth=0):
+        """Descend la recette de `name` jusqu'aux paliers d'arrêt de la chaîne.
+
+        Les lots sont arrondis au-dessus, comme en jeu : une usine ne produit
+        que des cycles entiers. La profondeur est bornée à 10 par prudence —
+        aucune recette n'en a plus de quatre, mais une donnée cyclique
+        bouclerait sinon.
+        """
         if depth > 10:
             return
         tier = get_tier(name)
@@ -1350,6 +1407,12 @@ def _gen_extraction_template(product_name, planet_type, cc_level, diameter, opti
     link_cpu, link_pw = link_cost_per_spacing(diameter)
 
     def _fixed(lps, ecus, sfs):
+        """CPU et PWR de tout ce qui n'est pas une usine : pads, extracteurs,
+        entrepôts, liens.
+
+        Un lien par structure en plus du premier pad. C'est la part qu'on rogne
+        quand le Command Center ne suit pas, avant de toucher aux usines.
+        """
         cpu = (lps * STRUCTURES["Launch Pad"]["cpu"] + ecus * ecu_cpu
                + sfs * STRUCTURES["Storage Facility"]["cpu"]
                + (lps - 1 + ecus + sfs) * link_cpu)
@@ -1621,6 +1684,11 @@ def _gen_p0_to_p2_template(product_name, planet_type, cc_level, diameter, option
         n_ecu = len(local)
 
         def _cost(n_aif, heads):
+            """CPU et PWR d'une colonie P0→P2 à `n_aif` usines avancées et `heads` têtes.
+
+            Topologie en étoile sur le pad : un lien par structure, chacun d'un
+            espacement, donc au prix fixé par le rayon.
+            """
             n_bif = n_aif * len(local)
             n_links = n_ecu + n_bif + n_aif          # topologie en étoile sur le LP
             cpu = (STRUCTURES["Launch Pad"]["cpu"]
@@ -1803,6 +1871,13 @@ def _gen_single_stage_template(product_name, planet_type, cc_level, diameter,
         link_cpu, link_pw = link_cost_per_spacing(diameter)
 
         def _max_factories(lps):
+            """Le nombre d'usines que le CC alimente avec `lps` pads, plafonné
+            par la géométrie.
+
+            Le plafond `lps * arm_len * 2` est celui des deux bras par pad :
+            au-delà, aucune place n'existe pour les poser, quel que soit le
+            budget.
+            """
             backbone = max(0, lps - 1)
             fixed_cpu = lps * STRUCTURES["Launch Pad"]["cpu"] + backbone * link_cpu
             fixed_pw = lps * STRUCTURES["Launch Pad"]["power"] + backbone * link_pw
@@ -2220,6 +2295,7 @@ def _build_p4_template(product_name, planet_type, cc_level, diameter, include_p2
     num_lps   = max(1, min(3, math.ceil(len(all_p2) / 2))) if include_p2_factories else 1
 
     def _fits():
+        """Vrai si les compteurs P2/P3 actuels tiennent dans le budget du CC."""
         total_aif = sum(p2_counts.values()) + sum(p3_counts.values())
         total_links = max(0, num_lps - 1) + total_aif + num_htf
         return _try_budget(num_lps, total_aif, num_htf, total_links, cc_level, diameter,
@@ -2687,6 +2763,13 @@ class TemplateService:
     shape_note: Optional[str] = None
 
     def generate(self, config: dict[str, Any], *, use_sf: bool = False) -> Optional[dict]:
+        """Génère le template pour cette configuration, puis lui applique la
+        forme demandée.
+
+        `KeyError` si une clé obligatoire manque : une config incomplète est
+        une erreur de programmation, pas un refus à afficher. Renvoie None
+        quand le Command Center ne peut pas alimenter la colonie.
+        """
         for key in self.REQUIRED_KEYS:
             if key not in config:
                 raise KeyError(f"Missing required key: {key}")
@@ -2724,7 +2807,15 @@ class TemplateService:
         )
 
     def get_supply_chain(self, product_name: str, chain_name: str) -> dict:
+        """Enveloppe de `get_full_supply_chain`.
+
+        Aucun appelant dans le code au 2026-09-22 ; gardée comme partie de
+        l'interface du service.
+        """
         return get_full_supply_chain(product_name, chain_name)
 
     def get_tier(self, name: str) -> Optional[str]:
+        """Enveloppe de la fonction de module `get_tier` ; même remarque que
+        `get_supply_chain`.
+        """
         return get_tier(name)

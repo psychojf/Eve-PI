@@ -215,6 +215,7 @@ def build_scout(app, body, dialog_parent):
             _render_results(last_results["data"])
 
     def _toggle_type(t):
+        """Ajoute ou retire un type de planète du filtre, puis réapplique."""
         if t in active_types:
             active_types.discard(t)
         else:
@@ -304,13 +305,20 @@ def build_scout(app, body, dialog_parent):
             r_canvas.yview_moveto(r_canvas.yview()[0])
 
     def _on_cards_conf(e):
+        """La liste des cartes a changé de taille : on recale la zone défilable."""
         _sync_scroll()
 
     def _on_canvas_resize(e):
+        """Aligne la largeur des cartes sur celle du canvas, regroupée à 80 ms.
+
+        Un redimensionnement envoie des dizaines de <Configure> ; ne garder que
+        le dernier évite de reposer toutes les cartes à chaque pixel.
+        """
         if _resize_pending[0]:
             popup.after_cancel(_resize_pending[0])
 
         def _apply(w=e.width):
+            """Applique la dernière largeur reçue ; figée par l'argument par défaut."""
             r_canvas.itemconfig(cards_win, width=w)
             _sync_scroll()
         _resize_pending[0] = popup.after(80, _apply)
@@ -348,6 +356,12 @@ def build_scout(app, body, dialog_parent):
                          highlightthickness=0)
 
         def _draw(hovered=None):
+            """Dessine la carte d'une planète, au repos ou survolée.
+
+            Sur un Canvas plutôt qu'avec des Labels : toute la carte change
+            d'aspect au survol (bordure, invite « BUILD HERE » à la place du
+            rayon), et se redessine alors d'un seul bloc.
+            """
             if hovered is not None:
                 state["hovered"] = hovered
             card.delete("all")
@@ -414,6 +428,7 @@ def build_scout(app, body, dialog_parent):
         filtering = len(active_types) < len(PLANET_ORDER)
 
         def _keep(planets):
+            """Les planètes dont le type est coché dans le filtre."""
             return [p for p in planets if p.get("type", "Unknown") in active_types]
 
         # Tri des systèmes : l'origine d'abord, puis par distance en sauts, puis alphabétique
@@ -541,6 +556,13 @@ def build_scout(app, body, dialog_parent):
         status_var.set(f"Resolving '{sys_name}'…")
 
         def _reset_btn():
+            """Rend au bouton son état de repos et réautorise un scan.
+
+            Le drapeau `_scanning` empêche un second scan de partir pendant le
+            premier. Appelé par `after(0, …)` depuis le thread du scan, sur
+            chaque chemin de sortie : Tk ne se touche que depuis le thread
+            principal.
+            """
             scan_btn._scanning = False
             scan_btn.config(text="⟳  SCAN", bg=EVE["accent_dim"], fg=EVE["fg_bright"])
 
@@ -595,6 +617,13 @@ def build_scout(app, body, dialog_parent):
                         next_f = set()
 
                         def _get_gates(sid):
+                            """Les portes d'un système, et sa charge utile
+                            gardée pour le scan de planètes.
+
+                            Un échec réseau rend une liste vide : un système
+                            injoignable arrête le parcours de ce côté-là sans
+                            faire échouer tout le scan.
+                            """
                             try:
                                 data = _esi_fetch(f"/universe/systems/{sid}/")
                                 sys_payloads[sid] = data
@@ -608,6 +637,9 @@ def build_scout(app, body, dialog_parent):
                         all_gates = [g for gl in gate_results for g in gl]
 
                         def _get_dest(sg_id):
+                            """Le système où mène une porte, ou None si l'ESI
+                            ne répond pas.
+                            """
                             try:
                                 return _esi_fetch(f"/universe/stargates/{sg_id}/").get(
                                     "destination", {}).get("system_id")

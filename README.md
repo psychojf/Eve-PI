@@ -44,7 +44,8 @@ A desktop tool for EVE Online players that generates ready-to-import Planetary I
 - **Bill of Materials** — One factory's recipe, plus the whole colony's throughput both per hour and **per collection trip** — what it extracts, what you must haul in, what you collect. The per-trip column is the number you load a hauler against, and it is capped at what storage actually survives: ask 48h of a colony that jams at 33 and it says so and computes for 33
 - **Intermediates** — What a multi-stage colony makes and uses on the planet, made and used per hour side by side. A pair that differs is the gap that HAUL IN or COLLECT carries
 - **Routes table** — Every route in the template, in the order EVE reads them, with its commodity, quantity and the structures it passes through. Folded by default; a P1→P3 colony carries over 90
-- **What the game will refuse** — A link over 1,250 m³/h names itself, with the level to upgrade it to in game and what that costs in CPU and power. A route through more than 7 structures is called out in red: EVE builds every other route of the template and silently drops that one
+- **What the game will refuse** — A link over 1,250 m³/h names itself, with the level to upgrade it to in game and what that costs in CPU and power. A route through more than 7 structures is called out in red: EVE builds every other route of the template and silently drops that one. Structures closer than the minimum spacing are listed by number, and a colony over budget names the Command Center level that would carry it
+- **Repair for EVE** — One button for what can be fixed without moving or removing a structure: a route that is too long loads or unloads at the nearest launch pad or storage instead, and an overloaded link is written into the template at the level it needs, so it arrives in game already upgraded. The button says what it will do before you press it (*"Repair for EVE — reroute 3 routes, upgrade 1 link"*) and is not shown when there is nothing to repair
 - **Extraction coverage** — When a colony runs more factories than its heads support, the BOM says so in words (*"6 of 7 factories are fed by extraction; the rest need 2,000/h of Planktic Colonies hauled in"*)
 
 ### Other ways to build
@@ -59,6 +60,8 @@ A desktop tool for EVE Online players that generates ready-to-import Planetary I
 - **Library** — Your own colonies as cards: chain, planet, structure count, save date and a breakdown, all readable without opening anything. Search filters on name and comment. Load, Edit or Delete
 - **Opening a template fills the panel** — Product, chain, planet type, radius and Command Center level are derived from the colony itself, never from its file name or comment, so a template from a forum post reads correctly too
 - **JSON workspace** — Import from file, paste or clipboard; export by copy or file. Everything lands on the Build stage with the panel filled in
+- **A pasted colony is checked as it opens** — If EVE would refuse or alter part of a template that came from somewhere else, the planet says so before you carry it into the game (*"EVE would refuse or alter part of it: …"*), and the layout panel says what to do about each point
+- **Colonies built by hand open too** — A link that closes a loop through launch pads or storage (a factory placed on two pads, three pads linked in a triangle) is legal in EVE, so it is read as it is: the counters, Route storage and the suggestions all work on it
 - **Themes and text size** — 23 EVE faction colour schemes, plus a text-size setting (80–200%) that scales every font and the panels drawn around them
 - **System Tray** — Minimize to tray; click the icon to restore
 
@@ -74,8 +77,10 @@ A desktop tool for EVE Online players that generates ready-to-import Planetary I
 | **Ways to build this** — every variant, costed side by side | **Assign P2 per factory** — one P2 per Advanced Industry Facility |
 | ![Proximity Scout filtered by planet type](3.png) | ![The same colony laid out as the letters PI](16.png) |
 | **Proximity Scout** — offline, filtered by planet type | **Shape** — the same 23 factories, re-laid as the letters *PI* |
+| ![A pasted colony with an overloaded link, and the Repair for EVE button](17.png) | ![The Library, one card per saved colony](9.png) |
+| **Repair for EVE** — a pasted P3→P4 colony with one link over capacity: the planet says so, the panel prices the upgrade, the button writes it | **Library** — your saved colonies as cards |
 
-More in the repository root: the empty Build screen (`1.png`), the JSON workspace (`10.png`), the Scout unfiltered and by extracted P1 (`4.png`, `5.png`), the Library (`9.png`), Settings (`6.png`) and About (`7.png`).
+More in the repository root: the empty Build screen (`1.png`), the JSON workspace (`10.png`), the Scout unfiltered and by extracted P1 (`4.png`, `5.png`), Settings (`6.png`) and About (`7.png`).
 
 ## How colonies are sized
 
@@ -118,6 +123,12 @@ that reaches the interval, in this order:
 3. **Build from the tier above** — when there is nothing to trade, the same
    product from the next tier up (for example P2→P3 instead of P1→P3), with how
    its output compares.
+
+Every suggestion is measured on the colony with all its launch pads and storage
+routed to the factories they can feed, so the hours on the button are the hours
+the colony you get will last. When that routing alone buys hours and nothing
+else fits, it is offered by itself: *"Route storage to the factories — lasts
+Nh"*.
 
 ## Route priority
 
@@ -187,6 +198,17 @@ rather than read from a wiki:
   every shape it re-lays — is checked against it. Dragging a building by hand is
   the one place crowding is allowed: it is shown with a red ring and left to you.
 
+The same checks run on any template, not only on the ones generated here — a
+colony pasted from a forum post included — along with a fourth: whether the
+Command Center level written in it supplies the CPU and power it needs.
+**Repair for EVE** fixes the first two without touching a structure. A long
+route is moved to load or unload at the nearest launch pad or storage, or
+dropped when that shorter route already exists; a saturated link gets its level
+written into the template. Spacing and budget are left to you, because fixing
+them means moving or removing structures. A route that runs between two
+production structures has no pad or storage end to move, and the panel says so
+rather than letting the button look like it forgot one.
+
 ## Ways to build a P3 or P4
 
 EVE has one schematic per product, so a "different recipe" can only mean a
@@ -231,8 +253,8 @@ python PI.py
 python -m PyInstaller build.spec
 ```
 
-The result is **self-contained**. Planet artwork, the planet icons and the
-offline Scout snapshot travel inside the executable and are read from the
+The result is **self-contained**. Planet artwork, the planet icons, the
+structure glyphs and the offline Scout snapshot travel inside the executable and are read from the
 PyInstaller bundle at runtime, so the .exe can be moved anywhere on its own.
 
 What the app *writes* — your saved templates, the work history, your settings —
@@ -245,6 +267,10 @@ if the SDE snapshot is missing — which, being bundled, it never is. Shipping
 them would add 8 MB to the executable for code that does not run.
 
 ## Tests
+
+The suite is **not in this repository**: `tests/` is kept out by `.gitignore`,
+so the commands below only run in the author's working copy. They are left here
+as a description of how the tool is verified.
 
 ```
 python -m unittest discover -s tests -t . -p "test_*.py"   # pure logic
@@ -278,10 +304,10 @@ timing-sensitive behaviour shows up.
 ```
 PI/
 ├── PI.py                        # Application: rail, screens, panel, map
-├── Eve PI.exe                   # Compiled Windows executable
+├── Eve PI.exe                   # Compiled Windows executable (built, not committed)
 ├── build.spec                   # PyInstaller build definition
 ├── future.ico                   # Window and executable icon
-├── pi_config.json               # Theme, opacity, text size, last scan, layout prefs
+├── pi_config.json               # Theme, opacity, text size, last scan, layout prefs (written on first run)
 ├── requirements.txt             # Python dependencies
 ├── how_to.txt                   # Step-by-step user guide
 ├── scripts/
@@ -295,6 +321,7 @@ PI/
 │   │   ├── colony_model.py      # Parse/edit model: moves, factory sets, storage hubs, routes
 │   │   ├── layout_shapes.py     # Re-lays a built colony as #, star, ring, PI…
 │   │   ├── route_limits.py      # EVE's own limits: 7 structures a route, link capacity
+│   │   ├── template_doctor.py   # What EVE refuses in any template, and the repair
 │   │   ├── storage_suggestion.py# How much storage reaches the interval, and what to trade for it
 │   │   ├── template_describe.py # Reads a colony back into panel settings
 │   │   ├── library_cards.py     # What a library card shows about a template
@@ -338,7 +365,8 @@ See `how_to.txt` for a step-by-step walkthrough.
 
 ## Data Sources
 
-- Systems, stargates and planets: [EVE Swagger Interface (ESI)](https://esi.evetech.net)
-- Planet radii: `mapDenormalize.csv` from the [Fuzzwork SDE dump](https://www.fuzzwork.co.uk/dump/latest/csv/), downloaded once and cached in `data/planet_radii.json`
+- Systems, stargates, planets and planet radii: a snapshot of the EVE Online SDE, bundled as `data/scout-universe.json`
+- Fallback only, if that snapshot is missing: systems and planets from the [EVE Swagger Interface (ESI)](https://esi.evetech.net), radii from `mapDenormalize.csv` in the [Fuzzwork SDE dump](https://www.fuzzwork.co.uk/dump/latest/csv/), cached in `data/planet_radii.json`
+- Structure icons on the map: the client's Planetary Industry icons, from the [EVE University UniWiki](https://wiki.eveuniversity.org/UniWiki:Icons)
 - PI recipes and resource tables: EVE Online SDE / community data
 - Original template math: *Planetary_Interaction_PI_Template_Generator* by Razkin

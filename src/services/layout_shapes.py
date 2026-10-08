@@ -310,6 +310,9 @@ def _letters_slots(count, hubs):
     cells = [(x - width_mid, y - height_mid) for x, y in cells]
 
     def at(x, y):
+        """L'index de la case (x, y) exprimée dans la grille des lettres, avant
+        recentrage.
+        """
         return cells.index((x - width_mid, y - height_mid))
 
     preferred = [at(0, 3), at(6, height // 2), at(0, height - 1), at(6, 0), at(3, 0)]
@@ -520,6 +523,7 @@ def _spanning_links(cells, near, slot_of, hubs):
     root = {hub: hub for hub in hubs}
 
     def find(hub):
+        """Racine d'une zone, avec compression de chemin par demi-pas."""
         while root[hub] != hub:
             root[hub] = root[root[hub]]
             hub = root[hub]
@@ -565,6 +569,11 @@ def _reroute(routes, pins, links):
         graph[b].append(a)
 
     def path(start, end):
+        """Le chemin unique de l'arbre entre deux pins, en indices 1-based.
+
+        Un parcours en largeur suffit : les liens forment un arbre, donc le
+        premier chemin trouvé est le seul.
+        """
         previous = {start: None}
         queue = deque([start])
         while queue:

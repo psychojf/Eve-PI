@@ -169,6 +169,11 @@ def draw_map(app, canvas, template, view_state=None, chrome=True):
     node_radius = fit["node_radius"]
 
     def transform(x, y):
+        """Coordonnées du plateau → coordonnées du canvas, zoom et panoramique compris.
+
+        Le zoom se fait autour du centre du canvas, d'où le décalage avant et
+        après la mise à l'échelle.
+        """
         cx_canvas = cw / 2
         cy_canvas = ch / 2
         tx = cx_canvas + (x - cx_canvas) * zoom + pan_x
@@ -360,6 +365,9 @@ def draw_map(app, canvas, template, view_state=None, chrome=True):
                                     "Basic Industry Facility"})
 
     def _commodity(tid):
+        """Le nom d'une marchandise, ou « type N » pour un id que les données
+        ne connaissent pas.
+        """
         return ID_TO_COMMODITY.get(tid, f"type {tid}")
 
     def _flow_lines(flows):
@@ -510,6 +518,7 @@ def draw_map(app, canvas, template, view_state=None, chrome=True):
         return " — ".join(parts)
 
     def _hide_pin_tooltip(_event=None):
+        """Détruit l'infobulle et la fiche détaillée du survol, s'il y en a."""
         for key in ("tooltip_win", "details_win"):
             tip = view_state.pop(key, None)
             if tip is not None:
@@ -589,6 +598,13 @@ def draw_map(app, canvas, template, view_state=None, chrome=True):
         return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
 
     def _show_route_signals(pin_idx):
+        """Dessine, au survol d'un bâtiment, chaque route qui passe par lui.
+
+        Une bande continue à la couleur de la marchandise, et des perles plus
+        claires dessus : on lit d'un coup d'œil ce qui entre et sort du
+        bâtiment survolé, et par où. Redessiné à chaque survol plutôt que gardé
+        caché : il n'y a jamais qu'un bâtiment survolé.
+        """
         canvas.delete("signal")
         focused_1b = pin_idx + 1
         halo_width = max(4, int(round(ROUTE_HALO_PX * zoom)))
@@ -637,6 +653,7 @@ def draw_map(app, canvas, template, view_state=None, chrome=True):
                    "image": ("image",)}
 
     def _clear_focus():
+        """Rend à chaque objet le style retenu par `_apply_focus`, puis efface la lueur."""
         for item, style in view_state.pop("focus_restore", []):
             try:
                 canvas.itemconfig(item, **style)
@@ -653,6 +670,12 @@ def draw_map(app, canvas, template, view_state=None, chrome=True):
         restore = []
 
         def remember(item):
+            """Retient le style d'un objet avant de le changer, pour que
+            `_clear_focus` le rende tel quel.
+
+            Seules les options que le type d'objet porte vraiment : demander
+            `outline` à une ligne lève.
+            """
             keys = _STYLE_KEYS.get(canvas.type(item), ())
             restore.append((item, {k: canvas.itemcget(item, k) for k in keys}))
 
@@ -744,6 +767,7 @@ def draw_map(app, canvas, template, view_state=None, chrome=True):
         view_state["focus_pin"] = focus
 
     def _unfocus_now():
+        """Retire tout ce que le survol a posé : infobulle, routes, mise en valeur."""
         view_state.pop("unfocus_job", None)
         _hide_pin_tooltip()
         canvas.delete("signal")
@@ -762,6 +786,10 @@ def draw_map(app, canvas, template, view_state=None, chrome=True):
             center = _live_pin_center(i) or (0, 0)
 
             class _At:
+                """Un évènement factice centré sur le bâtiment, pour les appels
+                sans vrai <Enter>.
+                """
+
                 x, y = int(center[0]), int(center[1])
             event = _At
         _unfocus_now()
@@ -894,6 +922,9 @@ def draw_map(app, canvas, template, view_state=None, chrome=True):
             _hover_pin(i, e)
 
         def _leave(_e):
+            """Programme le retrait du survol dans 40 ms ; `_enter` l'annule si
+            le même bâtiment revient.
+            """
             job = view_state.pop("unfocus_job", None)
             if job is not None:
                 canvas.after_cancel(job)

@@ -6,7 +6,7 @@ If you discover a security issue, please report it privately and promptly.
 
 Preferred reporting options:
 - Submitting a GitHub Security Advisory if this repository has that feature enabled
-- Opening a private issue with the label `security`
+- Contacting the maintainer privately on the project's [Discord](https://discord.gg/zBkQ5rXWc), the same one the in-app Bug report button opens
 
 Do not include security-sensitive details in a public issue.
 
@@ -26,8 +26,12 @@ When reporting an issue, please provide:
 
 ## Supported Versions
 
-This policy applies to the current version of the repository. If older versions are supported, that will be documented separately.
+This policy applies to the current version of the repository. Older versions are not maintained.
+
+## Scope
+
+The tool runs locally and offline: it reads and writes JSON files beside itself and needs no account or login. The network is only reached if the bundled map snapshot is missing (EVE ESI and the Fuzzwork SDE dump), and when you click a link that opens your browser.
 
 ## Disclaimer
 
-Our goal is to resolve security issues responsibly and transparently. If you need additional contact information, please use the repositorys maintainer channels.
+Our goal is to resolve security issues responsibly and transparently. If you need additional contact information, please use the repository's maintainer channels.

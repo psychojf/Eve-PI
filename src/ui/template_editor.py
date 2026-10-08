@@ -63,6 +63,7 @@ def open_template_editor(app, template, source_name=None):
     win.minsize(560, 560)
 
     def close():
+        """Ferme l'éditeur en retenant sa géométrie."""
         PI._update_window_config("editor_geometry", win.geometry())
         win.destroy()
 
@@ -84,6 +85,12 @@ def open_template_editor(app, template, source_name=None):
         return cm.counter_tally(state["model"])
 
     def apply_counter(key):
+        """Amène un compteur à la valeur saisie, une édition élémentaire à la fois.
+
+        Répéter `add_*`/`remove_*` plutôt que reconstruire : chaque pas garde
+        les positions posées à la main. Un refus s'affiche, et le modèle garde
+        tout ce qui a réussi avant lui.
+        """
         m = state["model"]
         try:
             want = int(counter_vars[key].get())
@@ -155,6 +162,11 @@ def open_template_editor(app, template, source_name=None):
     name_entry.bind("<KeyRelease>", lambda _e: state.update(name_touched=True))
 
     def apply_meta(_event=None):
+        """Applique rayon, niveau CC et nom ; un champ illisible est ignoré.
+
+        Métadonnées pures : aucune ne déplace un pin, donc aucune ne passe par
+        une reconstruction.
+        """
         m = state["model"]
         if m is None:
             return
@@ -181,12 +193,20 @@ def open_template_editor(app, template, source_name=None):
     strip.pack(fill=tk.X, padx=10, pady=(4, 2))
 
     def draw_strip(analysis):
+        """Le bandeau de validation : jauges CPU/PWR, autonomie, extraction.
+
+        Il signale sans bloquer : une colonie hors budget reste éditable, le
+        bandeau passe au rouge.
+        """
         c = strip
         c.delete("all")
         right = max(300, c.winfo_width() - 8)
         y = 6
 
         def bar(label, used, cap, x0, x1):
+            """Une jauge CPU ou PWR, verte, jaune au-delà de 90 %, rouge
+            au-delà de 100 %.
+            """
             pct = used / cap if cap else 0
             colour = (EVE["green"] if pct <= 0.9
                       else EVE["yellow"] if pct <= 1.0 else EVE["red"])
@@ -243,6 +263,7 @@ def open_template_editor(app, template, source_name=None):
     btns.pack(fill=tk.X, padx=10, pady=(2, 4))
 
     def styled(parent, text, cmd, strong=False):
+        """Un bouton plat du thème ; `strong` pour l'action principale."""
         return tk.Button(parent, text=text, command=cmd,
                          font=("Segoe UI", PI._fs(9), "bold"),
                          bg=EVE["accent_dim"] if strong else EVE["bg_card"],
@@ -252,6 +273,12 @@ def open_template_editor(app, template, source_name=None):
                          relief=tk.FLAT, cursor="hand2")
 
     def do_fit():
+        """Retire des usines jusqu'à ce que la colonie tienne dans le budget du CC.
+
+        Le message distingue trois issues — rien à retirer, ajusté, encore trop
+        cher — pour que « Fit » ne passe jamais pour un succès qui n'en est pas
+        un.
+        """
         m = state["model"]
         if m is None:
             return
@@ -272,6 +299,7 @@ def open_template_editor(app, template, source_name=None):
         messagebox.showinfo("Fit to planet", msg, parent=win)
 
     def do_copy():
+        """Copie le template courant, éditions comprises, dans le presse-papiers."""
         win.clipboard_clear()
         win.clipboard_append(json.dumps(current_template(), default=str))
         messagebox.showinfo("Copied", "Template JSON copied to clipboard!\n\n"
@@ -300,6 +328,7 @@ def open_template_editor(app, template, source_name=None):
                   "drag_start_x": 0, "drag_start_y": 0, "redraw_job": None}
 
     def on_scroll(event):
+        """Zoom molette : mise à l'échelle immédiate, redessin net 120 ms plus tard."""
         factor = 1.15 if event.delta > 0 else 1 / 1.15
         new_zoom = max(0.3, min(3.0, view_state["zoom"] * factor))
         factor = new_zoom / view_state["zoom"]
@@ -318,10 +347,12 @@ def open_template_editor(app, template, source_name=None):
                           app._draw_map(map_canvas, current_template(), view_state)))
 
     def on_drag_start(event):
+        """Début de panoramique : retire l'infobulle et retient le point de départ."""
         map_canvas.delete("tooltip")
         view_state["drag_start_x"], view_state["drag_start_y"] = event.x, event.y
 
     def on_drag(event):
+        """Déplace les objets déjà dessinés (tag « map ») sans redessiner."""
         dx = event.x - view_state["drag_start_x"]
         dy = event.y - view_state["drag_start_y"]
         view_state["drag_start_x"], view_state["drag_start_y"] = event.x, event.y
@@ -339,6 +370,12 @@ def open_template_editor(app, template, source_name=None):
         return m.to_template() if m is not None else state["template"]
 
     def refresh():
+        """Redessine tout depuis le modèle : bandeau, JSON, carte, compteurs.
+
+        Un compteur que `editability` refuse est grisé plutôt que caché : on
+        voit qu'il existe et qu'il ne s'applique pas à cette colonie. Le nom
+        n'est réécrit que tant que l'utilisateur ne l'a pas touché.
+        """
         tpl = current_template()
         analysis = analyze_template(tpl)
         state["analysis"] = analysis
@@ -377,10 +414,12 @@ def open_template_editor(app, template, source_name=None):
 # ── Sauvegardes ──────────────────────────────────────────────────────────
 
 def _clean_name(raw):
+    """Retire les caractères interdits dans un nom de fichier Windows."""
     return "".join(ch for ch in raw.strip() if ch not in '\\/:*?"<>|')
 
 
 def _write_json(path, template):
+    """Écrit un template en JSON compact, comme EVE et la bibliothèque le lisent."""
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(template, fh, default=str)
 
@@ -418,6 +457,12 @@ def _save_library(win, state, name_var):
 
 
 def _save_eve(win, state, name_var):
+    """Écrit le template dans le dossier que le client EVE lit pour l'import PI.
+
+    Le seul endroit du code qui écrit dans `PlanetaryInteractionTemplates` ;
+    PI.py n'en a pas d'équivalent depuis que cet éditeur dort. Le client ne lit
+    le dossier qu'au démarrage, d'où le message sur la reconnexion.
+    """
     import os
     name = _clean_name(name_var.get()) or "Unnamed"
     target = os.path.join(os.path.expanduser("~"), "Documents",

@@ -1,4 +1,26 @@
-# EVE Online - Générateur de templates de Planetary Interaction
+"""EVE Online — générateur de templates de Planetary Interaction (bureau).
+
+Ce fichier est l'application : la fenêtre Tk, le rail et ses écrans (Build,
+Library, JSON), le Proximity Scout et son scanner ESI, les thèmes et
+l'échelle du texte. Les calculs vivent dans `src/services` — le générateur
+dans `template_service`, le modèle de colonie dans `colony_model` — et ne
+connaissent pas Tk : c'est ce qui permet de les tester sans fenêtre et de
+les garder à parité avec l'outil web, dont ils sont le portage.
+
+Trois morceaux de l'interface ont quitté la classe le 2026-09-22 : la scène
+(`src/ui/stage_view`), le dessin de la carte (`src/ui/map_render`) et le
+Proximity Scout (`src/ui/scout_panel`). Chacun garde ici un délégué au même
+nom et à la même signature, pour que rien d'autre n'ait eu à changer. Ils
+importent ce module tard et lisent ses noms à l'appel : `EVE` est recoloré
+sur place à chaque changement de thème, et `_fs`/`_px` lisent l'échelle du
+texte au moment où on les appelle.
+
+Deux règles valent partout. Toute taille de police passe par `_fs()` —
+l'échelle du texte est un réglage de lisibilité, et une taille écrite en
+dur y échappe. Les commentaires sont en français, le texte de l'interface
+reste en anglais : c'est celui du jeu, et des tests l'affirment mot pour
+mot.
+"""
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
@@ -51,7 +73,10 @@ from src.services.variants import enumerate_recipe_variants
 from src.services.layout_shapes import (SHAPE_MENU, SHAPES, STANDARD, apply_shape,
                                         available_shapes)
 from src.services.route_limits import (MAX_ROUTE_STRUCTURES, link_capacity_at_level,
-                                       link_upgrades_needed, long_routes, long_routes_note)
+                                       long_routes_note)
+from src.services.template_doctor import (ESTIMATED_HINT, budget_note, crowded_note,
+                                          diagnose_template, repair_template,
+                                          unfit_note)
 
 SHAPE_BY_MENU = {label: key for key, label in SHAPE_MENU.items()}
 from src.services.scout_universe import PLANET_TYPE_NAMES, load_universe
@@ -94,10 +119,10 @@ from src.ui.screens import (DESKTOP_RAIL, DESKTOP_SCREENS, RAIL_ITEMS,
 from src.ui.map_render import draw_map
 from src.ui.scout_panel import build_scout
 from src.ui.stage_view import StageView
-# `src/ui/template_editor.py` n'est plus importe : sa fenetre redessinait la
-# meme planete dans une seconde scene, et Build est desormais le seul endroit
-# ou une colonie se regarde et se change. Le fichier reste en place, dormant,
-# le temps qu'on soit sur de ne rien vouloir en reprendre.
+# `src/ui/template_editor.py` n'est plus importé : sa fenêtre redessinait la
+# même planète dans une seconde scène, et Build est désormais le seul endroit
+# où une colonie se regarde et se change. Le fichier reste en place, dormant,
+# le temps qu'on soit sûr de ne rien vouloir en reprendre.
 
 
 # ── Zone de notification (pystray + PIL) ──────────────────────────────
@@ -667,6 +692,11 @@ def _attach_tooltip(widget, text):
     state = {"win": None}
 
     def hide(_event=None):
+        """Détruit la bulle si elle existe.
+
+        Tolère une fenêtre déjà morte : la bulle peut disparaître avec son
+        parent avant que <Leave> n'arrive.
+        """
         win = state.pop("win", None)
         state["win"] = None
         if win is not None:
@@ -676,6 +706,11 @@ def _attach_tooltip(widget, text):
                 pass
 
     def show(_event=None):
+        """Pose la bulle à droite du widget, sans décor et au premier plan.
+
+        Cache d'abord la précédente : deux <Enter> sans <Leave> entre les deux
+        laisseraient une bulle orpheline à l'écran.
+        """
         hide()
         try:
             win = tk.Toplevel(widget)
@@ -831,6 +866,12 @@ def _fetch_planets_for_systems(system_ids, progress_callback=None, preloaded=Non
     results = {}
 
     def scan_one_system(sid):
+        """Télécharge un système et ses planètes ; tourne dans un thread du pool.
+
+        Renvoie `(sid, None)` au lieu de lever : un système qui échoue ne doit
+        pas faire tomber le balayage des autres. Une planète illisible est
+        sautée pour la même raison.
+        """
         try:
             sys_data = (preloaded or {}).get(sid)
             if sys_data is None:
@@ -1207,6 +1248,7 @@ def _attach_placeholder(entry, text):
     state = {"showing": False}
 
     def show():
+        """Affiche le texte d'aide en gris, seulement si le champ est vide."""
         if entry.get():
             return
         state["showing"] = True
@@ -1214,12 +1256,18 @@ def _attach_placeholder(entry, text):
         entry.config(fg=EVE["fg_dim"])
 
     def hide(_event=None):
+        """Retire le texte d'aide avant que l'utilisateur ne tape.
+
+        Ne vide le champ que s'il affiche le placeholder — le drapeau, pas le
+        contenu, en décide (voir la docstring de `_attach_placeholder`).
+        """
         if state["showing"]:
             state["showing"] = False
             entry.delete(0, tk.END)
             entry.config(fg=EVE["fg_bright"])
 
     def maybe_show(_event=None):
+        """Remet le texte d'aide à la perte du focus si le champ est resté vide."""
         show()
 
     entry.bind("<FocusIn>", hide, add="+")
@@ -1281,6 +1329,7 @@ def _import_notice(parent, bg):
     state = {"width": 0}
 
     def _fit(event):
+        """Ajuste la hauteur du Text au nombre de lignes réellement affichées."""
         if event.width == state["width"]:
             return
         state["width"] = event.width
@@ -1791,6 +1840,11 @@ class PIGeneratorApp:
     # ── Écran Bibliothèque ───────────────────────────────────────────────
 
     def _library_dir(self):
+        """Le dossier de la bibliothèque, à côté de l'exe.
+
+        `get_base_path` et non `bundled_path` : on y écrit, et ce qui est écrit
+        doit survivre à la fermeture de l'exe.
+        """
         return os.path.join(get_base_path(), "data", "templates")
 
     def _read_library(self):
@@ -1886,6 +1940,11 @@ class PIGeneratorApp:
         self._lib_columns = 0
 
         def _fit(_event=None):
+            """Recalcule la zone défilable et n'affiche la barre que si elle sert.
+
+            Quand toute la bibliothèque tient à l'écran, une barre visible
+            prendrait de la largeur aux cartes pour rien.
+            """
             viewport.configure(scrollregion=viewport.bbox("all"))
             needed = grid.winfo_reqheight() > viewport.winfo_height()
             if needed and not bar.winfo_manager():
@@ -1971,11 +2030,11 @@ class PIGeneratorApp:
         """Une colonie enregistrée, telle qu'elle se présente dans la grille."""
         frame = tk.Frame(parent, bg=EVE["bg_card"], highlightthickness=1,
                          highlightbackground=EVE["border"])
-        # Largeur imposee, hauteur libre. Couper la propagation ferait les deux
-        # a la fois : les cartes tombaient alors a un pixel de haut, faute de
-        # hauteur donnee. Une cale invisible tient la largeur, et la carte reste
+        # Largeur imposée, hauteur libre. Couper la propagation ferait les deux
+        # à la fois : les cartes tombaient alors à un pixel de haut, faute de
+        # hauteur donnée. Une cale invisible tient la largeur, et la carte reste
         # aussi haute que ce qu'elle contient : trois structures prennent plus
-        # de place que deux, et la grille aligne les rangees sur la plus haute.
+        # de place que deux, et la grille aligne les rangées sur la plus haute.
         tk.Frame(frame, bg=EVE["bg_card"], height=1,
                  width=_px(LIBRARY_CARD_WIDTH)).pack()
 
@@ -1988,6 +2047,7 @@ class PIGeneratorApp:
                      fill=tk.X, pady=(0, _px(10)))
 
         def pair(left_label, left_value, right_label, right_value):
+            """Une ligne de deux cellules libellé/valeur côte à côte sur la carte."""
             line = tk.Frame(body, bg=EVE["bg_card"])
             line.pack(fill=tk.X, pady=(0, _px(8)))
             for label, value in ((left_label, left_value),
@@ -2023,6 +2083,11 @@ class PIGeneratorApp:
         actions.pack(fill=tk.X, pady=(_px(12), 0))
 
         def action(text, command, danger=False):
+            """Un bouton du pied de carte ; `danger` le teinte en rouge.
+
+            Le rouge signale l'action qui détruit (supprimer) pour qu'elle ne
+            se clique pas par réflexe à côté d'« Open ».
+            """
             return tk.Button(actions, text=text, font=("Segoe UI", _fs(9)),
                              bg=EVE["bg_input"],
                              fg=EVE["red"] if danger else EVE["fg_bright"],
@@ -2052,20 +2117,20 @@ class PIGeneratorApp:
         return frame
 
     def _apply_template_to_panel(self, template):
-        """Regle les etapes ① a ⑤ sur ce que decrit la colonie ouverte.
+        """Règle les étapes ① à ⑤ sur ce que décrit la colonie ouverte.
 
-        Le panneau restait vide quand on ouvrait un template : la planete etait
-        dessinee, la moitie gauche disait encore « Choose a product… ». Rien
-        n'etait faux, mais le moindre reglage touche aurait alors decrit une
-        autre colonie que celle a l'ecran.
+        Le panneau restait vide quand on ouvrait un template : la planète était
+        dessinée, la moitié gauche disait encore « Choose a product… ». Rien
+        n'était faux, mais le moindre réglage touché aurait alors décrit une
+        autre colonie que celle à l'écran.
 
-        L'ordre compte, et c'est tout ce que cette methode fait de delicat.
-        Choisir un produit repeuple la liste des chaines et en choisit une ;
-        choisir une chaine refiltre les types de planete et en choisit un. Poser
+        L'ordre compte, et c'est tout ce que cette méthode fait de délicat.
+        Choisir un produit repeuple la liste des chaînes et en choisit une ;
+        choisir une chaîne refiltre les types de planète et en choisit un. Poser
         les trois dans l'ordre inverse ne laisserait donc rien. On descend donc
-        ①, ②, ③, chacun apres le remaniement que le precedent declenche.
+        ①, ②, ③, chacun après le remaniement que le précédent déclenche.
 
-        Renvoie ce qui a ete lu, pour que l'appelant puisse le dire.
+        Renvoie ce qui a été lu, pour que l'appelant puisse le dire.
         """
         described = describe_template(template, NAME_TO_TIER)
         self._filling_panel = True
@@ -2079,14 +2144,14 @@ class PIGeneratorApp:
                     self.product_combo.set(display)
                     self._product_display_var.set(display)
                     self.product_var.set(product)
-                    # Repeuple ② ; il choisit aussi une chaine, qu'on remplace
-                    # juste apres si la colonie en dit une autre.
+                    # Repeuple ② ; il choisit aussi une chaîne, qu'on remplace
+                    # juste après si la colonie en dit une autre.
                     self._update_chain_list()
 
             chain = described["chain"]
             if chain and chain in self.chain_combo["values"]:
                 self._set_chain(chain)
-                # Refiltre ③ selon ce que la chaine autorise.
+                # Refiltre ③ selon ce que la chaîne autorise.
                 self._on_chain_changed()
 
             planet = described["planet"]
@@ -2101,8 +2166,8 @@ class PIGeneratorApp:
         finally:
             self._filling_panel = False
 
-        # Un seul recalcul, une fois tout pose : un par champ aurait fait
-        # clignoter la nomenclature quatre fois et calcule trois apercus que
+        # Un seul recalcul, une fois tout posé : un par champ aurait fait
+        # clignoter la nomenclature quatre fois et calculé trois aperçus que
         # personne n'allait voir.
         self._update_bom()
         return described
@@ -2124,6 +2189,13 @@ class PIGeneratorApp:
         name = card["name"]
 
         def run():
+            """Ouvre la carte sur la scène ; différé pour passer par la garde.
+
+            `_replace_colony` décide d'abord si l'arrangement en cours mérite
+            d'être enregistré, puis appelle ceci. Une colonie qui ne se laisse
+            pas arranger s'ouvre quand même : l'avertissement dit pourquoi, et
+            l'écran JSON reste là pour l'éditer à la main.
+            """
             template = copy.deepcopy(card["template"])
             if editing:
                 shape = template_shape_error(template)
@@ -2141,8 +2213,8 @@ class PIGeneratorApp:
             self.current_template = template
             self._history.record(template, f"Opened {name}", kind="load")
             self._show_screen("build")
-            # Le panneau d'abord, la scene ensuite : `doc["config"]` est pris
-            # apres, donc il decrit la colonie posee et non celle d'avant.
+            # Le panneau d'abord, la scène ensuite : `doc["config"]` est pris
+            # après, donc il décrit la colonie posée et non celle d'avant.
             self._apply_template_to_panel(template)
             self._show_popup(template, source="library")
             doc = (self._stage_state or {}).get("doc")
@@ -2157,18 +2229,19 @@ class PIGeneratorApp:
         self._replace_colony(f"{'Editing' if editing else 'Loading'} {name}", run)
 
     def _open_external_template(self, template, source):
-        """Porte sur la scene de Build un template venu d'ailleurs.
+        """Porte sur la scène de Build un template venu d'ailleurs.
 
-        Il ouvrait une fenetre d'editeur a part, qui redessinait la meme planete
-        dans sa propre scene. Le webtool a supprime cet ecran le 2026-08-06 pour
-        cette raison, et le bureau n'a plus qu'un endroit ou une colonie se
+        Il ouvrait une fenêtre d'éditeur à part, qui redessinait la même planète
+        dans sa propre scène. Le webtool a supprimé cet écran le 2026-08-06 pour
+        cette raison, et le bureau n'a plus qu'un endroit où une colonie se
         regarde et se change.
 
-        `filed` reste faux, contrairement a une colonie ouverte depuis la
-        bibliotheque : ce qui vient du presse-papiers n'est dans aucun fichier,
+        `filed` reste faux, contrairement à une colonie ouverte depuis la
+        bibliothèque : ce qui vient du presse-papiers n'est dans aucun fichier,
         donc le remplacer perdrait vraiment quelque chose.
         """
         def run():
+            """Pose la colonie venue d'ailleurs ; appelé par `_replace_colony`."""
             pasted = copy.deepcopy(template)
             self.current_template = pasted
             self._history.record(pasted, f"Opened {source}", kind="load")
@@ -2281,8 +2354,8 @@ class PIGeneratorApp:
                 btn.bind("<Button-1>", lambda _e: self._open_scout_from_build())
             self._rail_buttons[name] = btn
 
-        # Le pied se pose apres les destinations : il s'ancre au plancher, donc
-        # il ne depend pas de leur nombre.
+        # Le pied se pose après les destinations : il s'ancre au plancher, donc
+        # il ne dépend pas de leur nombre.
         self._build_rail_footer(rail)
 
     def _build_rail_footer(self, rail):
@@ -2405,6 +2478,7 @@ class PIGeneratorApp:
     def _show_more_tools(self):
         """Les autres outils, chacun avec ce qu'il fait et un lien qui part."""
         def body(parent, wrap):
+            """Remplit la boîte : mes outils d'abord, puis ceux d'autres auteurs."""
             tk.Label(parent, text="Other EVE Online tools I have built.",
                      bg=EVE["bg_deep"], fg=EVE["fg"],
                      font=("Segoe UI", _fs(9)), wraplength=wrap,
@@ -2434,6 +2508,7 @@ class PIGeneratorApp:
     def _show_terms(self):
         """Les conditions d'utilisation, en clair et sans réseau."""
         def body(parent, wrap):
+            """Remplit la boîte, une section des conditions par titre."""
             for heading, text in TERMS_SECTIONS:
                 tk.Label(parent, text=heading, bg=EVE["bg_deep"],
                          fg=EVE["accent_text"],
@@ -2524,6 +2599,11 @@ class PIGeneratorApp:
         win.minsize(420, 320)
 
         def close_json():
+            """Ferme la fenêtre JSON en retenant sa géométrie.
+
+            Oublie `_json_window` : le prochain appel en ouvrira une neuve au
+            lieu de chercher à relever celle-ci.
+            """
             _update_window_config("json_geometry", win.geometry())
             self._json_window = None
             win.destroy()
@@ -2536,17 +2616,18 @@ class PIGeneratorApp:
         win.focus_force()
 
     def _build_json_body(self, parent):
-        """L'espace JSON : ce qui entre a gauche, ce qui sort a droite.
+        """L'espace JSON : ce qui entre à gauche, ce qui sort à droite.
 
-        C'etait une seule colonne — un grand champ de texte et trois boutons en
+        C'était une seule colonne — un grand champ de texte et trois boutons en
         dessous — donc rien ne disait lequel des trois faisait entrer une colonie
-        et lesquels la faisaient sortir. Les deux moities d'un aller-retour se
-        lisent maintenant comme deux moities.
+        et lesquels la faisaient sortir. Les deux moitiés d'un aller-retour se
+        lisent maintenant comme deux moitiés.
         """
         cards = tk.Frame(parent, bg=EVE["bg_deep"])
         cards.pack(fill=tk.X, pady=(_px(10), _px(14)))
 
         def card(side, title, pad):
+            """Une carte titrée d'un côté de la fenêtre ; renvoie son intérieur."""
             outer = tk.Frame(cards, bg=EVE["bg_card"], highlightthickness=1,
                              highlightbackground=EVE["border"])
             outer.pack(side=side, fill=tk.BOTH, expand=True, padx=pad)
@@ -2558,6 +2639,7 @@ class PIGeneratorApp:
             return inner
 
         def wide_button(parent_, text, command, bold=False):
+            """Un bouton plat aux couleurs du thème pour les cartes de l'écran JSON."""
             return tk.Button(parent_, text=text,
                              font=("Segoe UI", _fs(9), "bold" if bold else "normal"),
                              bg=EVE["bg_input"], fg=EVE["fg_bright"],
@@ -2577,7 +2659,7 @@ class PIGeneratorApp:
                      side=tk.LEFT)
         # Le champ est ce que montre le webtool, parce qu'un navigateur ne peut
         # pas lire le presse-papiers quand il veut. Le bureau, si : ce raccourci
-        # remplit le champ en un clic plutot que de le retirer.
+        # remplit le champ en un clic plutôt que de le retirer.
         tk.Button(label_row, text="from clipboard", font=("Segoe UI", _fs(8)),
                   bg=EVE["bg_card"], fg=EVE["accent_text"],
                   activebackground=EVE["bg_card"], activeforeground=EVE["fg_bright"],
@@ -2600,16 +2682,16 @@ class PIGeneratorApp:
             side=tk.LEFT, ipadx=_px(10), ipady=_px(7))
         wide_button(export_row, "Save JSON file", self._json_save).pack(
             side=tk.LEFT, padx=(_px(8), 0), ipadx=_px(10), ipady=_px(7))
-        # Pas de « Copy share link » : il tient a une URL, et une application de
-        # bureau n'en a pas a offrir. Un bouton qui ne peut rien produire est
+        # Pas de « Copy share link » : il tient à une URL, et une application de
+        # bureau n'en a pas à offrir. Un bouton qui ne peut rien produire est
         # pire que son absence.
 
-        # La meme notice que sur la scene, et pour la meme raison : c'est ici
+        # La même notice que sur la scène, et pour la même raison : c'est ici
         # aussi qu'on part vers le jeu.
         _import_notice(right, EVE["bg_card"]).pack(
             fill=tk.BOTH, expand=True, pady=(_px(12), 0))
 
-        # ── Ce qu'il y a sur la scene ────────────────────────────────────
+        # ── Ce qu'il y a sur la scène ────────────────────────────────────
         self._json_heading = tk.StringVar(value="NOTHING BUILT YET")
         tk.Label(parent, textvariable=self._json_heading, bg=EVE["bg_deep"],
                  fg=EVE["fg_dim"], font=("Segoe UI", _fs(8), "bold"),
@@ -2636,14 +2718,19 @@ class PIGeneratorApp:
                  fg=EVE["fg_dim"], font=("Segoe UI", _fs(8)), anchor=tk.W).pack(
                      fill=tk.X, pady=(_px(6), 0))
 
-    # ── Les gestes de l'ecran JSON ───────────────────────────────────────
+    # ── Les gestes de l'écran JSON ───────────────────────────────────────
 
     def _json_current(self):
-        """La colonie que l'ecran decrit : celle de la scene, deplacements compris."""
+        """La colonie que l'écran décrit : celle de la scène, déplacements compris."""
         doc = (getattr(self, "_stage_state", None) or {}).get("doc")
         return doc["template"] if doc else self.current_template
 
     def _json_copy(self):
+        """Copie la colonie de la scène, déplacements compris, dans le presse-papiers.
+
+        `default=str` : une valeur que json ne sait pas écrire devient du texte
+        au lieu de faire échouer toute la copie.
+        """
         template = self._json_current()
         if template is None:
             self._json_status.set("Nothing to copy yet.")
@@ -2653,6 +2740,11 @@ class PIGeneratorApp:
         self._json_status.set("Copied to clipboard.")
 
     def _json_save(self):
+        """Enregistre la colonie de la scène dans un fichier .json choisi.
+
+        Les échecs vont dans la ligne d'état de la fenêtre, comme ceux des
+        autres gestes de l'écran JSON.
+        """
         template = self._json_current()
         if template is None:
             self._json_status.set("Nothing to save yet.")
@@ -2674,7 +2766,7 @@ class PIGeneratorApp:
     def _json_fill_from_clipboard(self):
         """Verse le presse-papiers dans le champ, sans rien ouvrir encore.
 
-        Deux temps plutot qu'un : on voit ce qu'on s'apprete a ouvrir, et
+        Deux temps plutôt qu'un : on voit ce qu'on s'apprête à ouvrir, et
         « Use pasted JSON » reste le geste qui remplace la colonie.
         """
         try:
@@ -2701,6 +2793,7 @@ class PIGeneratorApp:
         return template
 
     def _json_use_pasted(self):
+        """Ouvre sur la scène le JSON collé dans la zone de texte."""
         template = self._json_parse(self._json_paste.get("1.0", tk.END))
         if template is None:
             return
@@ -2708,6 +2801,11 @@ class PIGeneratorApp:
         self._open_external_template(template, "pasted JSON")
 
     def _json_open_file(self):
+        """Ouvre sur la scène un template lu depuis un fichier.
+
+        `utf-8-sig` : un fichier enregistré par le Bloc-notes porte un BOM, et
+        `json.loads` refuse un texte qui commence par lui.
+        """
         path = filedialog.askopenfilename(
             parent=self.root, filetypes=[("JSON", "*.json"), ("All files", "*.*")])
         if not path:
@@ -3079,18 +3177,34 @@ class PIGeneratorApp:
 
         drag_data = {"x": 0, "y": 0, "dragging": False}
         def on_press(event):
+            """Retient où, dans la fenêtre, le bouton a été pressé.
+
+            Le glisser déplace la fenêtre de ce décalage : sans lui, elle
+            sauterait pour mettre son coin sous le curseur.
+            """
             drag_data["x"] = event.x_root - window.winfo_x()
             drag_data["y"] = event.y_root - window.winfo_y()
             drag_data["dragging"] = False
         def on_drag(event):
+            """Déplace la fenêtre sans décor avec le curseur.
+
+            `overrideredirect` retire la barre de titre de Windows et, avec
+            elle, le déplacement : c'est cette barre-ci qui le rend.
+            """
             drag_data["dragging"] = True
             x = event.x_root - drag_data["x"]
             y = event.y_root - drag_data["y"]
             window.geometry(f"+{x}+{y}")
         def on_release(event):
+            """Fin du geste : le prochain double-clic en sera vraiment un."""
             drag_data["dragging"] = False
         
         def on_double_click(event):
+            """Replie la fenêtre au double-clic sur la barre, jamais pendant un glisser.
+
+            La fenêtre principale se replie elle-même ; les autres passent par
+            le `toggle_cmd` qu'elles ont fourni.
+            """
             if not drag_data.get("dragging", False):
                 if window_to_toggle == self.root:
                     self._toggle_collapse(event)
@@ -3229,7 +3343,7 @@ class PIGeneratorApp:
         content.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
 
         ttk.Label(content, text="EVE Online — PI Template Generator", style="Header.TLabel").pack(anchor=tk.W, pady=(0,5))
-        ttk.Label(content, text="Version 4.5", style="Sub.TLabel").pack(anchor=tk.W)
+        ttk.Label(content, text="Version 5.0", style="Sub.TLabel").pack(anchor=tk.W)
         ttk.Label(content, text="\nBased on the Planetary Interaction Template\nGenerator spreadsheet by Razkin.").pack(anchor=tk.W)
         # Le crédit de la bibliothèque livrée a été retiré le 12/08/2026 : la
         # bibliothèque ne contient plus que les colonies bâties par l'utilisateur, donc
@@ -3523,7 +3637,14 @@ class PIGeneratorApp:
                            font=("Segoe UI", _fs(10), "bold"), relief=tk.FLAT, cursor="hand2")
             btn.pack(side=tk.LEFT, padx=2)
             def _make_cc_click(l=lvl):
+                """Fabrique le rappel du bouton de niveau `l`.
+
+                L'argument par défaut fige `lvl` à chaque tour de boucle ; une
+                fermeture directe lirait la dernière valeur, et les six boutons
+                régleraient tous le niveau 5.
+                """
                 def _click(e=None):
+                    """Règle le niveau de Command Center et recalcule l'aperçu."""
                     self.cc_var.set(l)
                     self._refresh_cc_buttons()
                     self._on_selection_change(None, "cc")
@@ -3718,6 +3839,12 @@ class PIGeneratorApp:
         self._bom_redraw_job = None
 
         def _on_bom_resize(event):
+            """Redessine le rapport quand la colonne change vraiment de largeur.
+
+            Regroupé en un seul redessin 60 ms plus tard : un glisser de
+            fenêtre envoie des dizaines de <Configure> et chacun redessinerait
+            tout le canvas.
+            """
             if event.width == self._bom_width:
                 return
             self._bom_width = event.width
@@ -4348,6 +4475,12 @@ class PIGeneratorApp:
             y = max(y + _px(14), box[3] if box else 0)
 
         def bar(label, used, cap, x0, x1):
+            """Une jauge CPU ou PWR : libellé, « utilisé / capacité » et barre.
+
+            Vert jusqu'à 90 %, jaune jusqu'à 100 %, rouge au-delà — le jaune
+            prévient qu'il ne reste plus de marge avant que la colonie refuse
+            de se bâtir.
+            """
             pct = used / cap if cap else 0
             colour = EVE["green"] if pct <= 0.9 else (EVE["yellow"] if pct <= 1.0 else EVE["red"])
             c.create_text(x0, y, anchor=tk.NW, text=label, fill=EVE["fg_dim"],
@@ -4469,20 +4602,42 @@ class PIGeneratorApp:
         for warn in a["warnings"]:
             note(f"⚠ {warn}", EVE["red"], ("Segoe UI", _fs(8)))
 
-        # Ce que le jeu impose et que l'analyse ne dit pas encore
-        # (src/services/route_limits.py) : quel lien améliorer et ce que ça
-        # coûte, et les routes qu'EVE refusera de construire.
+        # Ce que le jeu refuse ou modifie à l'import et que l'analyse ne dit
+        # pas (src/services/template_doctor.py) : les routes qu'EVE ne bâtira
+        # pas, les liens à améliorer et ce que ça coûte, les structures qu'il
+        # écartera, le budget qu'il ne fournit pas. Dans l'ordre de la boîte
+        # « Game limits » de l'outil web ; le bouton qui répare ce qui peut
+        # l'être est sur la scène, à côté de « Route storage ».
         report_template = self._report_template()
         if report_template:
-            for up in link_upgrades_needed(report_template, layout_opts):
-                cost = f"+{up.extra_cpu} CPU, +{up.extra_power} MW"
-                note(f"⬆ Upgrade link {up.a}–{up.b} in game to level {up.level} "
-                     f"({link_capacity_at_level(up.level):,} m³/h): "
-                     f"{cost if up.verified else cost + ' (estimate)'}",
-                     EVE["orange"], ("Segoe UI", _fs(8)))
-            too_long = long_routes_note(long_routes(report_template))
-            if too_long:
-                note(f"⚠ {too_long}", EVE["red"], ("Segoe UI", _fs(8)))
+            try:
+                diagnosis = diagnose_template(report_template, layout_opts)
+                repair = repair_template(report_template, layout_opts)
+            except Exception as exc:
+                # Une colonie que l'analyse ne lit pas s'affiche quand même.
+                _debug(f"game limits not diagnosed: {exc}")
+                diagnosis = repair = None
+            if diagnosis is not None:
+                too_long = long_routes_note(diagnosis.long_routes)
+                if too_long:
+                    note(f"⚠ {too_long}", EVE["red"], ("Segoe UI", _fs(8)))
+                if repair.unfit:
+                    note(f"⚠ {unfit_note(repair.unfit)}", EVE["orange"],
+                         ("Segoe UI", _fs(8)))
+                for up in diagnosis.upgrades:
+                    cost = f"+{up.extra_cpu} CPU, +{up.extra_power} MW"
+                    note(f"⬆ Upgrade link {up.a}–{up.b} in game to level {up.level} "
+                         f"({link_capacity_at_level(up.level):,} m³/h): "
+                         f"{cost if up.verified else cost + ' (estimate)'}",
+                         EVE["orange"], ("Segoe UI", _fs(8)))
+                if repair.estimated:
+                    note(ESTIMATED_HINT, EVE["orange"], ("Segoe UI", _fs(8)))
+                if diagnosis.crowded:
+                    note(f"⚠ {crowded_note(diagnosis.crowded)}", EVE["red"],
+                         ("Segoe UI", _fs(8)))
+                if diagnosis.budget is not None:
+                    note(f"⚠ {budget_note(diagnosis.budget)}", EVE["red"],
+                         ("Segoe UI", _fs(8)))
         c.config(height=max(_px(56), y + 2))
 
     def _required_p0(self, product, chain_name):
@@ -4576,6 +4731,7 @@ class PIGeneratorApp:
                 pass
 
         def _push():
+            """La moitié différée de `_sync_live_popup` : envoie le dernier aperçu."""
             self._live_sync_job = None
             follow = self._live_popup
             if follow is None or self.current_preview is None:
@@ -4875,6 +5031,12 @@ class PIGeneratorApp:
             return max(0, (box[3] - box[1]) - line) if box else 0
 
         def draw_row(label, value, color, indent=0):
+            """Une ligne libellé à gauche, valeur à droite ; fait avancer y.
+
+            La largeur laissée au libellé s'arrête là où la valeur commence,
+            pour qu'un nom long se renvoie à la ligne au lieu de passer sous
+            les chiffres.
+            """
             nonlocal y
             limit_x = right_x - (value_font.measure(value) + label_gap if value else 0)
             extra = draw_label(8 + indent, label, color, limit_x)
@@ -4943,6 +5105,12 @@ class PIGeneratorApp:
             per_hour_x = per_trip_x - trip_w - gap
 
             def draw_flows(flows, indent=4):
+                """Dessine les flux d'un groupe : débit horaire, quantité par
+                trajet, tier.
+
+                Chaque ligne prend la couleur de son tier (`TIER_CLR`), comme
+                le reste du rapport.
+                """
                 for flow in flows:
                     clr = TIER_CLR.get(flow.tier, EVE["fg"])
                     hour_txt = f"{_num(flow.per_hour)}/h"
@@ -4958,6 +5126,7 @@ class PIGeneratorApp:
                     _advance(extra)
 
             def _advance(extra=0):
+                """Passe à la ligne suivante, plus la hauteur d'un libellé renvoyé."""
                 nonlocal y
                 y += lh + extra
 
@@ -4975,6 +5144,11 @@ class PIGeneratorApp:
                 _advance()
 
             def draw_subtotal(m3):
+                """Le volume du groupe en m³/h et par trajet, sous ses flux.
+
+                Les m³ sont ce qui décide de la taille du vaisseau de
+                ramassage ; ils méritent leur ligne plutôt qu'un calcul de tête.
+                """
                 nonlocal y
                 c.create_text(per_hour_x, y, anchor=tk.E, text=f"{_num(m3)} m³/h",
                               fill=EVE["fg_dim"], font=("Consolas", _fs(9)))
@@ -5108,6 +5282,7 @@ class PIGeneratorApp:
         self._routes_extra_px = y - routes_top if opened else 0
 
         def _toggle_routes(_event=None):
+            """Ouvre ou referme le détail des routes et redessine le rapport."""
             self._routes_open = not getattr(self, "_routes_open", False)
             self._draw_bom()
 
@@ -5265,6 +5440,7 @@ class PIGeneratorApp:
         apply_window_border(win)
 
         def close(value):
+            """Ferme le dialogue modal en retenant la réponse choisie."""
             answer["value"] = value
             win.grab_release()
             win.destroy()
@@ -5443,6 +5619,7 @@ class PIGeneratorApp:
         apply_window_border(popup)
 
         def close_popup():
+            """Ferme l'historique en retenant sa géométrie."""
             _update_window_config("history_geometry", popup.geometry())
             popup.destroy()
 
@@ -5473,6 +5650,11 @@ class PIGeneratorApp:
         rows = []
 
         def _refresh():
+            """Relit l'historique et remplit la liste, la plus récente en haut.
+
+            `rows` est rempli sur place : les autres rappels le partagent et
+            doivent voir la même liste que celle affichée.
+            """
             rows[:] = self._history.entries()
             listbox.delete(0, tk.END)
             for entry in rows:
@@ -5487,6 +5669,11 @@ class PIGeneratorApp:
                 listbox.selection_set(0)
 
         def _restore(_event=None):
+            """Rouvre sur la scène l'état sélectionné.
+
+            Ferme la fenêtre d'abord : l'historique est au premier plan et
+            cacherait la colonie qu'on vient de rappeler.
+            """
             sel = listbox.curselection()
             if not sel:
                 return
@@ -5514,6 +5701,7 @@ class PIGeneratorApp:
                     template, template.get("Cmt") or entry.label, popup)
 
         def _delete():
+            """Oublie l'état sélectionné, puis relit la liste."""
             sel = listbox.curselection()
             if not sel:
                 return
@@ -5521,6 +5709,11 @@ class PIGeneratorApp:
             _refresh()
 
         def _clear():
+            """Vide l'historique après confirmation ; la bibliothèque n'est pas touchée.
+
+            La question le précise : c'est la bibliothèque qu'on a peur de
+            perdre en cliquant ici, et elle ne partage rien avec l'historique.
+            """
             if messagebox.askyesno("Clear history",
                                    "Forget every recorded state?\n\n"
                                    "Templates saved in the library are not "
@@ -5566,7 +5759,7 @@ class PIGeneratorApp:
 
         Le Scout dit *où* construire ; jusqu'ici il fallait ensuite recopier le
         type et le rayon à la main dans le générateur, et un rayon recopié de
-        travers reprice tous les liens en silence. Ici les deux valeurs
+        travers refacture tous les liens en silence. Ici les deux valeurs
         traversent ensemble, telles que le SDE les donne.
         """
         # Un P1 choisi depuis le Scout décide de la construction : ce choix est toute la
@@ -5702,6 +5895,12 @@ class PIGeneratorApp:
         apply_window_border(popup)
 
         def close_popup():
+            """Ferme la comparaison en retenant sa géométrie.
+
+            Oublier `_variants_refresh` coupe le lien avec le panneau : sans
+            ça, chaque réglage touché redessinerait un tableau qui n'existe
+            plus.
+            """
             self._variants_refresh = None
             _update_window_config("variants_geometry", popup.geometry())
             popup.destroy()
@@ -5759,6 +5958,7 @@ class PIGeneratorApp:
             return f"{round(cpu)}% · {round(power)}%"
 
         def _structures(analysis):
+            """Les usines et les pads d'une variante, en une note courte."""
             counts = analysis["structures"]
             factories = (counts.get("Advanced Industry Facility", 0)
                          + counts.get("High-Tech Industry Facility", 0))
@@ -5780,6 +5980,13 @@ class PIGeneratorApp:
             return text.rstrip() + "…"
 
         def _draw_table():
+            """Redessine tout le tableau des variantes à la largeur courante.
+
+            Un Canvas parce que chaque ligne porte deux étages — le nom, puis
+            la note ou la raison d'un refus — ce qu'une ligne de Treeview ne
+            sait pas faire. La ligne choisie est surlignée, les autres
+            alternent pour se suivre à l'œil.
+            """
             table.delete("all")
             width = max(660, table.winfo_width())
             right = width - 12
@@ -5862,12 +6069,14 @@ class PIGeneratorApp:
                                        HEAD_H + len(variants) * ROW_H + 8))
 
         def _row_at(event):
+            """La variante sous le pointeur, ou None hors des lignes."""
             index = int((table.canvasy(event.y) - HEAD_H) // ROW_H)
             if 0 <= index < len(variants):
                 return variants[index]
             return None
 
         def _on_click(event):
+            """Pose la variante cliquée sur la scène et fait suivre le panneau."""
             variant = _row_at(event)
             if variant is None:
                 return
@@ -5990,6 +6199,7 @@ class PIGeneratorApp:
         apply_window_border(popup)
 
         def close_popup():
+            """Ferme la fenêtre du mélange en retenant sa géométrie."""
             _update_window_config("mixed_geometry", popup.geometry())
             popup.destroy()
 
@@ -6017,6 +6227,11 @@ class PIGeneratorApp:
         summary.pack(fill=tk.BOTH, expand=True)
 
         def _draw_summary():
+            """Redessine le résumé du lot pour les affectations choisies.
+
+            Recalculé à chaque changement de liste déroulante : on voit la
+            liste de courses P1 et la durée de course bouger avant de générer.
+            """
             summary.delete("all")
             for i, var in enumerate(chosen):
                 assignments[i] = var.get()
@@ -6036,6 +6251,7 @@ class PIGeneratorApp:
             right = max(_px(240), summary.winfo_width() - 12)
 
             def row(label, value="", color=None, indent=0, bold=False):
+                """Une ligne du résumé, libellé à gauche et valeur calée à droite."""
                 summary.create_text(10 + indent, y[0], anchor=tk.NW, text=label,
                                     fill=color or EVE["fg"],
                                     font=("Segoe UI", _fs(9), "bold") if bold
@@ -6102,6 +6318,7 @@ class PIGeneratorApp:
         btns.pack(fill=tk.X, pady=(8, 0))
 
         def use_default_for_all():
+            """Remet toutes les usines sur le produit par défaut."""
             for var in chosen:
                 var.set(default)
             _draw_summary()
@@ -6112,6 +6329,11 @@ class PIGeneratorApp:
                   command=use_default_for_all).pack(side=tk.LEFT)
 
         def generate_mixed():
+            """Génère la colonie mélangée et l'ouvre sur la scène.
+
+            Un refus du générateur reste dans cette fenêtre : les affectations
+            sont encore là pour être corrigées.
+            """
             for i, var in enumerate(chosen):
                 assignments[i] = var.get()
             try:
@@ -6198,10 +6420,12 @@ class PIGeneratorApp:
         view_state.update({"zoom": 1.0, "pan_x": 0, "pan_y": 0, "fit": None})
 
         def on_drag_start(event):
+            """Retient le point de départ du glisser sur le plateau vide."""
             view_state["drag_start_x"] = event.x
             view_state["drag_start_y"] = event.y
 
         def on_drag(event):
+            """Fait glisser le plateau vide avec le pointeur."""
             dx = event.x - view_state["drag_start_x"]
             dy = event.y - view_state["drag_start_y"]
             view_state["drag_start_x"] = event.x
@@ -6269,6 +6493,11 @@ class PIGeneratorApp:
                        "start_w": 0, "start_h": 0, "start_win_x": 0, "start_win_y": 0}
 
         def get_edge(event):
+            """Le bord ou le coin sous le pointeur (« n », « se »…), ou None.
+
+            `handle_size` pixels depuis le bord : assez large pour s'attraper,
+            assez étroit pour ne pas voler les clics du contenu.
+            """
             x = event.x_root - window.winfo_rootx()
             y = event.y_root - window.winfo_rooty()
             w = window.winfo_width()
@@ -6290,6 +6519,7 @@ class PIGeneratorApp:
             return None
 
         def update_cursor(event):
+            """Affiche le curseur de redimensionnement qui correspond au bord survolé."""
             edge = get_edge(event)
             cursors = {
                 "nw": "top_left_corner", "ne": "top_right_corner",
@@ -6303,6 +6533,11 @@ class PIGeneratorApp:
                 window.config(cursor="")
 
         def start_resize(event):
+            """Commence un redimensionnement si le clic tombe sur un bord.
+
+            Mémorise la géométrie de départ : `do_resize` calcule tout à partir
+            d'elle plutôt que par petits deltas, qui dériveraient.
+            """
             edge = get_edge(event)
             if edge:
                 resize_data["active"] = True
@@ -6315,6 +6550,12 @@ class PIGeneratorApp:
                 resize_data["start_win_y"] = window.winfo_y()
 
         def do_resize(event):
+            """Applique le redimensionnement en cours, avec un plancher de 400 px.
+
+            Tirer par la gauche ou le haut déplace aussi la fenêtre, pour que
+            le bord opposé reste en place — et seulement tant que le plancher
+            n'est pas atteint, sinon la fenêtre glisserait.
+            """
             if not resize_data["active"]:
                 return
             
@@ -6361,6 +6602,9 @@ class PIGeneratorApp:
         grip.place(relx=1.0, rely=1.0, anchor="se")
         
         def grip_start(event):
+            """Démarre un redimensionnement depuis la poignée ⋱, toujours par
+            le coin « se ».
+            """
             resize_data["active"] = True
             resize_data["edge"] = "se"
             resize_data["start_x"] = event.x_root
@@ -6412,6 +6656,7 @@ class PIGeneratorApp:
         _sc_state = {"collapsed": False, "full_height": 0}
 
         def close_popup():
+            """Ferme le scanner en retenant sa géométrie."""
             _update_window_config("scanner_geometry", popup.geometry())
             popup.destroy()
 
@@ -6423,6 +6668,13 @@ class PIGeneratorApp:
         body = tk.Frame(popup, bg=EVE["bg_deep"])
 
         def _toggle_scanner():
+            """Replie le scanner à sa barre de titre ou le rouvre à sa hauteur.
+
+            L'anti-rebond d'une demi-seconde : un troisième clic rapide
+            satisfait encore <Double-Button-1> chez Tk, et la fenêtre se
+            repliait puis se dépliait aussitôt. La hauteur est retenue au repli
+            pour que la réouverture rende la fenêtre telle qu'elle était.
+            """
             current_time = time.time()
             last = _toggle_scanner.__dict__.get("_last_time", 0)
             if current_time - last < 0.5:

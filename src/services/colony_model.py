@@ -10,7 +10,6 @@ from __future__ import annotations
 import copy
 import dataclasses
 import math
-from collections import deque
 from dataclasses import dataclass, field
 
 from src.pi_data import DEFAULT_YIELD_PER_HEAD, RECIPES_P1_P2
@@ -100,19 +99,35 @@ class Arm:
     divergent quand un bras se ramifie : chaque branche devient alors son
     propre bras, de parent le pin où ça bifurque, et garde le hub d'origine
     pour que l'équilibrage de charge continue de compter au bon endroit.
+
+    `depth` est le rang du premier pin compté depuis le hub : 1 pour un bras
+    posé sur un hub, la portée de la fourche plus un pour une branche. Les
+    règles de longueur parlent de la distance au pad qui nourrit la structure,
+    pas de la longueur du tronçon — `depth` de l'outil web.
     """
     hub: int
     pins: list[int]
     end_hub: int | None = None
     parent: int | None = None
+    depth: int = 1
 
     def __post_init__(self):
+        """Un bras sans parent déclaré part de son hub : le cas de toute la bibliothèque."""
         if self.parent is None:
             self.parent = self.hub
 
 
 @dataclass
 class ColonyModel:
+    """Un template lu en structure : ses pins, ses hubs, ses bras et son épine.
+
+    Les listes `pins`, `links` et `routes` sont gardées mot pour mot : les
+    éditions les modifient en place puis reparsent, et `to_template()` doit
+    rendre exactement le fichier lu quand rien n'a changé — c'est l'invariant
+    d'aller-retour que les tests vérifient. `hubs`, `arms` et `backbone` sont
+    la lecture structurelle qu'on en tire, jamais écrite dans le JSON.
+    """
+
     cc_level: int
     planet_id: int
     diameter: float          # un DIAMÈTRE — voir spec §6
@@ -126,6 +141,11 @@ class ColonyModel:
     extra: dict = field(default_factory=dict)   # clés inconnues, recopiées
 
     def to_template(self):
+        """Le template EVE de ce modèle, clés inconnues comprises.
+
+        `extra` est recopié tel quel : un champ que ce code ne connaît pas
+        encore ne doit pas disparaître au premier aller-retour.
+        """
         out = {"CmdCtrLv": self.cc_level, "Cmt": self.comment,
                "Diam": float(self.diameter), "L": self.links,
                "P": self.pins, "Pln": self.planet_id, "R": self.routes}
@@ -166,8 +186,16 @@ def parse_colony(template):
             adj[s - 1].append(d - 1)
             adj[d - 1].append(s - 1)
 
-    if len(links) != n - 1:
-        raise ParseError(f"link graph is not a tree ({len(links)} links, {n} pins)")
+    # Pas de règle « doit être un arbre ». Elle refusait toute colonie où un
+    # lien ferme une boucle *par les hubs* : deux pads reliés entre eux et à un
+    # troisième, ou une usine posée en jeu sur deux launch pads — la colonie
+    # P1 → P3 Data Chips d'un ami (23 liens, 23 pins), que l'outil web ouvrait
+    # et que le bureau refusait partout, « Route storage » compris (2026-10-07).
+    # Ces boucles sont légales dans EVE et l'éditeur ne les parcourt jamais : la
+    # dorsale est relevée à part et les bras partent des voisins d'un hub. Ce
+    # dont il a besoin est vérifié à la place, chacun avec son message : le
+    # graphe est connexe, chaque structure rejoint un hub, aucun bras ne se
+    # referme. Miroir de `parseColony` dans l'outil web.
     seen, stack = {0}, [0]
     while stack:
         for nb in adj[stack.pop()]:
@@ -192,43 +220,62 @@ def parse_colony(template):
     # second hub (bras-pont) — 30 templates de la bibliothèque en dépendent.
     visited = set(hubs)
     arms = []
-    for h in hubs:
-        # (parent, premier pin) — la file grandit quand un bras se ramifie.
-        pending = deque((h, start) for start in sorted(adj[h])
-                        if start not in visited)
-        while pending:
-            parent, first = pending.popleft()
-            if first in visited:
+
+    def walk(hub, parent, start, depth):
+        """Suit un tronçon droit vers l'extérieur, puis repart dans chaque branche.
+
+        En profondeur et plus petit pin d'abord, comme `walk` de l'outil web :
+        une colonie rend toujours les mêmes bras dans le même ordre, et ajouter
+        ou retirer choisit par position parmi eux. La file en largeur d'avant
+        rangeait les branches après tous les bras du hub, donc les deux outils
+        départageaient autrement les égalités sur un éventail.
+        """
+        arm, prev, cur, end_hub = [], parent, start, None
+        while True:
+            visited.add(cur)
+            arm.append(cur)
+            onward = [x for x in adj[cur] if x != prev]
+            ahead = [x for x in onward if x not in hubset]
+            # Une boucle *par* les hubs passe ; une boucle dans un bras n'a pas
+            # de bout où ajouter ni d'où retirer.
+            if any(x in visited for x in ahead):
+                raise ParseError(f"pin {cur + 1} closes a loop inside an arm")
+            if len(ahead) == 1:
+                # Un hub voisin en cours de route ne coupe pas le bras : l'usine
+                # posée sur deux pads reste le premier pin du sien.
+                prev, cur = cur, ahead[0]
                 continue
-            arm, prev, cur, end_hub = [], parent, first, None
-            while True:
-                visited.add(cur)
-                arm.append(cur)
-                nxt = [x for x in adj[cur] if x != prev]
-                # Les hubs sont dans `visited` dès le départ : le filtre ne
-                # vaut que pour la suite du bras, sinon aucun bras-pont ne
-                # serait jamais reconnu.
-                onward = [x for x in nxt if x not in hubset and x not in visited]
-                to_hub = [x for x in nxt if x in hubset]
-                if to_hub:
-                    # Un bras-pont : l'autre bout rejoint un second hub.
-                    end_hub = to_hub[0]
-                if len(onward) == 1 and not to_hub:
-                    prev, cur = cur, onward[0]
-                    continue
-                # Zéro suite : bras ouvert. Plusieurs : le bras s'arrête ici et
-                # chaque branche repart comme un bras à part entière, de parent
-                # ce pin — un éventail P4 n'est pas un template malformé, c'est
-                # ce que nos propres générateurs posent.
-                for branch in onward:
-                    pending.append((cur, branch))
-                break
-            # On tolère ce que la surcharge arm_length produisait avant son
-            # plafond à 4 ; MAX_ARM_LEN, plus compact, ne plafonne que la
-            # croissance automatique.
-            if len(arm) > MAX_ARM_LEN_EDITABLE:
-                raise ParseError(f"arm of {len(arm)} pins exceeds {MAX_ARM_LEN_EDITABLE}")
-            arms.append(Arm(hub=h, pins=arm, end_hub=end_hub, parent=parent))
+            # Zéro suite : le bout, et un hub au-delà en fait un bras-pont.
+            # Plusieurs : le bras s'arrête ici et chaque branche repart comme
+            # un bras à part entière, de parent ce pin — un éventail P4 n'est
+            # pas un template malformé, c'est ce que nos générateurs posent.
+            if not ahead:
+                hub_ahead = next((x for x in onward if x in hubset), None)
+                # Sorti d'un hub et revenu au même : un anneau, sans extrémité
+                # libre. Retirer une structure obligerait à relier le hub à
+                # lui-même ; refusé plutôt que modélisé en pont vers nulle part.
+                if hub_ahead == hub:
+                    raise ParseError(f"pin {cur + 1} closes a loop back to its own hub")
+                end_hub = hub_ahead
+            break
+        # Mesuré depuis le hub, pas depuis la fourche : le plafond dit à quelle
+        # distance du pad se tient une structure, quel que soit le nombre de
+        # fourches pour y arriver. On tolère 8, ce que la surcharge arm_length
+        # produisait avant son plafond à 4 ; MAX_ARM_LEN, plus compact, ne
+        # plafonne que la croissance automatique.
+        reach = depth + len(arm) - 1
+        if reach > MAX_ARM_LEN_EDITABLE:
+            raise ParseError(f"arm of {reach} pins exceeds {MAX_ARM_LEN_EDITABLE}")
+        arms.append(Arm(hub=hub, pins=arm, end_hub=end_hub, parent=parent, depth=depth))
+        for branch in sorted(ahead):
+            walk(hub, arm[-1], branch, reach + 1)
+
+    for h in hubs:
+        for start in sorted(adj[h]):
+            # Déjà parcouru : un hub de la dorsale, ou le bout d'un pont que la
+            # colonie a atteint par l'autre hub.
+            if start not in visited:
+                walk(h, h, start, 1)
     if len(visited) != n:
         raise ParseError("structures not reachable from any hub")
 
@@ -399,10 +446,9 @@ def _assert_extraction_feeds_itself(template):
     jamais au total — un surplus de Carbon Compounds ne nourrit pas les usines
     qui attendent des Noble Metals. Miroir de `assertExtractionFeedsItself`.
 
-    Appliqué aux jeux seulement. L'outil web le fait aussi sur une usine seule.
-    Ici, `stage_edit` écrit le rendement dans le template avant de faire grandir
-    la colonie, mais `grow_to_supply` ne le fait pas lui-même : sur une usine
-    seule, le contrôle bloquerait la croissance de tout appelant qui l'oublie.
+    Appliqué à une usine seule comme à un jeu, des deux côtés. Le rendement est
+    lu dans les routes des extracteurs : `grow_to_supply` ne l'y écrit pas, c'est
+    à son appelant de le faire avant — `stage_edit` le fait.
     """
     analysis = analyze_template(template,
                                 {"yield_per_head": _template_yield_per_head(template)})
@@ -609,6 +655,7 @@ def _drop_pin(template, idx_1b, repair=None):
         links.append({"D": repair[0], "Lv": 0, "S": repair[1]})
 
     def _remap(i):
+        """Décale d'un cran les indices 1-based situés après le pin retiré."""
         return i - 1 if i > idx_1b else i
 
     template["L"] = [{"D": _remap(lk["D"]), "Lv": lk["Lv"], "S": _remap(lk["S"])}
@@ -636,10 +683,15 @@ def add_factory(model):
     fac_schematics = {p.get("S") for p in model.pins
                       if kind_of(p) in FACTORY_KINDS} - {None}
     if len(fac_schematics) <= 1:
-        # Pas de contrôle de nourriture ici : `grow_to_supply` passe le nouveau
-        # rendement en argument sans le réécrire dans les routes, donc un
-        # contrôle qui lit le rendement du template refuserait toute croissance.
-        return parse_colony(_place_factory(model, None))
+        # Nourrie par le sol ou refusée, comme un jeu. Le bureau sautait ce
+        # contrôle sur une usine seule et laissait poser, sur une colonie
+        # d'extraction équilibrée, une usine qui tourne à vide là où l'outil
+        # web refuse (2026-10-07). Le rendement lu est celui des routes : qui
+        # fait grandir pour un nouveau rendement l'y écrit d'abord, ce que
+        # fait `stage_edit`.
+        placed = _place_factory(model, None)
+        _assert_extraction_feeds_itself(placed)
+        return parse_colony(placed)
 
     products = factory_set_products(model.pins)
     if products is None:
@@ -662,7 +714,10 @@ def _place_factory(model, schematic):
     toujours ; renseigné, on copie un pin qui fabrique ce produit — le bout du
     bras où l'on s'accroche n'en est pas forcément un.
     """
+    # Une fourche n'a pas de place au-delà de son bout : les branches y sont.
+    forks = {a.parent for a in model.arms}
     open_arms = [a for a in model.arms if a.end_hub is None
+                 and a.pins[-1] not in forks
                  and all(kind_of(model.pins[i]) in FACTORY_KINDS for i in a.pins)]
     factory_arms = [a for a in model.arms
                     if any(kind_of(model.pins[i]) in FACTORY_KINDS for i in a.pins)]
@@ -670,6 +725,12 @@ def _place_factory(model, schematic):
         raise EditError("template has no factory to copy from")
 
     def donor_for(candidate):
+        """Le pin à copier pour cette greffe.
+
+        Le bout du bras si aucun produit n'est demandé ou s'il fabrique déjà le
+        bon ; sinon la dernière usine de la colonie qui fabrique `schematic`,
+        pour que le nouveau pin reçoive ses routes et sa recette.
+        """
         if schematic is None or model.pins[candidate].get("S") == schematic:
             return candidate
         return max(i for i, p in enumerate(model.pins)
@@ -682,9 +743,9 @@ def _place_factory(model, schematic):
     # est pris suffisait à bloquer la croissance : déplacer une structure près
     # d'un bout condamnait toute la colonie alors que trois autres bras étaient
     # libres.
+    # Portée et non longueur : une branche part déjà à mi-chemin du pad.
     placed = None
-    for arm in sorted((a for a in open_arms if len(a.pins) < MAX_ARM_LEN),
-                      key=lambda a: len(a.pins)):
+    for arm in sorted((a for a in open_arms if _reach(a) < MAX_ARM_LEN), key=_reach):
         tip = model.pins[arm.pins[-1]]
         # arm.parent, pas arm.hub : sur une branche d'éventail le pin d'amont
         # est celui où ça bifurque, et prolonger depuis le hub viserait à côté.
@@ -742,24 +803,14 @@ def remove_factory(model):
     return working
 
 
-def _tip_reach(model):
-    """Liens entre chaque bras et son hub, jusqu'à son bout : `tipReach` de l'outil web.
+def _reach(arm):
+    """Liens entre le hub et le bout de ce bras : `tipReach` de l'outil web.
 
     Pour un bras posé sur un hub, c'est sa longueur ; pour une branche, la
-    portée du bras d'où elle part plus la sienne. Mesurer au hub plutôt qu'à la
-    fourche garde « le bras le plus long » vrai sur un éventail P4.
+    portée de la fourche plus la sienne. Mesurer au hub plutôt qu'à la fourche
+    garde « le bras le plus long » vrai sur un éventail P4.
     """
-    arm_of = {pin: index for index, arm in enumerate(model.arms) for pin in arm.pins}
-    reach = {}
-
-    def of(index):
-        if index not in reach:
-            arm = model.arms[index]
-            parent = arm_of.get(arm.parent)
-            reach[index] = len(arm.pins) + (0 if parent is None else of(parent))
-        return reach[index]
-
-    return [of(index) for index in range(len(model.arms))]
+    return arm.depth + len(arm.pins) - 1
 
 
 def _drop_factory(model, schematic):
@@ -773,14 +824,13 @@ def _drop_factory(model, schematic):
     n'ayant aucune fourche, mais les colonies P1 → P4 et P2 → P4 générées en ont.
     """
     forks = {a.parent for a in model.arms}
-    reach = _tip_reach(model)
     candidates = []
-    for index, a in enumerate(model.arms):
+    for a in model.arms:
         tip = a.pins[-1]
         pin = model.pins[tip]
         if (tip not in forks and kind_of(pin) in FACTORY_KINDS
                 and (schematic is None or pin.get("S") == schematic)):
-            candidates.append((a.end_hub is not None, -reach[index], a))
+            candidates.append((a.end_hub is not None, -_reach(a), a))
     if schematic is None:
         total = sum(1 for p in model.pins if kind_of(p) in FACTORY_KINDS)
         if not candidates or total <= 1:
@@ -797,7 +847,9 @@ def _drop_factory(model, schematic):
     tip_1b = arm.pins[-1] + 1
     repair = None
     if arm.end_hub is not None:
-        before = arm.pins[-2] + 1 if len(arm.pins) > 1 else arm.hub + 1
+        # arm.parent, pas arm.hub : une branche-pont d'un seul pin se ressoude
+        # à la fourche d'où elle part.
+        before = arm.pins[-2] + 1 if len(arm.pins) > 1 else arm.parent + 1
         repair = (before, arm.end_hub + 1)
     tpl = _working_copy(model)
     _drop_pin(tpl, tip_1b, repair=repair)
@@ -831,6 +883,9 @@ def production_set_members(pins):
             facility_of[schematic] = kind_of(pin)
 
     def rank(type_id):
+        """Rang du tier d'un type, -1 s'il est inconnu : sert à trouver le
+        palier le plus haut.
+        """
         return _TIER_RANK.get(get_tier(ID_TO_NAME.get(type_id, "")), -1)
 
     ranked = sorted(facility_of, key=lambda type_id: -rank(type_id))
@@ -1060,6 +1115,11 @@ def _hub_spot(model):
     pads = [h for h in model.hubs if kind_of(model.pins[h]) == "Launch Pad"]
 
     def reach(hub):
+        """Le plus long chemin, en liens, d'un hub vers une usine alimentée par stockage.
+
+        Un chemin introuvable compte comme infini : un pad qui ne rejoint pas
+        une usine ne doit jamais gagner le tri.
+        """
         lengths = []
         for factory in factories:
             path = _bfs_path(tpl["L"], hub + 1, factory, len(tpl["P"]))
@@ -1086,6 +1146,11 @@ def _storage_feeds(template):
     pins = template["P"]
 
     def kind_at(one_based):
+        """Le type du pin à cet indice 1-based, ou None hors de la colonie.
+
+        Les routes viennent du fichier : un indice qui déborde ne doit pas
+        lever ici, seulement ne rien reconnaître.
+        """
         return kind_of(pins[one_based - 1]) if 1 <= one_based <= len(pins) else None
 
     made = {p.get("S") for p in pins
@@ -1208,7 +1273,14 @@ def remove_hub(model, kind):
         for m in members:
             comp[m] = home
         home_hubs.extend(s for s in survivors_1b if s in members)
-    return parse_colony(tpl)
+    # La ressoudure prend le pin le plus proche, qui peut être en milieu de
+    # bras et fermer une boucle. Tout autre refus de cette couche est un
+    # EditError : un reparse refusé est traduit plutôt que de fuir tel quel.
+    try:
+        return parse_colony(tpl)
+    except ParseError as exc:
+        raise EditError(f"removing the {kind} leaves a colony that cannot be "
+                        f"rejoined: {exc}") from exc
 
 
 def set_radius_km(model, radius_km_value):
@@ -1230,17 +1302,30 @@ def set_radius_km(model, radius_km_value):
 
 
 def radius_km(model):
+    """Le rayon affiché, tiré du diamètre stocké.
+
+    Import tardif : `template_service` importe ce module. Passer par
+    `radius_from_diameter` garde une seule conversion dans tout le code — le
+    piège rayon/diamètre a déjà coûté un facteur deux.
+    """
     from src.services.template_service import radius_from_diameter
     return radius_from_diameter(model.diameter)
 
 
 def set_cc_level(model, level):
+    """Règle le niveau de Command Center, ramené dans les niveaux qui existent.
+
+    Métadonnée pure : aucun pin ne bouge ; seul le budget CPU/PWR change.
+    """
     from src.pi_data import CC_LEVELS
     level = max(0, min(max(CC_LEVELS), int(level)))
     return dataclasses.replace(model, cc_level=level)
 
 
 def set_comment(model, text):
+    """Remplace le commentaire du template (le nom affiché en jeu et dans la
+    bibliothèque).
+    """
     return dataclasses.replace(model, comment=str(text))
 
 

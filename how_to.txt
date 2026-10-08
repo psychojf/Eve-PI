@@ -11,11 +11,11 @@ Double-click "Eve PI.exe" to launch the app.
 Run from source:  python PI.py
 
 The executable is self-contained. Planet artwork, the Scout's
-offline map snapshot and the planet icons all travel inside
-it, so you can move the .exe anywhere. It creates a "data"
-folder beside itself the first time it runs, for the things
-it writes: your saved templates, the work history and your
-settings.
+offline map snapshot, the planet icons and the structure
+icons all travel inside it, so you can move the .exe
+anywhere. It creates a "data" folder beside itself the first
+time it runs, for the things it writes: your saved templates,
+the work history and your settings.
 
 The window is one screen split in two: a compact settings
 column on the left, and the colony those settings describe
@@ -323,6 +323,16 @@ Work down the numbered panels:
          needs, what it will then carry, and what the upgrade
          adds in CPU and power. Measured in game up to level
          2; above that the figure is marked as an estimate.
+       Structures closer than EVE's minimum spacing, listed
+         by number.
+       A colony that needs more CPU or power than its command
+         center level supplies, with the level that would
+         carry it — or, if none does, the advice to remove
+         structures.
+
+     These checks run on any colony on the planet, including
+     one you pasted in. What can be fixed without touching a
+     structure is one click away — see REPAIR FOR EVE below.
 
      Your yield choice is remembered between sessions. The
      manual counts are not, and neither are the shape nor the
@@ -373,7 +383,8 @@ STEP 2 — READING THE COLONY
 The right half shows, top to bottom:
 
   - A toolbar: Copy JSON, Reset View, Reset template,
-    Save to Library, Start over, Route storage
+    Save to Library, Start over, Route storage — and
+    Repair for EVE, only when there is something to repair
   - The import notice
   - The JSON, exactly as EVE will read it
   - The colony drawn on the real artwork of the planet type
@@ -485,6 +496,37 @@ ROUTE STORAGE
   EVE allows no route between two storage structures, so a
   storage facility only helps by feeding factories directly.
 
+REPAIR FOR EVE
+
+  Fixes what the game would refuse, without moving or
+  removing a single structure. Two things:
+
+    Routes through more than 7 structures are moved to load
+      or unload at the nearest launch pad or storage facility
+      instead. If that shorter route already exists, the long
+      one is simply dropped.
+    Links carrying more than they can pass get the level
+      they need written into the template, so the link
+      arrives in game already upgraded — you do not do it by
+      hand after importing.
+
+  The button says what it is about to do, for example
+  "Repair for EVE — reroute 3 routes, upgrade 1 link", and it
+  is not in the toolbar at all when it would change nothing.
+
+  Link levels are confirmed in game up to level 2. When a
+  repair writes a higher one, the panel says so: check the
+  cost after importing.
+
+  What it does NOT fix: structures sitting too close, and a
+  colony over its command center's budget. Both mean moving
+  or removing structures, and that stays your decision. A
+  route between two production structures cannot be repaired
+  either — it has no pad or storage end to move — and the
+  panel tells you to bring those structures closer.
+
+  A repair is recorded in HISTORY like any other edit.
+
 SAVING IT
 
   "Save to Library" asks for a name and stores the colony as
@@ -564,6 +606,13 @@ STORAGE SUGGESTION — STORAGE RUNS OUT BEFORE THE TRIP
   When nothing helps, it says why: no storage fits the
   budget, there is no room to place one, or what runs out
   first is not held in storage at all.
+
+  Every fix is measured on the colony with all its launch
+  pads and storage routed to the factories they can feed, so
+  the hours on the button are the hours you get. When that
+  routing alone buys hours and nothing else fits, it is
+  offered by itself:
+       "Route storage to the factories — lasts Nh"
 
   IMPORTANT: storage facilities do not receive imports. On
   each visit, move the inputs into them yourself with an
@@ -802,6 +851,18 @@ Where a colony comes in and goes out as raw text.
     settings panel filled in from it, exactly as a Library
     load does.
 
+    If EVE would refuse or alter part of what you pasted, the
+    planet says so straight away — "EVE would refuse or alter
+    part of it: ..." — and the notes in the layout panel say
+    what to do about each point. The line goes away by itself
+    once the colony is repaired.
+
+    A colony built by hand in game opens as it is. Links that
+    close a loop through launch pads or storage — a factory
+    placed on two pads, three pads linked in a triangle — are
+    legal in EVE, and the counters, Route storage and the
+    suggestions all work on such a colony.
+
   EXPORT
     "Copy JSON" puts the colony on your clipboard in the
     compact form EVE reads.
@@ -916,8 +977,9 @@ Always on. There is nothing to switch on and nothing to
 remember to press.
 
 Every colony you build, every mixed plan, every way to build
-you pick, every suggestion you apply, every Reset template
-or Route storage, and every structure you drag is recorded.
+you pick, every suggestion you apply, every Reset template,
+Route storage or Repair for EVE, and every structure you drag
+is recorded.
 That last one is the point: a colony you arranged by hand
 used to live only in the window that drew it, so closing it
 threw the work away.
@@ -1062,9 +1124,12 @@ Route storage says every pad already feeds everything
     already routed to every factory it can feed.
 
 "CPU / Power over budget"
-  — Only reachable with manual counts or hand edits. The
-    template is still produced so you can see the shape of
-    it, but EVE will refuse to build it as-is.
+  — Reachable with manual counts, hand edits, or a colony
+    pasted in with a command center level too low for it.
+    The template is still produced so you can see the shape
+    of it, but EVE will refuse to build it as-is. The panel
+    names the command center level that would carry it, or
+    says that none does.
 
 "Link N–N needs N m3/h — over the 1250 a level-0 link moves"
   — An arm is carrying more than its link can pass. The link
@@ -1081,8 +1146,19 @@ EVE says "Some template routes failed to build"
     other route and silently drops those, so the colony
     imports looking complete and does not run. The panel
     warns about it before you copy the JSON. It comes from
-    hand-lengthened arms or from an old template: generate
-    again, or shorten the arm.
+    hand-lengthened arms, an old template, or a colony
+    somebody else drew: press Repair for EVE in the toolbar,
+    generate again, or shorten the arm.
+
+Repair for EVE is not in the toolbar
+  — There is nothing it could fix: no route is too long and
+    no link is overloaded. Crowded structures and a budget
+    overrun are not its job — see REPAIR FOR EVE above.
+
+A route is still red after Repair for EVE
+  — It runs between two production structures, so it has no
+    launch pad or storage end to move. Drag those structures
+    closer together.
 
 The shape I picked did not happen
   — The panel says why, in orange, under the CPU bars: too

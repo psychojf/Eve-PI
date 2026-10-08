@@ -40,6 +40,11 @@ class FactoryTimer:
     _MARGIN = 10
 
     def __init__(self, parent, app):
+        """Monte la barre de titre (déplaçable, avec son chevron) et le corps vide.
+
+        Le contenu arrive par `update` : le panneau existe dès que la scène
+        s'ouvre, et se remplit chaque fois que la colonie change.
+        """
         self.parent = parent
         self.app = app
         self._open = True
@@ -99,10 +104,12 @@ class FactoryTimer:
             self.frame.place(relx=0.0, rely=0.0, x=x, y=y, anchor="nw")
 
     def _drag_start(self, event):
+        """Retient le point de saisie et la position de départ du panneau."""
         self._grab = (event.x_root, event.y_root,
                       self.frame.winfo_x(), self.frame.winfo_y())
 
     def _drag(self, event):
+        """Déplace le panneau avec le curseur, borné à la carte."""
         if not getattr(self, "_grab", None):
             return
         x0, y0, fx, fy = self._grab
@@ -123,6 +130,7 @@ class FactoryTimer:
             self.body.pack_forget()
 
     def destroy(self):
+        """Retire le panneau ; tolère un cadre déjà détruit avec la scène."""
         try:
             self.frame.destroy()
         except tk.TclError:
@@ -131,10 +139,19 @@ class FactoryTimer:
     # ── Contenu ───────────────────────────────────────────────────────────
 
     def _clear(self):
+        """Vide le corps avant de le remplir à nouveau.
+
+        Reconstruire plutôt que mettre à jour ligne par ligne : le nombre de
+        lignes change d'une colonie à l'autre, et un panneau de cette taille se
+        refait en un instant.
+        """
         for child in self.body.winfo_children():
             child.destroy()
 
     def _line(self, text, colour=None, bold=False, size=8, pady=(0, 0), wrap=None):
+        """Une ligne de texte dans le corps, aux couleurs et à l'échelle du
+        thème courant.
+        """
         EVE, _fs = app_theme(self.app)
         font = ("Segoe UI", _fs(size), "bold") if bold else ("Segoe UI", _fs(size))
         lbl = tk.Label(self.body, text=text, font=font, justify=tk.LEFT,
@@ -146,6 +163,7 @@ class FactoryTimer:
         return lbl
 
     def _rule(self):
+        """Un filet horizontal entre deux sections du panneau."""
         EVE, _ = app_theme(self.app)
         tk.Frame(self.body, bg=EVE["border"], height=1).pack(fill=tk.X, padx=8, pady=4)
 
@@ -328,6 +346,7 @@ def _tooltip(widget, text, app):
     state = {"win": None}
 
     def show(_event=None):
+        """Pose l'infobulle au-dessus du widget ; une seule à la fois."""
         if state["win"] is not None:
             return
         win = tk.Toplevel(widget)
@@ -340,6 +359,7 @@ def _tooltip(widget, text, app):
         state["win"] = win
 
     def hide(_event=None):
+        """Détruit l'infobulle si elle est encore là."""
         win = state.pop("win", None)
         state["win"] = None
         if win is not None:

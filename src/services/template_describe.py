@@ -31,6 +31,11 @@ _EXTRACTOR = "Extractor Control Unit"
 
 
 def _tier_of(name, tier_by_name):
+    """Le tier d'une marchandise, ou None si elle n'est pas dans la table.
+
+    Un nom de plus sur `dict.get` : il rend lisibles les trois endroits qui se
+    demandent « à quel palier est ceci ».
+    """
     return tier_by_name.get(name)
 
 

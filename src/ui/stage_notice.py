@@ -71,6 +71,10 @@ def storage_offer_text(suggestion, switch=None):
                   f"{suggestion.count} storage {noun} — lasts "
                   f"{format_hours(suggestion.hours)}h, "
                   f"{round(suggestion.output_share * 100)}% of the output")
+    elif suggestion.count == 0:
+        # Rien à bâtir : le stockage est déjà là, seules manquent les routes
+        # qui laissent les usines y puiser.
+        action = f"Route storage to the factories — lasts {format_hours(suggestion.hours)}h"
     else:
         action = (f"Add {suggestion.count} storage {noun} — lasts "
                   f"{format_hours(suggestion.hours)}h")
@@ -92,6 +96,14 @@ class StageNotice:
     _MARGIN = 10
 
     def __init__(self, parent, on_apply=None, top=None, on_storage=None, on_switch=None):
+        """Monte la notice, cachée tant qu'`update` n'a rien à dire.
+
+        Les trois rappels sont ceux de la scène : `on_apply(delta)` corrige
+        l'équilibre des usines, `on_storage(suggestion)` pose les entrepôts
+        suggérés, `on_switch(chain)` passe au palier au-dessus. `top` est la
+        hauteur sous laquelle se poser, pour ne pas couvrir la barre COLLECT
+        EVERY.
+        """
         self.parent = parent
         self.on_apply = on_apply
         # La suggestion de stockage appliquée, et la chaîne du palier au-dessus.
@@ -182,24 +194,31 @@ class StageNotice:
         self.update(*self._last)
 
     def _apply(self):
+        """Le bouton d'équilibre : transmet l'écart courant à la scène."""
         if self.on_apply is not None:
             self.on_apply(self._delta)
 
     def _apply_storage(self):
+        """Le bouton de stockage : transmet la suggestion affichée."""
         if self.on_storage is not None and self._storage is not None:
             self.on_storage(self._storage["suggestion"])
 
     def _apply_switch(self):
+        """Le bouton de chaîne : demande la chaîne du palier au-dessus."""
         if (self.on_switch is not None and self._storage is not None
                 and self._storage.get("switch") is not None):
             self.on_switch(self._storage["switch"].chain_name)
 
     def hide(self):
+        """Retire la notice de la carte sans la détruire, pour la reposer au
+        prochain écart.
+        """
         if self._shown:
             self.frame.place_forget()
             self._shown = False
 
     def destroy(self):
+        """Détruit la notice ; tolère un cadre déjà détruit avec la scène."""
         try:
             self.frame.destroy()
         except tk.TclError:
