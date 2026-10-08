@@ -104,12 +104,38 @@ def _final_product(exports, tier_by_name):
                                         item[1], item[0]))[0]
 
 
+def _hauled_on_every_chain(product, tier_by_name):
+    """Les ingrédients du produit qu'aucune chaîne d'usines ne fabrique sur place.
+
+    Trois P4 prennent un P1 à côté de leurs P3 : Nano-Factory (Reactive Metals),
+    Sterile Conduits (Water), Organic Mortar Applicators (Bacteria). Le faire
+    sur la planète voudrait des extracteurs, donc il arrive par cargo que la
+    colonie parte du P1, du P2 ou du P3 — et ne dit rien de ce départ.
+
+    Reconnu à l'écart de paliers plutôt qu'à une liste de trois noms : un
+    ingrédient situé plus d'un palier sous le produit saute une étape qu'aucune
+    usine ne franchit. Un produit que les chaînes ne connaissent pas n'en a
+    aucun, et la lecture reste celle du palier le plus bas.
+    """
+    target = _tier_of(product, tier_by_name)
+    if target not in TIERS:
+        return set()
+    for chain in CHAINS.values():
+        recipe = chain["recipes"].get(product)
+        if recipe:
+            return {name for name, _quantity in recipe["input"]
+                    if _tier_of(name, tier_by_name) in TIERS
+                    and TIERS.index(tier_by_name[name]) < TIERS.index(target) - 1}
+    return set()
+
+
 def _chain_name(analysis, product, extracts, tier_by_name):
     """Le nom de chaîne du panneau, ou None s'il n'en existe pas de connu.
 
     La chaîne va de ce qu'on apporte à ce qu'on emporte. Une colonie qui extrait
     part de P0 quoi qu'elle importe par ailleurs ; sinon elle part du palier le
-    plus bas qu'elle fait venir de l'extérieur.
+    plus bas qu'elle fait venir de l'extérieur — sans compter ce que la recette
+    du produit fait venir sur toutes les chaînes.
     """
     if product is None:
         return None
@@ -120,11 +146,17 @@ def _chain_name(analysis, product, extracts, tier_by_name):
     if extracts:
         start = "P0"
     else:
-        tiers = [_tier_of(name, tier_by_name) for name in analysis.get("imports") or {}]
-        tiers = [tier for tier in tiers if tier in TIERS]
-        if not tiers:
+        imported = [name for name in analysis.get("imports") or {}
+                    if _tier_of(name, tier_by_name) in TIERS]
+        if not imported:
             return None
-        start = min(tiers, key=TIERS.index)
+        # Le P1 d'un Nano-Factory faisait relire tout P3 → P4 et tout P2 → P4
+        # en « P1 → P4 » : 12 des 796 colonies que le générateur bâtit en CC5
+        # (2026-10-08). S'il ne reste que lui, on le garde plutôt que de ne
+        # rien lire.
+        always = _hauled_on_every_chain(product, tier_by_name)
+        deciding = [name for name in imported if name not in always] or imported
+        start = min((tier_by_name[name] for name in deciding), key=TIERS.index)
 
     name = f"{start} → {target} ({'Extraction' if extracts else 'Factory'})"
     # Seulement si l'application connaît cette chaîne : une combinaison que la
